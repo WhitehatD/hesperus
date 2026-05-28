@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
-from app.analysis.models import CaptureLatency
+from app.analysis.models import CaptureLatency, EnergyTelemetry
 from app.api.agent_routes import AGENT_TOOLS, AGENT_SYSTEM_PROMPT
 from app.analysis.engine import analyze_image
 from app.config import settings
@@ -51,6 +51,45 @@ async def list_latency(
             {c.name: getattr(r, c.name) for c in CaptureLatency.__table__.columns}
             for r in rows
         ]
+    }
+
+
+# ── Energy telemetry (RQ3 measured duty cycle) ─────────────────────────────────
+
+@router.get("/energy")
+async def list_energy(db: AsyncSession = Depends(get_db)):
+    """Aggregate + raw energy phase-timer telemetry from the board.
+
+    The firmware publishes ``{"status":"energy","window_ms","ps_rest_ms",
+    "capture_ms"}`` once per minute while in WIFI_PS_REST; on_message persists
+    each as an EnergyTelemetry row. This endpoint returns the per-window rows
+    plus aggregates used to compute the MEASURED duty cycle for RQ3. Feed the
+    JSON to ``scripts/energy_model.py --measured-json``.
+    """
+    rows = (await db.execute(
+        select(EnergyTelemetry).order_by(EnergyTelemetry.id)
+    )).scalars().all()
+    total_window = sum(r.window_ms for r in rows)
+    total_rest = sum(r.ps_rest_ms for r in rows)
+    total_capture = sum(r.capture_ms for r in rows)
+    total_active = max(total_window - total_rest, 0)
+    return {
+        "windows": len(rows),
+        "total_window_ms": total_window,
+        "total_ps_rest_ms": total_rest,
+        "total_capture_ms": total_capture,
+        "total_active_ms": total_active,
+        "measured_active_fraction": (total_active / total_window) if total_window else None,
+        "measured_capture_fraction": (total_capture / total_window) if total_window else None,
+        "rows": [
+            {
+                "window_ms": r.window_ms,
+                "ps_rest_ms": r.ps_rest_ms,
+                "capture_ms": r.capture_ms,
+                "received_at": r.received_at.isoformat() if r.received_at else None,
+            }
+            for r in rows
+        ],
     }
 
 

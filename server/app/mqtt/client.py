@@ -150,6 +150,26 @@ async def on_message(client, topic, payload, qos, properties):
             _board_state = "online"
             _dormant_until = None
 
+    # ── Energy phase-timer telemetry (RQ3 measured duty cycle) ───────────────
+    if status == "energy":
+        try:
+            from app.db.database import async_session
+            from app.analysis.models import EnergyTelemetry
+            from sqlalchemy.exc import SQLAlchemyError
+
+            try:
+                async with async_session() as db:
+                    db.add(EnergyTelemetry(
+                        window_ms=int(data.get("window_ms", 0)),
+                        ps_rest_ms=int(data.get("ps_rest_ms", 0)),
+                        capture_ms=int(data.get("capture_ms", 0)),
+                    ))
+                    await db.commit()
+            except SQLAlchemyError as e:
+                print(f"[ENERGY] persist failed: {e}")
+        except (ValueError, TypeError) as e:
+            print(f"[ENERGY] bad telemetry payload: {e}")
+
     # ── Auto-deactivate schedule when board finishes all tasks ───────────────
     if status == "cycle_complete":
         try:

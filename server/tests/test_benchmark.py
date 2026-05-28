@@ -85,3 +85,31 @@ def test_benchmark_analyze_missing_file(client):
     assert resp.status_code == 422, (
         f"Expected 422 when file is missing, got {resp.status_code}: {resp.text}"
     )
+
+
+def test_energy_telemetry_table_exists(client):
+    """EnergyTelemetry table should be registered on startup (RQ3 telemetry)."""
+    from app.db.database import Base
+
+    assert "energy_telemetry" in Base.metadata.tables, (
+        "energy_telemetry table not registered in SQLAlchemy metadata"
+    )
+    table = Base.metadata.tables["energy_telemetry"]
+    expected = {"id", "window_ms", "ps_rest_ms", "capture_ms", "received_at"}
+    actual = {c.name for c in table.columns}
+    missing = expected - actual
+    assert not missing, f"EnergyTelemetry missing columns: {missing}"
+
+
+def test_benchmark_energy_endpoint_empty(client):
+    """GET /api/benchmark/energy returns 200 with zeroed aggregates on a fresh DB."""
+    resp = client.get("/api/benchmark/energy")
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["windows"] == 0
+    assert data["total_window_ms"] == 0
+    assert data["total_ps_rest_ms"] == 0
+    assert data["total_capture_ms"] == 0
+    assert data["total_active_ms"] == 0
+    assert data["measured_active_fraction"] is None
+    assert data["rows"] == []

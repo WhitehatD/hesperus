@@ -58,3 +58,20 @@ class CaptureLatency(Base):
     success = Column(Boolean, default=False)
     error = Column(String(512), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class EnergyTelemetry(Base):
+    """Per-window energy phase-timer telemetry from the board (status:"energy").
+
+    The firmware publishes {window_ms, ps_rest_ms, capture_ms} once per minute
+    while in WIFI_PS_REST. Aggregated to compute the MEASURED duty cycle for RQ3
+    (replaces the assumed 7s/30min duty cycle with real operational data).
+    """
+
+    __tablename__ = "energy_telemetry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    window_ms = Column(Integer, nullable=False)
+    ps_rest_ms = Column(Integer, nullable=False)
+    capture_ms = Column(Integer, nullable=False)
+    received_at = Column(DateTime, default=datetime.utcnow, index=True)
