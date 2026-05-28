@@ -108,6 +108,10 @@ results/*
 !results/benchmark_20260528_203558.jsonl
 !results/judge_scores_20260529_000539.jsonl
 !results/judge_summary_20260529_000539.md
+# Gemini second-judge run + inter-judge agreement (2026-05-29)
+!results/judge_scores_20260529_013824.jsonl
+!results/judge_summary_20260529_013824.md
+!results/judge_agreement_20260529_015009.md
 !results/planning_score_20260529_000027.jsonl
 !results/plan_scores_20260529_000027.md
 # v1 (superseded; kept for provenance — referenced by name inside findings_v3.md)

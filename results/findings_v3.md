@@ -67,6 +67,21 @@ Composite /9 = hazard_id + spatial + low_false_positive (each 0–3).
 
 `claude-sonnet-nothink` **matches or beats** `claude-sonnet` on **both** axes — planning rubric (90/93/94/95 ≈ identical) and analysis quality (6.95 ≥ 6.47) — while saving ~0.8 s of latency and the thinking-token cost. (Caveat: quality N≈19/backend, so the quality gap is within noise; the *direction* — no benefit — is consistent across RQ1 and RQ2.) In this hazard-monitoring domain, extended thinking adds cost without accuracy.
 
+### Cross-cutting: inter-judge validation rules out self-preference
+
+To test whether the quality ranking is a judge artefact, an independent Gemini 3 Flash judge re-scored all 120 image×model pairs (0 errors). Results across 114 shared pairs:
+
+| Metric | Per-axis MAD (0–3) | Composite (0–9) |
+|---|---|---|
+| Mean abs. difference | 0.45–0.99 | 1.75 |
+| Exact agreement | 12–55 % | 7 % |
+| Pearson r | 0.37–0.53 | 0.59 |
+| Spearman ρ | 0.29–0.49 | 0.47 |
+
+**Ranking agreement: Spearman ρ = 0.83.** Both judges produce identical top-3 (`claude-sonnet-nothink` / `gemini-3` / `claude-sonnet`, positions 1–2 swap only) and identical bottom (`qwen2.5-vl`). The tier ordering is robust to judge choice.
+
+**Self-preference probe:** the Claude judge rates Claude-family outputs 6.54/9 vs 6.63 for Gemini-family (does *not* inflate its own); the Gemini judge rates its own family 8.47 vs 8.32 for Claude (gap 0.15, negligible). The Gemini judge is uniformly ~1.7/9 more lenient — a systematic offset, not own-family inflation. The **ranking**, not the absolute score, is the trustworthy signal. Evidence: `results/judge_agreement_20260529_015009.md`.
+
 ---
 
 ## Deployable recommendation (the RQ2 answer)
@@ -80,7 +95,7 @@ Composite /9 = hazard_id + spatial + low_false_positive (each 0–3).
 
 ## Limitations (honesty pass)
 
-- **Quality ground truth** is a single LLM judge (`claude-sonnet-4-6`) — risk of self-preference bias when judging Claude outputs; the fact that *Gemini and Qwen3* score near Claude argues against strong self-bias, but a human-rater cross-check would strengthen it.
+- **Quality ground truth** now uses two independent LLM judges (Claude Sonnet 4.6 + Gemini 3 Flash). Ranking Spearman ρ = 0.83; self-preference probe shows neither judge inflates its own provider family (gap ≤ 0.15 vs a uniform +1.7/9 leniency offset). Single-axis absolute scores remain coarse (0–3 integer, MAD 0.45–0.99 per axis); use the ranking and tier, not the raw composite. A human-rater cross-check would further strengthen conclusions.
 - **N ≈ 19** per backend for the quality judge (one judge call per unique image×model pair); latency/planning use N reps and are tighter.
 - **20-image corpus**, indoor scenes — breadth, not depth of any single hazard class.
 - RQ3 energy is reported separately (datasheet duty-cycle model + on-device WIFI_PS_REST timing).
