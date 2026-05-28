@@ -37,7 +37,7 @@ A `git push` compiles ARM firmware, runs 64 backend tests, builds Docker images,
 
 ## Key Findings
 
-The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, 20 indoor scenes, 13 planning prompts, repeated trials). The highest-leverage results:
+The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, [20 indoor scenes](scripts/benchmark_images/), 13 planning prompts, repeated trials). The highest-leverage results:
 
 - **A uniform, *deliberate* "immediate-action drop" across every VLM provider — the headline result.** When a request combines an immediate capture with a recurring one — *"take a photo **now** and then every 45 minutes"* — all five tested backends (Claude Haiku/Sonnet, Gemini 3, Qwen3-VL) silently discard the *now* and emit only the recurring schedule. It is preserved **0% of the time across 5 backends × 4 prompt variants × repeated trials**, it is neither provider- nor scale-specific (the strongest planners do it too), and the captured reasoning trace shows it is *deliberate* — the model explicitly names both intents, then forwards only one. This is a concrete, reproducible instance of what the literature calls [*constraint drift*](https://arxiv.org/html/2605.10481) (a constraint that stays visible in the prompt while losing operational force), specialised to a failure mode — immediate-vs-recurring collapse in natural-language → tool-call scheduling — that is not otherwise documented. **Takeaway:** any "now *and* recurring" request needs a prompt-level guard or a post-processing split; the schedule alone cannot be trusted to honour it.
 
@@ -47,7 +47,7 @@ The working system doubles as an empirical study (1,850 inference calls across 6
 
 - **A duty-cycled node can stay agent-responsive.** The firmware sleeps in STOP2 between captures (datasheet ~2 µA floor; ~250× lower daily energy than continuous capture by duty-cycle accounting) yet remains reachable: a **WIFI_PS_REST** mode keeps WiFi associated through sleep and wakes the MCU in **0.1–2.6 s on an incoming command** (sub-second via the WiFi NOTIFY line, verified on hardware). Enabling it required two under-documented STM32U5 fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock. Energy figures are datasheet-grounded duty-cycle models, not power-meter measurements.
 
-> Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report.
+> Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report. The evaluation corpus is the 20 curated [`scripts/benchmark_images/`](scripts/benchmark_images/) (MIT Indoor Scenes — Quattoni & Torralba, CVPR 2009; per-image provenance in [`MANIFEST.tsv`](scripts/benchmark_images/MANIFEST.tsv)), and the raw run is `results/benchmark_20260528_203558.jsonl`.
 
 ---
 
