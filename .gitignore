@@ -97,8 +97,23 @@ datasets/
 benchmarks/results/
 benchmarks/images/*.jpg
 benchmarks/images/*.png
-# Benchmark runner outputs (scripts/)
-results/
+# Benchmark runner outputs (scripts/) — ignored by default (scratch runs), but
+# the canonical thesis evidence is force-tracked so README/IEEE citations
+# resolve and every claim is reproducible. Aborted/contaminated/superseded
+# partial runs stay ignored.
+results/*
+!results/.gitkeep
+# v3 (current) — grounds README "Key Findings" + IEEE report
+!results/findings_v3.md
+!results/benchmark_20260528_203558.jsonl
+!results/judge_scores_20260529_000539.jsonl
+!results/judge_summary_20260529_000539.md
+!results/planning_score_20260529_000027.jsonl
+!results/plan_scores_20260529_000027.md
+# v1 (superseded; kept for provenance — referenced by name inside findings_v3.md)
+!results/findings_5way_20260519.md
+!results/findings_cloud_20260519.md
+!results/benchmark_5way_merged.jsonl
 scripts/benchmark_images/*.jpg
 scripts/benchmark_images/*.jpeg
 scripts/benchmark_images/*.mp4
