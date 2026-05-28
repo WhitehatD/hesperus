@@ -49,6 +49,7 @@ import httpx
 ANALYSIS_MODELS = [
     "claude-haiku",
     "claude-sonnet",
+    "claude-sonnet-nothink",   # control arm: Sonnet at T=0.1 without extended thinking
     "gemini-3",
     "qwen3-vl",
     "qwen2.5-vl",
@@ -58,14 +59,20 @@ ANALYSIS_MODELS = [
 PLANNING_MODELS = [
     "claude-haiku",
     "claude-sonnet",
+    "claude-sonnet-nothink",   # control arm: Sonnet at T=0.1 without extended thinking
     "gemini-3-flash-preview",
-    # qwen3-vl excluded: no tool-calling support via llama.cpp OpenAI-compat API
+    "qwen3-vl",
+    # qwen2.5-vl excluded: empirically verified (2026-05-28) that the 3B model
+    # does NOT emit OpenAI tool_calls under llama.cpp --jinja default; it returns
+    # conversational text or markdown-fenced Python-style calls. The 30B variant
+    # (qwen3-vl) DOES support tool_use cleanly and is included.
 ]
 
 # ── Planning prompts ─────────────────────────────────────────────────────────
 # Realistic natural-language scheduling requests a user would give the IoT system
 
 PLANNING_PROMPTS = [
+    # P1-P10: original 10-prompt corpus (kept unchanged for back-compat with old JSONL)
     "Monitor the workspace every 30 minutes for the next 4 hours",
     "Take a photo every hour starting at 9am for 8 hours, stop if nothing changes",
     "Capture images every 15 minutes between 8am and 6pm on weekdays",
@@ -76,6 +83,15 @@ PLANNING_PROMPTS = [
     "Monitor continuously every 10 minutes for 1 hour to detect any activity",
     "Schedule daily monitoring at 8am and 5pm for the next week",
     "Take a photo immediately and then every 45 minutes for 3 hours",
+    # P11-P13: additional t=0-class probes added 2026-05-28 to strengthen the
+    # constraint-preservation finding from N=1 prompt to N=4. All four phrasings
+    # combine an immediate capture with a recurring schedule; the question is
+    # whether each backend preserves the t=0 component when forwarding to the
+    # planning engine. If only P10 fails the t=0 axis, the failure is anecdotal;
+    # if P10-P13 all fail, the failure is a robust LLM behavior pattern.
+    "Take a photo right now and then capture every 30 minutes for 2 hours",
+    "Start with a baseline capture, then take one every 1 hour for 4 hours",
+    "Take an immediate snapshot followed by hourly checks for the next 3 hours",
 ]
 
 
@@ -100,13 +116,31 @@ async def call_analyze(
     image_path: Path,
     model_key: str,
     objective: str,
+    rep_index: int = 0,
 ) -> dict:
+    """Send one analyze request to the benchmark server.
+
+    rep_index is appended to the objective as a hidden marker (e.g.,
+    "[rep 3] Monitor the workspace"). This defeats Anthropic/Gemini prompt
+    caching that would otherwise make reps 1-N return artificially low
+    latencies from a warm cache. The marker is text-only and does not affect
+    the visual analysis. Image bytes are also untouched, so vision is
+    deterministic on the input — only the text portion of the prompt differs
+    between reps.
+    """
     try:
         image_bytes = image_path.read_bytes()
+        # Per-rep + per-model nonce as a prefix to objective (token-cheap, cache-defeating).
+        # The model_key MUST be in the nonce: claude-sonnet and claude-sonnet-nothink both
+        # hit the same underlying model (claude-sonnet-4-6), so without arm-distinct nonces
+        # Anthropic's prompt cache serves the first arm's (thinking, T=1.0) response to the
+        # second arm (no-thinking, T=0.1), silently invalidating the control comparison.
+        # Tagging by model_key makes every arm cache-distinct AND gives uniform treatment.
+        objective_with_nonce = f"[rep {rep_index}|{model_key}] {objective}"
         r = await client.post(
             f"{server}/api/benchmark/analyze",
             files={"file": (image_path.name, image_bytes, "image/jpeg")},
-            data={"model_key": model_key, "objective": objective},
+            data={"model_key": model_key, "objective": objective_with_nonce},
             timeout=120.0,
         )
         r.raise_for_status()
@@ -127,11 +161,19 @@ async def call_plan(
     server: str,
     prompt: str,
     model_key: str,
+    rep_index: int = 0,
 ) -> dict:
+    # Per-rep nonce defeats prompt caching (Anthropic + Gemini). The nonce is
+    # prepended as a hidden marker so each rep sends a textually-different
+    # prompt; the actual scheduling intent is identical. Without this, reps
+    # 1..N would hit cache and report artificially low latencies.
     try:
+        # Per-rep + per-model nonce (see call_analyze for the cache-contamination
+        # rationale — claude-sonnet vs claude-sonnet-nothink share model claude-sonnet-4-6).
+        prompt_with_nonce = f"[rep {rep_index}|{model_key}] {prompt}"
         r = await client.post(
             f"{server}/api/benchmark/plan",
-            json={"prompt": prompt, "model_key": model_key},
+            json={"prompt": prompt_with_nonce, "model_key": model_key},
             timeout=60.0,
         )
         r.raise_for_status()
@@ -200,6 +242,14 @@ async def main() -> None:
     parser.add_argument("--no-planning", action="store_true", help="Skip planning benchmark")
     parser.add_argument("--out-dir", type=Path, default=repo_root / "results", help="Output directory for JSONL results")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible image sampling")
+    parser.add_argument(
+        "--reps",
+        type=int,
+        default=1,
+        help="Repetitions per (image,model) and (prompt,model) pair. Default 1. "
+             "Each row gets _rep_index field 0..reps-1. Use --reps 10 for proper "
+             "statistical variance estimation.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -225,14 +275,16 @@ async def main() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = args.out_dir / f"benchmark_{ts}.jsonl"
 
-    total_analysis = len(images) * len(analysis_models) if not args.no_analysis else 0
-    total_planning = len(PLANNING_PROMPTS) * len(planning_models) if not args.no_planning else 0
+    reps = max(1, args.reps)
+    total_analysis = len(images) * len(analysis_models) * reps if not args.no_analysis else 0
+    total_planning = len(PLANNING_PROMPTS) * len(planning_models) * reps if not args.no_planning else 0
     total = total_analysis + total_planning
 
     print(f"Thesis benchmark — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  Images   : {len(images)} ({args.images_dir if not args.images else 'explicit list'})")
-    print(f"  Analysis : {total_analysis} calls ({len(analysis_models)} models × {len(images)} images)")
-    print(f"  Planning : {total_planning} calls ({len(planning_models)} models × {len(PLANNING_PROMPTS)} prompts)")
+    print(f"  Reps     : {reps} per (image,model) and (prompt,model) pair")
+    print(f"  Analysis : {total_analysis} calls ({len(analysis_models)} models × {len(images)} images × {reps} reps)")
+    print(f"  Planning : {total_planning} calls ({len(planning_models)} models × {len(PLANNING_PROMPTS)} prompts × {reps} reps)")
     print(f"  Server   : {args.server}")
     print(f"  Output   : {out_file}")
     print()
@@ -255,47 +307,53 @@ async def main() -> None:
 
             # ── Analysis benchmark ──
             if not args.no_analysis:
-                print(f"[analysis] {len(images)} images × {analysis_models}")
-                for img in images:
-                    for model_key in analysis_models:
-                        result = await call_analyze(client, args.server, img, model_key, args.objective)
-                        done += 1
-                        row = {
-                            "_type": "analysis",
-                            "_timestamp": datetime.now().isoformat(),
-                            "_image": img.name,
-                            **result,
-                        }
-                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        all_results.append(row)
+                print(f"[analysis] {len(images)} images × {analysis_models} × {reps} reps")
+                for rep_idx in range(reps):
+                    for img in images:
+                        for model_key in analysis_models:
+                            result = await call_analyze(client, args.server, img, model_key, args.objective, rep_index=rep_idx)
+                            done += 1
+                            row = {
+                                "_type": "analysis",
+                                "_timestamp": datetime.now().isoformat(),
+                                "_image": img.name,
+                                "_rep_index": rep_idx,
+                                **result,
+                            }
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            f.flush()
+                            all_results.append(row)
 
-                        ok = result.get("success", False)
-                        lat = result.get("latency_ms", 0)
-                        status = f"{lat:.0f}ms" if ok else f"FAIL: {str(result.get('error', ''))[:60]}"
-                        print(f"  [{done:3}/{total}] {model_key:<28} {img.name:<20} {status}")
+                            ok = result.get("success", False)
+                            lat = result.get("latency_ms", 0)
+                            status = f"{lat:.0f}ms" if ok else f"FAIL: {str(result.get('error', ''))[:60]}"
+                            print(f"  [{done:4}/{total}] r{rep_idx} {model_key:<22} {img.name:<20} {status}")
 
             # ── Planning benchmark ──
             if not args.no_planning:
-                print(f"\n[planning] {len(PLANNING_PROMPTS)} prompts × {planning_models}")
-                for i, prompt in enumerate(PLANNING_PROMPTS):
-                    for model_key in planning_models:
-                        result = await call_plan(client, args.server, prompt, model_key)
-                        done += 1
-                        row = {
-                            "_type": "planning",
-                            "_timestamp": datetime.now().isoformat(),
-                            "_prompt_idx": i,
-                            "prompt": prompt,
-                            **result,
-                        }
-                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        all_results.append(row)
+                print(f"\n[planning] {len(PLANNING_PROMPTS)} prompts × {planning_models} × {reps} reps")
+                for rep_idx in range(reps):
+                    for i, prompt in enumerate(PLANNING_PROMPTS):
+                        for model_key in planning_models:
+                            result = await call_plan(client, args.server, prompt, model_key, rep_index=rep_idx)
+                            done += 1
+                            row = {
+                                "_type": "planning",
+                                "_timestamp": datetime.now().isoformat(),
+                                "_prompt_idx": i,
+                                "_rep_index": rep_idx,
+                                "prompt": prompt,
+                                **result,
+                            }
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            f.flush()
+                            all_results.append(row)
 
-                        ok = result.get("success", False)
-                        lat = result.get("latency_ms", 0)
-                        tool = result.get("tool_name") or "—"
-                        status = f"{lat:.0f}ms -> {tool}" if ok else f"FAIL: {str(result.get('error', ''))[:50]}"
-                        print(f"  [{done:3}/{total}] plan/{model_key:<22} prompt[{i}] {status}")
+                            ok = result.get("success", False)
+                            lat = result.get("latency_ms", 0)
+                            tool = result.get("tool_name") or "—"
+                            status = f"{lat:.0f}ms -> {tool}" if ok else f"FAIL: {str(result.get('error', ''))[:50]}"
+                            print(f"  [{done:4}/{total}] r{rep_idx} plan/{model_key:<22} prompt[{i}] {status}")
 
     print(f"\nDone. {done}/{total} calls completed -> {out_file}")
     print_summary(all_results)

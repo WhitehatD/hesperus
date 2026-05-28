@@ -139,17 +139,25 @@ async def _plan_with_claude(prompt: str, model: str) -> list[ScheduledTask]:
 
 
 async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
-    """Generate schedule using local vLLM (OpenAI-compatible API)."""
+    """Generate schedule using local vLLM / llama.cpp (OpenAI-compatible API).
+
+    Routes by model_key to the correct backend URL/model. Mirrors the
+    analysis-engine routing pattern so qwen3-vl hits port 8001 and qwen2.5-vl
+    hits port 8002.
+    """
     from openai import AsyncOpenAI
 
-    model_name = (
-        settings.vllm_model
-        if model_key == "qwen3-vl"
-        else "Qwen/Qwen2.5-VL-3B-Instruct"
-    )
+    if model_key == "qwen3-vl":
+        base_url = settings.vllm_base_url
+        model_name = settings.vllm_model
+    elif model_key == "qwen2.5-vl":
+        base_url = settings.vllm_qwen25_base_url
+        model_name = settings.vllm_qwen25_model
+    else:
+        raise ValueError(f"Unknown vllm model_key for planning: {model_key}")
 
     client = AsyncOpenAI(
-        base_url=settings.vllm_base_url,
+        base_url=base_url,
         api_key="not-needed",
     )
 
