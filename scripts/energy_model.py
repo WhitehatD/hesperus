@@ -29,6 +29,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 
 # -----------------------------------------------------------------------------
@@ -148,6 +150,36 @@ def continuous_daily_j(active_scale: float = 1.0) -> dict:
     return {"total_j": total}
 
 
+def measured_daily_j(
+    total_window_ms: float,
+    total_ps_rest_ms: float,
+    total_capture_ms: float,
+    active_scale: float = 1.0,
+) -> dict | None:
+    """24 h energy from a MEASURED duty cycle (firmware energy phase-timer).
+
+    Splits the observed time into three buckets, each at its datasheet current:
+      - ps_rest  -> WIFI_PS_REST (STOP2 + WiFi-PS, ~3 mA)
+      - capture  -> active burst (MCU + camera + WiFi TX, ~399 mA)
+      - other    -> keepalive/service wakes (MCU run + WiFi-PS, camera off)
+    The DUTY CYCLE is measured; the absolute currents remain datasheet values.
+    """
+    if total_window_ms <= 0:
+        return None
+    f_rest = total_ps_rest_ms / total_window_ms
+    f_cap = total_capture_ms / total_window_ms
+    f_other = max(1.0 - f_rest - f_cap, 0.0)
+    i_rest = wifi_ps_rest_current_ma()
+    i_cap = active_burst_current_ma(active_scale)
+    i_other = I_MCU_RUN_MA + I_WIFI_PS_MA  # awake but not capturing (camera off)
+    avg_ma = f_rest * i_rest + f_cap * i_cap + f_other * i_other
+    total_j = (avg_ma / 1000.0) * VOLTAGE_V * 86400.0
+    return {
+        "f_rest": f_rest, "f_cap": f_cap, "f_other": f_other,
+        "avg_ma": avg_ma, "total_j": total_j,
+    }
+
+
 def battery_life_days(daily_j: float, battery_mah: float) -> float:
     """Days of runtime on a battery of given mAh at the system voltage."""
     battery_j = (battery_mah / 1000.0) * VOLTAGE_V * 3600.0  # mAh -> Ah -> C -> J
@@ -173,6 +205,10 @@ def main() -> int:
                     help="Scheduled capture interval (min). Default 30.")
     ap.add_argument("--battery-mah", type=float, default=2000.0,
                     help="Battery capacity for runtime projection (mAh). Default 2000 (e.g. 18650-ish).")
+    ap.add_argument("--measured-json", type=Path, default=None,
+                    help="Path to a saved /api/benchmark/energy JSON export. When given, "
+                         "appends a MEASURED-duty-cycle result computed from real on-device "
+                         "telemetry (RQ3 Tier 1) alongside the datasheet projection.")
     args = ap.parse_args()
 
     # Validate at the CLI boundary: the duty-cycle model is undefined for a
@@ -253,6 +289,36 @@ def main() -> int:
     print(f"  DEEP_DORMANT  (~{ratio_sched:.0f}x): WiFi off; maximum savings; latency until scheduled wake.")
     print(f"  The DEEP_DORMANT ratio is dominated by duty cycle; robust to +/-{ACTIVE_TOLERANCE_PCT:.0f}% current error.")
     print(f"  All Joule figures carry +/-{ACTIVE_TOLERANCE_PCT:.0f}% datasheet uncertainty; the ratio does not.")
+
+    # ── MEASURED duty cycle (RQ3 Tier 1) ──────────────────────────────────────
+    if args.measured_json:
+        try:
+            data = json.loads(args.measured_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"\n-- MEASURED -- could not read {args.measured_json}: {e}")
+            return 1
+        tw = float(data.get("total_window_ms", 0))
+        tr = float(data.get("total_ps_rest_ms", 0))
+        tc = float(data.get("total_capture_ms", 0))
+        m = measured_daily_j(tw, tr, tc)
+        print("\n-- MEASURED duty cycle (on-device energy phase-timer) --")
+        if not m:
+            print(f"  No telemetry yet (windows={data.get('windows', 0)}, total_window_ms=0). "
+                  "Deploy the board in WIFI_PS_REST and let it report.")
+        else:
+            cont = continuous_daily_j()
+            ratio = cont["total_j"] / m["total_j"]
+            print(f"  windows        : {data.get('windows', '?')} "
+                  f"(total observed {tw/1000:.0f} s = {tw/3.6e6:.2f} h)")
+            print(f"  measured split : ps_rest {m['f_rest']*100:.2f}%  "
+                  f"capture {m['f_cap']*100:.3f}%  keepalive/other {m['f_other']*100:.2f}%")
+            print(f"  measured avg I : {m['avg_ma']:.3f} mA")
+            print(f"  energy/day     : {fmt_j(m['total_j'])}  ->  {ratio:.0f}x vs continuous")
+            print(f"  battery life   : {battery_life_days(m['total_j'], args.battery_mah):.1f} days "
+                  f"on {args.battery_mah:.0f} mAh")
+            print("  NOTE: the DUTY CYCLE is measured from real operation; component currents "
+                  "remain datasheet values (no power meter — Tier 1).")
+
     return 0
 
 
