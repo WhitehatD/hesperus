@@ -121,6 +121,13 @@ static uint32_t s_sequence_base_task_id = 30000;
 /* ── Sleep mode toggle (MQTT command) ───────────────────── */
 static volatile uint8_t s_sleep_enabled = 0;  /* 0 = stay awake (agent controls sleep via sleep_mode MQTT) */
 
+/* ── PS-REST low-power mode (MQTT command) ──────────────── */
+/* 0 = always-awake (default; no behaviour change).
+ * 1 = PS-REST: STOP2 + WiFi associated in 802.11 power-save.
+ *     Board polls MQTT every REST_POLL_S seconds; agent-controllable
+ *     at any time via EXTI/MQTT wake or B3 button override. */
+static volatile uint8_t s_lp_mode = 0;
+
 /* ── OTA firmware update (MQTT command) ─────────────────── */
 static volatile uint8_t s_ota_requested = 0;
 static volatile uint8_t s_ota_in_progress = 0;  /* Lock for s_image_buffer */
@@ -166,10 +173,12 @@ static void _do_ota_update(void);
 static void _do_wifi_reconfig(void);
 static void _do_ping_sequence(void);
 static void _do_start_portal(void);
+static void EnterPSRest(void);
 
 /* SEC-07: Watchdog initialization */
 #if WATCHDOG_ENABLED
 static void Watchdog_Init(void);
+static void Watchdog_FreezeInStop(void);
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -434,6 +443,32 @@ static void on_command_received(const char *json_str, uint32_t length)
             LOG_INFO(TAG_MQTT, ">> SLEEP_MODE %s", s_sleep_enabled ? "ENABLED" : "DISABLED");
         }
     }
+    else if (type_str != NULL && strcmp(type_str, "low_power_mode") == 0)
+    {
+        /* ── PS-REST low-power mode toggle ──
+         *   {"type":"low_power_mode","mode":"ps_rest"} → STOP2+WiFi-PS poll loop
+         *   {"type":"low_power_mode","mode":"off"}     → always-awake (default)    */
+        cJSON *mode_obj = cJSON_GetObjectItemCaseSensitive(root, "mode");
+        const char *mode_label = "off";
+        if (mode_obj && cJSON_IsString(mode_obj) && mode_obj->valuestring != NULL)
+        {
+            if (strcmp(mode_obj->valuestring, "ps_rest") == 0)
+            {
+                s_lp_mode  = 1;
+                mode_label = "ps_rest";
+            }
+            else
+            {
+                s_lp_mode  = 0;
+                mode_label = "off";
+            }
+        }
+        LOG_INFO(TAG_MQTT, ">> LOW_POWER_MODE %s", mode_label);
+        char status_msg[64];
+        snprintf(status_msg, sizeof(status_msg),
+                 "{\"status\":\"lp_mode\",\"mode\":\"%s\"}", mode_label);
+        MQTT_PublishStatus(status_msg);
+    }
     else if (type_str != NULL && strcmp(type_str, "delete_schedule") == 0)
     {
         /* ── Delete / clear active schedule ── */
@@ -580,6 +615,10 @@ int main(void)
 
     /* SEC-07: Initialize IWDG — must be after all blocking HAL inits */
 #if WATCHDOG_ENABLED
+    /* Ensure the IWDG is frozen during STOP2 BEFORE starting it. One-time
+     * option-byte program (resets once on first boot after flashing). Without
+     * this, any low-power sleep > ~16s would be reset by the watchdog. */
+    Watchdog_FreezeInStop();
     Watchdog_Init();
 #endif
 
@@ -867,7 +906,36 @@ int main(void)
             idle_led_on = 0;
             /* Keep last_idle_blink anchor for stable IDLE_BLINK_PERIOD_MS period */
         }
-        HAL_Delay(SCHEDULER_MQTT_POLL_MS);
+        /* ── PS-REST gate ──
+         * When the agent has enabled PS-REST (low_power_mode=ps_rest) and no
+         * work is pending, enter WIFI_PS_REST: WiFi stays associated in 802.11
+         * power-save and the MCU sleeps in STOP2, waking on the REST_POLL_S RTC
+         * alarm floor or sub-second on the NOTIFY/PD14 line when a command
+         * arrives. Verified on-device 2026-05-28 (wake-on-ping 0.1-2.6s, MQTT
+         * survives, capture pipeline runs from rest). This was only possible
+         * after fixing two STOP2-wake bugs that had never been exercised
+         * (LOW_POWER_MODE_ENABLED was 0): the IWDG_STOP option-byte mask
+         * (Watchdog_FreezeInStop) and the STM32U5 Smart-Run-Domain RTC clock
+         * (SRDAMR.RTCAPBAMEN, HAL_RTC_MspInit). Default behavior is unchanged:
+         * s_lp_mode defaults to 0 so this path is never taken unless the agent
+         * opts in. The 7 work-flags below ensure we never sleep with work queued;
+         * IWDG is refreshed on every wake inside EnterPSRest(). */
+        if (s_lp_mode == 1
+            && _capture_queue_empty()
+            && !s_sequence_requested
+            && !s_button_held
+            && !s_capture_now_requested
+            && !s_wifi_reconfig_requested
+            && !s_ota_requested
+            && !s_portal_requested
+            && !s_ping_requested)
+        {
+            EnterPSRest();
+        }
+        else
+        {
+            HAL_Delay(SCHEDULER_MQTT_POLL_MS);
+        }
 
         /* ── Handle: Capture Queue (MQTT commands) ── */
         /* Dequeue one capture per loop iteration. Each capture+upload takes ~7s,
@@ -1146,10 +1214,46 @@ int main(void)
                 int alarm_result = Scheduler_SetNextAlarm(&s_schedule);
                 if (alarm_result == 0)
                 {
+                    /* Announce DEEP_DORMANT so the server-side command queue
+                     * holds any commands until we wake + reconnect (WiFi is
+                     * fully off during dormancy — the board is deaf until the
+                     * scheduled wake or a B3 press). */
+                    {
+                        char dormant_msg[80];
+                        snprintf(dormant_msg, sizeof(dormant_msg),
+                                 "{\"status\":\"deep_dormant\",\"until\":\"%02u:%02u:%02u\"}",
+                                 next->hour, next->minute, next->second);
+                        MQTT_PublishStatus(dormant_msg);
+                        HAL_Delay(50);  /* let the publish flush before disconnect */
+                    }
                     MQTT_Disconnect();
                     WiFi_DeInit();
                     Camera_DeInit();  /* Power down camera for sleep */
+                    uint32_t btn_tick_before = s_button_press_tick;
                     Scheduler_EnterLowPower();
+
+                    /* Refresh IWDG immediately on wake: the reconnect sequence
+                     * below (WiFi assoc + retries) can take several seconds, and
+                     * the IWDG resumes counting the moment we leave STOP2. Reset
+                     * its counter now so the wake reinit can't trip it. */
+#if WATCHDOG_ENABLED
+                    HAL_IWDG_Refresh(&hiwdg);
+#endif
+
+                    /* ── ANTI-BRICK: B3 button force-wake override ──
+                     * The B3 button is an EXTI source and wakes STOP2. If the
+                     * button (not the RTC alarm) woke us, the operator is
+                     * physically asking the board to stay awake — clear the
+                     * sleep opt-in so the board returns to ACTIVE and is fully
+                     * agent-reachable. This is the always-works physical escape
+                     * hatch that guarantees the board can never be bricked into
+                     * unreachable sleep. */
+                    if (s_button_press_tick != btn_tick_before)
+                    {
+                        s_sleep_enabled = 0;
+                        s_button_held = 0;
+                        LOG_WARN(TAG_PWR, "B3 woke board from STOP2 — sleep DISABLED, staying ACTIVE");
+                    }
 
                     /* Woke up — reconnect everything using runtime creds */
                     WiFi_Init();
@@ -1157,6 +1261,10 @@ int main(void)
                     MQTT_Init(&mqtt_cfg);
                     MQTT_SubscribeCommands(on_command_received);
                     last_ping = HAL_GetTick();
+                    if (s_sleep_enabled == 0)
+                    {
+                        MQTT_PublishStatus("{\"status\":\"awake\",\"reason\":\"button_override\"}");
+                    }
 
                     /* Re-initialize camera after sleep wake-up */
                     Camera_Init(CAMERA_DEFAULT_RESOLUTION);
@@ -1272,6 +1380,16 @@ static void RTC_Init(void)
      * Without this, CPU reads from RTC registers return 0. */
     __HAL_RCC_RTCAPB_CLK_ENABLE();
 
+    /* Enable RTC clock in the Smart-Run-Domain AUTONOMOUS + Sleep/Stop registers.
+     * CRITICAL for STOP2 wake on STM32U5 (RM0456 §11.8.44/45): without
+     * SRDAMR.RTCAPBAMEN ("RTC Autonomous Mode Enable in Stop 0,1,2") the RTC
+     * alarm flag still sets but the CPU does NOT exit Stop — verified on-device:
+     * the board slept through its 3s alarm and only the (then-unfrozen) IWDG
+     * recovered it. This is the documented, low-visibility U5 gotcha; no EXTI
+     * line config is needed (that is legacy L4/F4). */
+    __HAL_RCC_RTCAPB_CLKAM_ENABLE();     /* SRDAMR.RTCAPBAMEN — wake from STOP0/1/2 */
+    __HAL_RCC_RTCAPB_CLK_SLEEP_ENABLE(); /* APB3SMENR.RTCAPBSMEN — clocked in sleep/stop */
+
     LOG_DEBUG(TAG_BOOT, "After RTCSEL: BDCR=0x%08lX (LSION=%lu LSIRDY=%lu)",
               (unsigned long)RCC->BDCR,
               (unsigned long)(RCC->BDCR & RCC_BDCR_LSION),
@@ -1364,6 +1482,70 @@ static void LED_SignalError(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #if WATCHDOG_ENABLED
+/*
+ * Freeze the IWDG during STOP2 via the IWDG_STOP user option byte.
+ *
+ * CRITICAL for low-power: on STM32U5 the IWDG is clocked by LSI, which keeps
+ * running in STOP2. With the default option (IWDG_STOP=RUN) the watchdog would
+ * keep counting while the MCU sleeps and reset the board ~16s into any sleep
+ * longer than the timeout — bricking every realistic schedule. Programming the
+ * option byte to FREEZE stops the IWDG counter during STOP2; it still protects
+ * the active/execute phases (refreshed in the main loop).
+ *
+ * This is a one-time persistent option-byte write. It is GUARDED: if the bit is
+ * already FREEZE we do nothing (no reset loop). HAL_FLASH_OB_Launch() applies
+ * the new option bytes via a system reset, so on the first boot after flashing
+ * the board resets once; every subsequent boot sees FREEZE and skips.
+ */
+static void Watchdog_FreezeInStop(void)
+{
+    FLASH_OBProgramInitTypeDef ob = {0};
+    HAL_FLASHEx_OBGetConfig(&ob);
+
+    /* USERConfig holds the raw FLASH->OPTR bits (FLASH_OB_GetUser), so the
+     * IWDG_STOP state must be read with the OPTR BIT mask (FLASH_OPTR_IWDG_STOP,
+     * bit 17 = 0x20000) — NOT OB_USER_IWDG_STOP (0x40), which is the HAL
+     * *selector* used only by OBProgram. Masking the selector tested bit 6 and
+     * ALWAYS reported "frozen" (false positive), so the freeze was never
+     * programmed and the IWDG kept running in STOP — resetting the board ~16s
+     * into every sleep (confirmed on-device 2026-05-28). OB_IWDG_STOP_FREEZE==0,
+     * OB_IWDG_STOP_RUN==FLASH_OPTR_IWDG_STOP. */
+    if ((ob.USERConfig & FLASH_OPTR_IWDG_STOP) != OB_IWDG_STOP_FREEZE)
+    {
+        LOG_WARN(TAG_BOOT, "IWDG set to RUN-in-STOP — programming FREEZE (one-time, will reset)");
+
+        if (HAL_FLASH_Unlock() != HAL_OK || HAL_FLASH_OB_Unlock() != HAL_OK)
+        {
+            LOG_ERROR(TAG_BOOT, "Option-byte unlock failed — IWDG_STOP unchanged");
+            return;
+        }
+
+        FLASH_OBProgramInitTypeDef prog = {0};
+        prog.OptionType  = OPTIONBYTE_USER;
+        prog.USERType    = OB_USER_IWDG_STOP;
+        prog.USERConfig  = OB_IWDG_STOP_FREEZE;
+
+        if (HAL_FLASHEx_OBProgram(&prog) != HAL_OK)
+        {
+            LOG_ERROR(TAG_BOOT, "IWDG_STOP option-byte program failed");
+            HAL_FLASH_OB_Lock();
+            HAL_FLASH_Lock();
+            return;
+        }
+
+        /* Applies the new option bytes — triggers a system reset. */
+        HAL_FLASH_OB_Launch();
+
+        /* Not normally reached (reset above); lock defensively if it returns. */
+        HAL_FLASH_OB_Lock();
+        HAL_FLASH_Lock();
+    }
+    else
+    {
+        LOG_INFO(TAG_BOOT, "IWDG already frozen in STOP — safe for low-power sleep");
+    }
+}
+
 static void Watchdog_Init(void)
 {
     hiwdg.Instance = IWDG;
@@ -2086,6 +2268,72 @@ static void _do_start_portal(void)
 
     CaptivePortal_Start();  /* Blocks until configured + auto-reboots */
     /* Never returns */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  PS-REST — STOP2 + WiFi-associated power-save poll cycle
+ *
+ *  Called from the main loop when s_lp_mode == 1 and no pending work exists.
+ *  WiFi stays associated (802.11 power-save mode) so the board remains
+ *  agent-reachable: the MQTT broker holds QoS-0 publishes while we sleep,
+ *  and EXTI14 (NOTIFY line) or EXTI13 (B3 button) can break STOP2 early.
+ *
+ *  Guard: skipped if MQTT is disconnected — keeps the board awake for
+ *  reconnect recovery.
+ *
+ *  On return the main-loop top calls MQTT_ProcessLoop() which drains any
+ *  pending RX that accumulated during the sleep interval.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void EnterPSRest(void)
+{
+    /* Guard: if MQTT is not up, stay awake for reconnect recovery */
+    if (!MQTT_IsConnected())
+    {
+        LOG_WARN(TAG_PWR, "PS-REST: MQTT disconnected — skipping sleep");
+        HAL_Delay(SCHEDULER_MQTT_POLL_MS);
+        return;
+    }
+
+#if WIFI_POWERSAVE_ENABLED
+    /* 802.11 power-save: WiFi stays ASSOCIATED, EMW3080 DTIM-sleeps. */
+    MX_WIFI_station_powersave(wifi_obj_get(), 1);
+#endif
+
+    /* Arm RTC Alarm A REST_POLL_S from now (keepalive/poll). STOP2 also wakes
+     * early on the NOTIFY/PD14 (EXTI14) line when a command arrives -> the
+     * RTC alarm is the floor, NOTIFY gives sub-second wake-on-ping. */
+    if (Scheduler_SetShortAlarm(REST_POLL_S) != 0)
+    {
+        LOG_ERROR(TAG_PWR, "PS-REST: SetShortAlarm failed — active wait");
+#if WIFI_POWERSAVE_ENABLED
+        MX_WIFI_station_powersave(wifi_obj_get(), 0);
+#endif
+        HAL_Delay(SCHEDULER_MQTT_POLL_MS);
+        return;
+    }
+
+    uint32_t btn_tick_before = s_button_press_tick;
+
+    Scheduler_EnterLowPower();   /* STOP2: wakes on Alarm A / NOTIFY EXTI14 / B3 */
+
+#if WATCHDOG_ENABLED
+    HAL_IWDG_Refresh(&hiwdg);    /* IWDG resumes on STOP2 exit — refresh now */
+#endif
+
+#if WIFI_POWERSAVE_ENABLED
+    /* Back to full power so MQTT_ProcessLoop services pending RX promptly */
+    MX_WIFI_station_powersave(wifi_obj_get(), 0);
+#endif
+
+    /* B3 override: physical press during STOP2 exits PS-REST mode */
+    if (s_button_press_tick != btn_tick_before)
+    {
+        s_lp_mode = 0;
+        s_button_held = 0;
+        LOG_WARN(TAG_PWR, "PS-REST: B3 pressed during sleep — LP mode DISABLED");
+        MQTT_PublishStatus("{\"status\":\"awake\",\"reason\":\"button_override\"}");
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

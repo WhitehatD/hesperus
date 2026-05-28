@@ -187,7 +187,8 @@ All commands are JSON payloads published to `device/stm32/commands`:
 | Schedule | `{"type":"schedule","tasks":[...]}` | AI-generated task schedule |
 | Delete Schedule | `{"type":"delete_schedule"}` | Clear active schedule |
 | Firmware Update | `{"type":"firmware_update"}` | Trigger OTA update check |
-| Sleep Mode | `{"type":"sleep_mode","enabled":true}` | Toggle STOP2 between tasks |
+| Sleep Mode | `{"type":"sleep_mode","enabled":true}` | DEEP_DORMANT (~2µA): WiFi off, STOP2 until next scheduled task |
+| Low-Power Mode | `{"type":"low_power_mode","mode":"ps_rest"}` | WIFI_PS_REST: WiFi-associated STOP2 with sub-second wake-on-ping (`"off"` to disable) |
 | Ping | `{"type":"ping"}` | LED strobe + acknowledgment |
 | Set WiFi | `{"type":"set_wifi","ssid":"...","password":"..."}` | Remote WiFi reconfiguration |
 | Erase WiFi | `{"type":"erase_wifi"}` | Erase credentials + reboot to portal |

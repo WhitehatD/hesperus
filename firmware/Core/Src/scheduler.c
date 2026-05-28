@@ -398,3 +398,68 @@ void Scheduler_EnterLowPower(void)
     }
 #endif
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Short-interval RTC Alarm — PS-REST poll wake
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief  Set RTC Alarm A to fire `seconds` from the current RTC time.
+ *
+ * Mirrors Scheduler_SetNextAlarm() in alarm-config style (HAL_RTC_SetAlarm_IT,
+ * RTC_ALARMMASK_DATEWEEKDAY, RTC_FORMAT_BIN) but computes the target time
+ * by adding an offset to the current clock reading rather than using a
+ * fixed schedule entry.  Handles second, minute, and hour rollover in
+ * pure BIN arithmetic (no BCD conversion required since we use BIN format
+ * throughout).
+ *
+ * @param  seconds  Offset from now in seconds (practical range 1..3599).
+ * @retval 0 on success, -1 on HAL error.
+ */
+int Scheduler_SetShortAlarm(uint32_t seconds)
+{
+    RTC_TimeTypeDef now_time;
+    RTC_DateTypeDef now_date;
+
+    /* Read current RTC time (BIN format; must read date afterwards per RM) */
+    HAL_RTC_GetTime(&hrtc, &now_time, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &now_date, RTC_FORMAT_BIN);
+
+    /* Convert current time to seconds-of-day, add offset, wrap at 86400 */
+    uint32_t now_secs = (uint32_t)now_time.Hours   * 3600u
+                      + (uint32_t)now_time.Minutes * 60u
+                      + (uint32_t)now_time.Seconds;
+    uint32_t target_secs = (now_secs + seconds) % 86400u;
+
+    /* Decompose back to H:M:S */
+    uint8_t target_h = (uint8_t)(target_secs / 3600u);
+    uint8_t target_m = (uint8_t)((target_secs % 3600u) / 60u);
+    uint8_t target_s = (uint8_t)(target_secs % 60u);
+
+    LOG_DEBUG(TAG_PWR, "SetShortAlarm: now=%02u:%02u:%02u + %lus = %02u:%02u:%02u",
+              now_time.Hours, now_time.Minutes, now_time.Seconds,
+              (unsigned long)seconds, target_h, target_m, target_s);
+
+    /* Configure and arm Alarm A — mirror SetNextAlarm() style exactly */
+    RTC_AlarmTypeDef alarm = {0};
+    alarm.AlarmTime.Hours          = target_h;
+    alarm.AlarmTime.Minutes        = target_m;
+    alarm.AlarmTime.Seconds        = target_s;
+    alarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    alarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_RESET;
+    alarm.AlarmMask                = RTC_ALARMMASK_DATEWEEKDAY;
+    alarm.AlarmSubSecondMask       = RTC_ALARMSUBSECONDMASK_ALL;
+    alarm.Alarm                    = RTC_ALARM_A;
+
+    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN) != HAL_OK)
+    {
+        LOG_ERROR(TAG_PWR, "SetShortAlarm: HAL_RTC_SetAlarm_IT failed");
+        return -1;
+    }
+
+    LOG_INFO(TAG_PWR, "Short alarm set — PS-REST wake at %02u:%02u:%02u",
+             target_h, target_m, target_s);
+    return 0;
+}

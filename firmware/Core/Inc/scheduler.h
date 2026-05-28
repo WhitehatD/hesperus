@@ -65,4 +65,13 @@ const ScheduledTask_t *Scheduler_GetCurrentTask(Schedule_t *schedule);
  */
 void Scheduler_EnterLowPower(void);
 
+/**
+ * @brief  Set RTC Alarm A to fire `seconds` from the current RTC time.
+ *         Handles second/minute/hour rollover correctly (BIN format).
+ *         Intended for short PS-REST poll wakes.
+ * @param  seconds: Wake-up offset in seconds (1..3599).
+ * @retval 0 on success, -1 on HAL failure.
+ */
+int Scheduler_SetShortAlarm(uint32_t seconds);
+
 #endif /* __SCHEDULER_H */
