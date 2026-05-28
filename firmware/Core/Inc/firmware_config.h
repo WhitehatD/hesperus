@@ -143,6 +143,7 @@
 #define DEEP_SLEEP_ON_COMPLETE      0      /* 0 = no automatic standby — agent-controlled only */
 #define WIFI_POWERSAVE_ENABLED      1      /* 1 = MX_WIFI_station_powersave in WIFI_PS_REST */
 #define MQTT_KEEPALIVE_S            45     /* RTC keepalive-wake period; MUST be < broker keepalive (mosquitto default 60s) */
+#define ENERGY_REPORT_INTERVAL_MS  60000U /* ms between energy state-time publishes (PS-REST only) */
 #define DEEP_DORMANT_ENABLED        1      /* 1 = allow agent-commanded ~2uA dormant mode */
 #define REST_POLL_S                 3      /* PS-REST STOP2 wake interval in seconds (keepalive RTC tick) */
 
