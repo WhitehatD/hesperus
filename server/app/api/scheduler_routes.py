@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.database import get_db
-from app.mqtt.client import mqtt_client
+from app.mqtt.client import mqtt_client, send_board_command
 from app.scheduler import service
 from app.scheduler.notify import notify_schedule_update
 from app.api.schemas import (
@@ -69,7 +69,7 @@ async def update_schedule(
     # Re-publish to board if active
     if schedule.is_active:
         mqtt_payload = await service.activate_schedule(db, schedule_id)
-        mqtt_client.publish(settings.mqtt_topic_commands, json.dumps(mqtt_payload))
+        send_board_command(mqtt_client, settings.mqtt_topic_commands, json.dumps(mqtt_payload))
         # activate_schedule commits and expires the session — re-fetch with eager-loaded tasks
         schedule = await service.get_schedule(db, schedule_id)
 
@@ -86,7 +86,7 @@ async def activate_schedule(schedule_id: int, db: AsyncSession = Depends(get_db)
     mqtt_payload = await service.activate_schedule(db, schedule_id)
     payload_json = json.dumps(mqtt_payload)
 
-    mqtt_client.publish(settings.mqtt_topic_commands, payload_json)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload_json)
 
     await notify_schedule_update()
 
@@ -102,7 +102,7 @@ async def deactivate_schedule(schedule_id: int, db: AsyncSession = Depends(get_d
     """Deactivate a schedule and tell the board to clear it."""
     await service.deactivate_schedule(db, schedule_id)
     payload = json.dumps({"type": "delete_schedule"})
-    mqtt_client.publish(settings.mqtt_topic_commands, payload)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
     await notify_schedule_update()
     return {"status": "deactivated", "schedule_id": schedule_id}
 
@@ -111,7 +111,7 @@ async def deactivate_schedule(schedule_id: int, db: AsyncSession = Depends(get_d
 async def set_sleep_mode(enabled: bool = True):
     """Toggle sleep mode on the STM32 board via MQTT."""
     payload = json.dumps({"type": "sleep_mode", "enabled": enabled})
-    mqtt_client.publish(settings.mqtt_topic_commands, payload)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
     return {"status": "ok", "sleep_enabled": enabled}
 
 
@@ -120,7 +120,7 @@ async def delete_schedule(schedule_id: int, db: AsyncSession = Depends(get_db)):
     """Delete a schedule and notify the board to clear it."""
     await service.delete_schedule(db, schedule_id)
     payload = json.dumps({"type": "delete_schedule", "schedule_id": schedule_id})
-    mqtt_client.publish(settings.mqtt_topic_commands, payload)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
     await notify_schedule_update()
 
 

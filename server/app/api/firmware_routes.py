@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from app.config import settings
 from app.api.schemas import FirmwareVersionResponse, FirmwareUploadResponse
-from app.mqtt.client import mqtt_client
+from app.mqtt.client import mqtt_client, send_board_command
 
 router = APIRouter()
 
@@ -211,7 +211,7 @@ async def upload_firmware(
     })
     
     try:
-        mqtt_client.publish(settings.mqtt_topic_commands, update_command)
+        send_board_command(mqtt_client, settings.mqtt_topic_commands, update_command)
     except Exception as exc:
         print(f"[Firmware Upload] WARNING: MQTT publish failed: {exc}")
         # We don't fail the request because the file is safely saved on disk,
@@ -268,7 +268,7 @@ async def notify_firmware_update(
     })
 
     try:
-        mqtt_client.publish(settings.mqtt_topic_commands, update_command)
+        send_board_command(mqtt_client, settings.mqtt_topic_commands, update_command)
     except Exception as exc:
         raise HTTPException(
             status_code=503,

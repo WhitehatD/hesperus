@@ -14,7 +14,7 @@ from app.api.schemas import WifiConfigRequest, WifiConfigResponse
 from app.config import settings
 from app.db import database as db
 from app.db.wifi_models import WifiConfig
-from app.mqtt.client import mqtt_client
+from app.mqtt.client import mqtt_client, send_board_command
 
 router = APIRouter()
 
@@ -62,8 +62,8 @@ async def set_wifi_config(request: WifiConfigRequest):
         "ssid": request.ssid,
         "password": request.password,
     }
-    mqtt_client.publish(
-        settings.mqtt_topic_commands, json.dumps(command)
+    send_board_command(
+        mqtt_client, settings.mqtt_topic_commands, json.dumps(command)
     )
 
     return WifiConfigResponse(

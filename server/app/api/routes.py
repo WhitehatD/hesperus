@@ -23,7 +23,7 @@ from app.api.schemas import (
 from app.analysis.engine import analyze_image
 from app.analysis.models import AnalysisResult
 from app.db.database import get_db, async_session
-from app.mqtt.client import mqtt_client
+from app.mqtt.client import mqtt_client, send_board_command
 from app.planning.engine import generate_plan
 from app.scheduler.models import ScheduleTask
 from app.benchmark import timing as _timing
@@ -61,7 +61,7 @@ async def create_plan(request: PlanRequest):
 
     # Publish schedule to STM32 via MQTT
     schedule_json = json.dumps({"type": "schedule", "tasks": [t.model_dump() for t in plan.tasks]})
-    mqtt_client.publish(settings.mqtt_topic_commands, schedule_json)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, schedule_json)
 
     return plan
 
@@ -76,7 +76,7 @@ async def capture_now(request: CaptureRequest = CaptureRequest()):
     task_id = next_task_id()
     command = {"type": "capture_now", "task_id": task_id}
     command_json = json.dumps(command)
-    mqtt_client.publish(settings.mqtt_topic_commands, command_json)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
 
     return CaptureResponse(
         task_id=task_id,
@@ -92,7 +92,7 @@ async def ping_board():
     """
     command = {"type": "ping"}
     command_json = json.dumps(command)
-    mqtt_client.publish(settings.mqtt_topic_commands, command_json)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
 
     return {
         "status": "sent",
@@ -114,7 +114,7 @@ async def erase_wifi(request: Request):
 
     command = {"type": "erase_wifi"}
     command_json = json.dumps(command)
-    mqtt_client.publish(settings.mqtt_topic_commands, command_json)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
 
     return {
         "status": "sent",
