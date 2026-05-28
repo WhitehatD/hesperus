@@ -127,10 +127,24 @@
 #define DEBUG_LOG_ENABLED           1      /* Set to 0 to disable all logging */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Low Power Configuration
+ *  Low Power Configuration — Adaptive Duty-Cycling (WIFI_PS_REST + DEEP_DORMANT)
+ *
+ *  Default rest = WIFI_PS_REST: WiFi associated in 802.11 power-save (DTIM),
+ *  MCU in STOP2, woken sub-second by the EMW3080 NOTIFY line (PD14/EXTI14) on an
+ *  incoming MQTT command. A short RTC keepalive wake services the socket so the
+ *  link never times out. This gives ~mA-class energy AND wake-on-ping with no
+ *  server queue. DEEP_DORMANT (opt-in, agent-commanded) drops WiFi entirely for
+ *  ~2uA, waking only on a scheduled deadline or the B3 button.
+ *
+ *  REQUIRES the IWDG_STOP option byte = FREEZE (programmed by Watchdog_FreezeInStop
+ *  in main.c) or the watchdog resets the board mid-sleep.
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define LOW_POWER_MODE_ENABLED      0      /* 0 = stay awake — agent sends sleep_mode to engage STOP2 */
+#define LOW_POWER_MODE_ENABLED      1      /* 1 = real STOP2 sleep (was 0 = active-wait stub) */
 #define DEEP_SLEEP_ON_COMPLETE      0      /* 0 = no automatic standby — agent-controlled only */
+#define WIFI_POWERSAVE_ENABLED      1      /* 1 = MX_WIFI_station_powersave in WIFI_PS_REST */
+#define MQTT_KEEPALIVE_S            45     /* RTC keepalive-wake period; MUST be < broker keepalive (mosquitto default 60s) */
+#define DEEP_DORMANT_ENABLED        1      /* 1 = allow agent-commanded ~2uA dormant mode */
+#define REST_POLL_S                 3      /* PS-REST STOP2 wake interval in seconds (keepalive RTC tick) */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Heartbeat & Observability (PWR-02, OBS-01)

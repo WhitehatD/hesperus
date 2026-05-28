@@ -37,7 +37,7 @@ from sqlalchemy.orm import selectinload
 from app.agent.models import ChatMessage, ChatSession
 from app.config import settings
 from app.db.database import async_session
-from app.mqtt.client import mqtt_client
+from app.mqtt.client import mqtt_client, send_board_command
 from app.planning.engine import generate_plan
 from app.benchmark import timing as _timing
 from app.benchmark.ids import next_task_id
@@ -740,7 +740,7 @@ async def _capture_pipeline(
     command = json.dumps({"type": "capture_now", "task_id": task_id})
     yield _sse_event("tool_call", {"id": "capture", "label": "Sending capture command to board..."})
 
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
     # ── Benchmark: MQTT sent ──────────────────────────────────────────────────
     await _timing.record(task_id, t_mqtt_sent=time.time())
 
@@ -955,7 +955,7 @@ async def _capture_sequence_pipeline(tool_input: dict, bench_run_id: str | None 
         "id": "capture",
         "label": f"Sending {count}-shot sequence ({interval}ms apart)...",
     })
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
     # ── Benchmark: MQTT sent ──────────────────────────────────────────────────
     await _timing.record(first_task_id, t_mqtt_sent=time.time())
 
@@ -1136,7 +1136,7 @@ async def _tool_create_schedule(inp: dict) -> dict:
         mqtt_payload = await activate_schedule(db, schedule.id)
 
     # Publish to board
-    mqtt_client.publish(settings.mqtt_topic_commands, json.dumps(mqtt_payload))
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, json.dumps(mqtt_payload))
 
     # Push real-time update to dashboard
     from app.scheduler.notify import notify_schedule_update
@@ -1176,7 +1176,7 @@ async def _tool_activate_schedule(inp: dict) -> dict:
         except Exception as e:
             return {"success": False, "summary": f"Activate failed: {e}", "detail": ""}
 
-    mqtt_client.publish(settings.mqtt_topic_commands, json.dumps(mqtt_payload))
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, json.dumps(mqtt_payload))
     await notify_schedule_update()
 
     return {
@@ -1208,7 +1208,7 @@ async def _tool_deactivate_schedule(inp: dict) -> dict:
 
     # Tell board to clear its schedule
     command = json.dumps({"type": "delete_schedule"})
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
 
     await notify_schedule_update()
 
@@ -1287,7 +1287,7 @@ async def _tool_modify_schedule(inp: dict) -> dict:
             mqtt_payload = await activate_schedule(db, int(schedule_id))
 
     if was_active and mqtt_payload:
-        mqtt_client.publish(settings.mqtt_topic_commands, json.dumps(mqtt_payload))
+        send_board_command(mqtt_client, settings.mqtt_topic_commands, json.dumps(mqtt_payload))
 
     await notify_schedule_update()
 
@@ -1312,7 +1312,7 @@ async def _tool_modify_schedule(inp: dict) -> dict:
 async def _tool_capture_now() -> dict:
     task_id = next_task_id()
     command = json.dumps({"type": "capture_now", "task_id": task_id})
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
     return {
         "success": True,
         "summary": f"Capture sent (task #{task_id})",
@@ -1361,7 +1361,7 @@ async def _tool_capture_sequence(inp: dict) -> dict:
         "task_id": schedule.tasks[0].id,
         "delays_ms": delays,
     })
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
 
     return {
         "success": True,
@@ -1375,7 +1375,7 @@ async def _tool_capture_sequence(inp: dict) -> dict:
 
 async def _tool_ping() -> dict:
     command = json.dumps({"type": "ping"})
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
     return {
         "success": True,
         "summary": "Ping sent — board LEDs will flash",
@@ -1385,7 +1385,7 @@ async def _tool_ping() -> dict:
 
 async def _tool_start_portal() -> dict:
     command = json.dumps({"type": "start_portal"})
-    mqtt_client.publish(settings.mqtt_topic_commands, command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command)
     return {
         "success": True,
         "summary": "Portal mode started — board is now an access point",
@@ -1531,7 +1531,7 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
 async def _tool_sleep_mode(inp: dict) -> dict:
     enabled = inp.get("enabled", True)
     payload = json.dumps({"type": "sleep_mode", "enabled": enabled})
-    mqtt_client.publish(settings.mqtt_topic_commands, payload)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
     state = "sleep" if enabled else "wake"
     return {
         "success": True,
@@ -1558,7 +1558,7 @@ async def _tool_delete_schedule(inp: dict) -> dict:
             return {"success": False, "summary": f"Delete failed: {e}", "detail": ""}
 
     payload = json.dumps({"type": "delete_schedule", "schedule_id": schedule_id})
-    mqtt_client.publish(settings.mqtt_topic_commands, payload)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
     await notify_schedule_update()
 
     return {
