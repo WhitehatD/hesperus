@@ -114,8 +114,9 @@ results/*
 !results/findings_5way_20260519.md
 !results/findings_cloud_20260519.md
 !results/benchmark_5way_merged.jsonl
-scripts/benchmark_images/*.jpg
-scripts/benchmark_images/*.jpeg
+# Curated benchmark corpus (20 MIT Indoor Scenes) IS published — it is the
+# analysis-benchmark grounding data, referenced from the README. Only raw
+# source videos stay ignored.
 scripts/benchmark_images/*.mp4
 scripts/benchmark_images/*.mov
 

@@ -175,6 +175,21 @@ def main() -> int:
                     help="Battery capacity for runtime projection (mAh). Default 2000 (e.g. 18650-ish).")
     args = ap.parse_args()
 
+    # Validate at the CLI boundary: the duty-cycle model is undefined for a
+    # non-positive interval (division by zero) or a burst that meets/exceeds the
+    # interval (a node cannot capture longer than its own schedule period).
+    interval_s = args.interval_min * 60.0
+    if args.interval_min <= 0:
+        ap.error(f"--interval-min must be > 0 (got {args.interval_min})")
+    if args.burst_s <= 0:
+        ap.error(f"--burst-s must be > 0 (got {args.burst_s})")
+    if args.burst_s >= interval_s:
+        ap.error(
+            f"--burst-s ({args.burst_s:.0f}s) must be < the capture interval "
+            f"({interval_s:.0f}s = {args.interval_min:.0f} min); a burst cannot "
+            f"exceed its own schedule period."
+        )
+
     print("=" * 72)
     print("RQ3 ENERGY MODEL -- scheduled vs continuous capture")
     print("State-time accounting; deployable node = STM32U585 + OV5640 + EMW3080")
