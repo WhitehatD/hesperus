@@ -45,6 +45,7 @@ async def analyze_image(
     image_path: str,
     objective: str,
     model_key: str = "claude-sonnet",
+    enable_thinking: bool = False,
 ) -> dict:
     """
     Analyze a captured image against a monitoring objective.
@@ -53,9 +54,16 @@ async def analyze_image(
         image_path: Path to the JPEG image on disk.
         objective: The original monitoring objective from the user's plan.
         model_key: Which AI backend to use.
+        enable_thinking: If True and the model supports it (claude-sonnet only),
+            enable extended thinking mode and capture the thinking_text in the
+            return dict. Production callers leave this False. The benchmark
+            harness sets it True for Sonnet to capture the reasoning trace
+            needed for semantic-quality commentary on analysis output.
 
     Returns:
-        Dict with: description, findings, recommendation, model_used, inference_time_ms
+        Dict with: description, findings, recommendation, model_used,
+        inference_time_ms, input_tokens, output_tokens, thinking_text (empty
+        unless thinking was enabled), thinking_tokens.
     """
     start = time.monotonic()
 
@@ -65,7 +73,9 @@ async def analyze_image(
             if model_key == "claude-sonnet"
             else settings.claude_haiku_model
         )
-        result = await _analyze_with_claude(image_path, objective, model)
+        # Anthropic extended thinking is currently Sonnet-only.
+        use_thinking = enable_thinking and model_key == "claude-sonnet"
+        result = await _analyze_with_claude(image_path, objective, model, use_thinking)
     elif model_key in ("qwen3-vl", "qwen2.5-vl"):
         result = await _analyze_with_vllm(image_path, objective, model_key)
     elif model_key == "gemini-3":
@@ -76,22 +86,34 @@ async def analyze_image(
     elapsed_ms = (time.monotonic() - start) * 1000
     result["model_used"] = model_key
     result["inference_time_ms"] = round(elapsed_ms, 1)
+    # Ensure metadata keys are always present so the benchmark JSONL schema
+    # stays uniform across backends, even when a backend doesn't expose them.
+    result.setdefault("input_tokens", None)
+    result.setdefault("output_tokens", None)
+    result.setdefault("thinking_text", "")
+    result.setdefault("thinking_tokens", None)
     return result
 
 
 async def _analyze_with_claude(
-    image_path: str, objective: str, model: str
+    image_path: str, objective: str, model: str, enable_thinking: bool = False
 ) -> dict:
-    """Analyze image using Claude (Anthropic API — native vision)."""
+    """Analyze image using Claude (Anthropic API — native vision).
+
+    When enable_thinking is True (Sonnet only), the API call requests extended
+    thinking with a 2000-token budget. Anthropic requires temperature=1.0 in
+    that mode; this is intentional and the benchmark accounts for it by
+    repeating each (image, model) pair multiple times.
+    """
     image_b64 = _load_image_b64(image_path)
 
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-    response = await client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=ANALYSIS_SYSTEM_PROMPT,
-        messages=[
+    create_kwargs: dict = {
+        "model": model,
+        "max_tokens": 4096 if enable_thinking else 1024,
+        "system": ANALYSIS_SYSTEM_PROMPT,
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -110,11 +132,35 @@ async def _analyze_with_claude(
                 ],
             }
         ],
-        temperature=0.1,
-        timeout=30.0,
-    )
+        "timeout": 60.0,
+    }
+    if enable_thinking:
+        create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 2000}
+        create_kwargs["temperature"] = 1.0
+    else:
+        create_kwargs["temperature"] = 0.1
 
-    return _parse_analysis(response.content[0].text)
+    response = await client.messages.create(**create_kwargs)
+
+    # Iterate response blocks: extended-thinking responses contain ThinkingBlock
+    # entries BEFORE the final TextBlock. Concatenate text only from TextBlocks.
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    for block in response.content:
+        btype = getattr(block, "type", None)
+        if btype == "thinking":
+            thinking_parts.append(getattr(block, "thinking", "") or "")
+        elif btype == "text":
+            text_parts.append(getattr(block, "text", "") or "")
+
+    parsed = _parse_analysis("".join(text_parts))
+    parsed["input_tokens"] = response.usage.input_tokens
+    parsed["output_tokens"] = response.usage.output_tokens
+    parsed["thinking_text"] = "".join(thinking_parts)
+    # Anthropic doesn't expose a separate "thinking_tokens" counter — thinking
+    # contributes to output_tokens; record the character length as a proxy.
+    parsed["thinking_tokens"] = len(parsed["thinking_text"]) if parsed["thinking_text"] else 0
+    return parsed
 
 
 async def _analyze_with_vllm(
@@ -167,7 +213,12 @@ async def _analyze_with_vllm(
         max_tokens=1024,
     )
 
-    return _parse_analysis(response.choices[0].message.content)
+    parsed = _parse_analysis(response.choices[0].message.content)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        parsed["input_tokens"] = getattr(usage, "prompt_tokens", None)
+        parsed["output_tokens"] = getattr(usage, "completion_tokens", None)
+    return parsed
 
 
 async def _analyze_with_gemini(image_path: str, objective: str) -> dict:
@@ -191,7 +242,12 @@ async def _analyze_with_gemini(image_path: str, objective: str) -> dict:
         ],
     )
 
-    return _parse_analysis(response.text)
+    parsed = _parse_analysis(response.text)
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:
+        parsed["input_tokens"] = getattr(meta, "prompt_token_count", None)
+        parsed["output_tokens"] = getattr(meta, "candidates_token_count", None)
+    return parsed
 
 
 def _parse_analysis(raw_output: str) -> dict:
