@@ -163,6 +163,69 @@ async def judge_one(
         }
 
 
+async def judge_one_gemini(
+    model: str,
+    image_path: Path,
+    objective: str,
+    description: str,
+    findings: str,
+    recommendation: str,
+) -> dict[str, Any]:
+    """Run one judge call via the Gemini API — the INDEPENDENT second judge.
+
+    Mirrors judge_one() exactly (same rubric, same axes, same JSON contract) so
+    the two judges' scores are directly comparable for inter-judge agreement.
+    """
+    from google import genai
+    from google.genai import types
+
+    finding_block = (
+        f"MONITORING OBJECTIVE:\n{objective}\n\n"
+        f"MODEL OUTPUT:\n"
+        f"  Description: {description}\n"
+        f"  Findings: {findings}\n"
+        f"  Recommendation: {recommendation}\n"
+    )
+    image_bytes = image_path.read_bytes()
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    t0 = time.monotonic()
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        types.Part(text=f"{JUDGE_SYSTEM_PROMPT}\n\n{finding_block}"),
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(temperature=0.1),
+        )
+    except Exception as e:  # noqa: BLE001 — surface any API error into the row
+        return {"error": f"{type(e).__name__}: {e}", "latency_ms": (time.monotonic() - t0) * 1000}
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    text = (response.text or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        parsed = json.loads(text)
+        usage = getattr(response, "usage_metadata", None)
+        return {
+            "axes": parsed.get("axes", {}),
+            "reasoning": parsed.get("reasoning", ""),
+            "raw_text": response.text or "",
+            "latency_ms": elapsed_ms,
+            "input_tokens": getattr(usage, "prompt_token_count", 0) if usage else 0,
+            "output_tokens": getattr(usage, "candidates_token_count", 0) if usage else 0,
+        }
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parse failed: {e}", "raw_text": response.text or "", "latency_ms": elapsed_ms}
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("jsonl", type=Path)
@@ -176,12 +239,27 @@ async def main() -> int:
         "--limit", type=int, default=None,
         help="Cap total judge calls (for cost-control / dry-run). Default no cap.",
     )
+    ap.add_argument(
+        "--judge-model", default="claude-sonnet-4-6",
+        help="Judge backend. 'claude-sonnet-4-6' (default, needs ANTHROPIC_API_KEY) "
+             "or a Gemini model e.g. 'gemini-3-flash-preview' (needs GEMINI_API_KEY) "
+             "to run an INDEPENDENT second judge for inter-judge agreement.",
+    )
     args = ap.parse_args()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set", file=sys.stderr)
-        return 1
+    judge_model = args.judge_model
+    is_gemini = "gemini" in judge_model.lower()
+    if is_gemini:
+        if not os.environ.get("GEMINI_API_KEY"):
+            print("ERROR: GEMINI_API_KEY environment variable not set", file=sys.stderr)
+            return 1
+        client = None  # Gemini client is created per-call inside judge_one_gemini
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("ERROR: ANTHROPIC_API_KEY environment variable not set", file=sys.stderr)
+            return 1
+        client = anthropic.AsyncAnthropic(api_key=api_key)
 
     out_dir = args.out_dir or args.jsonl.parent
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -213,7 +291,6 @@ async def main() -> int:
     print(f"Will judge {len(judge_tasks)} (image, model, rep) cells")
     print(f"  -> {out_jsonl}")
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
     scored: list[dict] = []
 
     with open(out_jsonl, "w", encoding="utf-8") as out_f:
@@ -224,21 +301,31 @@ async def main() -> int:
                 continue
 
             res = row.get("result") or {}
-            verdict = await judge_one(
-                client,
-                image_path,
-                row.get("objective", ""),
-                res.get("description", "") or "",
-                res.get("findings", "") or "",
-                res.get("recommendation", "") or "",
-            )
+            if is_gemini:
+                verdict = await judge_one_gemini(
+                    judge_model,
+                    image_path,
+                    row.get("objective", ""),
+                    res.get("description", "") or "",
+                    res.get("findings", "") or "",
+                    res.get("recommendation", "") or "",
+                )
+            else:
+                verdict = await judge_one(
+                    client,
+                    image_path,
+                    row.get("objective", ""),
+                    res.get("description", "") or "",
+                    res.get("findings", "") or "",
+                    res.get("recommendation", "") or "",
+                )
 
             out_row = {
                 "_image": img,
                 "_model_key": mk,
                 "_rep_index": rep,
                 "_judged_at": datetime.now().isoformat(),
-                "judge_model": JUDGE_MODEL,
+                "judge_model": judge_model,
                 "verdict": verdict,
             }
             scored.append(out_row)
@@ -267,7 +354,7 @@ async def main() -> int:
     md_lines = [
         f"# LLM-as-judge Analysis Quality\n",
         f"_Generated {datetime.now().isoformat()} from {args.jsonl.name}_\n",
-        f"_Judge model: {JUDGE_MODEL}, N judged = {len(scored)}_\n",
+        f"_Judge model: {judge_model}, N judged = {len(scored)}_\n",
         "\n## Composite score (mean/9) per backend\n",
         "| Backend | N | mean | min | max |",
         "|---------|---:|---:|---:|---:|",
