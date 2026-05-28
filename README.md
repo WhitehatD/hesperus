@@ -35,6 +35,22 @@ A `git push` compiles ARM firmware, runs 64 backend tests, builds Docker images,
 
 ---
 
+## Key Findings
+
+The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, 20 indoor scenes, 13 planning prompts, repeated trials). The highest-leverage results:
+
+- **A uniform, *deliberate* "immediate-action drop" across every VLM provider — the headline result.** When a request combines an immediate capture with a recurring one — *"take a photo **now** and then every 45 minutes"* — all five tested backends (Claude Haiku/Sonnet, Gemini 3, Qwen3-VL) silently discard the *now* and emit only the recurring schedule. It is preserved **0% of the time across 5 backends × 4 prompt variants × repeated trials**, it is neither provider- nor scale-specific (the strongest planners do it too), and the captured reasoning trace shows it is *deliberate* — the model explicitly names both intents, then forwards only one. This is a concrete, reproducible instance of what the literature calls [*constraint drift*](https://arxiv.org/html/2605.10481) (a constraint that stays visible in the prompt while losing operational force), specialised to a failure mode — immediate-vs-recurring collapse in natural-language → tool-call scheduling — that is not otherwise documented. **Takeaway:** any "now *and* recurring" request needs a prompt-level guard or a post-processing split; the schedule alone cannot be trusted to honour it.
+
+- **A local 30B model is the deployment sweet spot.** Qwen3-VL-30B on a single GPU lands within ~0.6 points (of 9, LLM-judged) of the best cloud model on analysis quality, at **0.77 s median latency — 5–15× faster than cloud, at zero per-call cost — with a ~10× tighter latency tail.** Cloud Claude still wins on *planning* routing (≈100% vs Qwen's 77%); the 3B model is too weak (no tool-use, lowest quality). Recommendation: local VLM for perception, cloud for accuracy-critical planning.
+
+- **Extended thinking buys nothing here.** A no-thinking control arm matched or beat the thinking model on *both* planning and analysis quality while saving latency and tokens — *corroborating* (not discovering) recent findings that VLM reasoning [plateaus quickly on visual tasks](https://arxiv.org/html/2604.11177v1).
+
+- **A duty-cycled node can stay agent-responsive.** The firmware sleeps in STOP2 between captures (datasheet ~2 µA floor; ~250× lower daily energy than continuous capture by duty-cycle accounting) yet remains reachable: a **WIFI_PS_REST** mode keeps WiFi associated through sleep and wakes the MCU in **0.1–2.6 s on an incoming command** (sub-second via the WiFi NOTIFY line, verified on hardware). Enabling it required two under-documented STM32U5 fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock. Energy figures are datasheet-grounded duty-cycle models, not power-meter measurements.
+
+> Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report.
+
+---
+
 ## The Agentic Pipeline
 
 A natural language prompt becomes autonomous hardware behavior:
