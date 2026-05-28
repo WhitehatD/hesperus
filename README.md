@@ -25,13 +25,13 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 
 | Layer | Technology | Lines of Code | What It Does |
 |-------|-----------|---------------|--------------|
-| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~4,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, STOP2 sleep, hardware watchdog |
+| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~4,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
 | **Backend** | FastAPI, SQLAlchemy async, Python | ~3,000 | AI planning engine, multimodal LLM orchestration, MQTT broker bridge, image pipeline (RGB565 to JPEG), SSE streaming |
 | **Frontend** | Next.js 16, React 19, TypeScript | ~2,000 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 51 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 64 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
@@ -77,7 +77,7 @@ flowchart LR
 ```
 
 Four LLM backends are compared for thesis evaluation:
-- **Claude Sonnet 4 / Haiku 4.5** via Anthropic API — primary backend (planning + analysis + agent)
+- **Claude Sonnet 4.6 / Haiku 4.5** via Anthropic API — primary backend (planning + analysis + agent)
 - **Qwen3-VL-30B-A3B** via vLLM — open-weight, self-hosted
 - **Qwen2.5-VL-3B** via vLLM — lightweight edge candidate
 - **Gemini 3 Flash** via API — commercial baseline
@@ -219,7 +219,7 @@ All tasks done → Board sends cycle_complete
 
 User: "stop monitoring" → LLM picks deactivate_schedule
   → DB: schedule.is_active = False
-  → MQTT: clear_schedule to board + schedules/updated to dashboard
+  → MQTT: delete_schedule to board + schedules/updated to dashboard
 ```
 
 ### 7. Conversation Persistence
@@ -235,10 +235,10 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 - **Custom MQTT 3.1.1 client** over the EMW3080's TCP socket API. Connect, subscribe, publish, ping, and auto-reconnect in ~400 lines of C.
 - **Adaptive AEC convergence** — polls the OV5640's luminance register at 50ms intervals. In well-lit scenes, captures in ~300ms. In dark scenes, detects AEC saturation (stable readings) and exits early instead of wasting the full timeout. Night mode extends exposure to 4x VTS (~300ms) automatically.
 - **Over-the-air updates** — board polls for new firmware, downloads to RAM in 2KB chunks (avoiding SPI/flash contention), CRC32-verifies, erases inactive flash bank, writes, and performs atomic bank swap. Automatic rollback on boot failure.
-- **STOP2 sleep between tasks** — board enters 2uA deep sleep between scheduled captures, wakes via RTC alarm.
+- **Adaptive low-power sleep (agent-selectable via `low_power_mode`)** — *WIFI_PS_REST*: WiFi stays associated in 802.11 power-save while the MCU sleeps in STOP2, waking on a short RTC poll or **sub-second on the WiFi NOTIFY line** when a command arrives (wake-on-ping measured 0.1–2.6 s on hardware) — low-power *and* agent-responsive. *DEEP_DORMANT* (`sleep_mode`): WiFi off, ~2µA STOP2 until the next scheduled capture or a B3 button press. The IWDG watchdog is frozen in STOP via its option byte so it never resets the board mid-sleep, yet still guards the active phases and recovers a wake-time hang. (STOP2 wake required two STM32U5 silicon-config fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock — both verified on-device.)
 - **Captive portal WiFi provisioning** — no hardcoded credentials. Board starts a SoftAP (`IoT-Setup-XXXX`, password `setup123`) with DNS redirect for automatic captive portal detection on iOS/Android/Windows. Three entry paths: (1) first boot with no stored credentials, (2) stored credentials fail to connect after 3 retries, (3) **hold the B3 USER button for 3 seconds** — RED LED lights at 1s to signal "keep holding", 5x GREEN blinks confirm portal entry. Short press (<3s) triggers an instant capture.
 - **Phone hotspot compatible** — EMW3080 uses `MX_WIFI_SEC_AUTO` (WPA2/WPA3 PSK), 2.4GHz only. Explicit 30-second DHCP patience for iPhone hotspot latency. Server addressed by raw IP — no DNS dependency. Does **not** support WPA2-Enterprise (802.1X/RADIUS), which is why university WiFi networks are incompatible.
-- **9 MQTT command types**: capture_now, capture_sequence, schedule, delete_schedule, firmware_update, sleep_mode, ping, set_wifi, start_portal.
+- **11 MQTT command types**: capture_now, capture_sequence, schedule, delete_schedule, firmware_update, sleep_mode, low_power_mode, ping, set_wifi, start_portal, erase_wifi.
 
 ### Backend (FastAPI + AI)
 
@@ -248,6 +248,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 - **RGB565 to JPEG conversion** — the OV5640 outputs BGR565 little-endian. The server correctly extracts B[15:11] G[10:5] R[4:0], scales to 8-bit, and saves as JPEG.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.
 - **Real-time schedule notifications** — every schedule state change (activate, deactivate, delete, task completion) publishes the full schedule list to `dashboard/schedules/updated` via MQTT, so the frontend updates instantly without polling.
+- **Dormancy-safe command delivery** — all board commands route through a single `send_board_command()` chokepoint. When the board reports `deep_dormant`, commands are queued in order and replayed automatically on the next wake, so commands issued during deep sleep are never lost (the board's MQTT is QoS 0, so the broker won't buffer them).
 
 ### Dashboard (Next.js 16 + React 19)
 
@@ -259,7 +260,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (57 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
+- **Full pipeline**: pytest (64 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
 - **Watchtower auto-update** — production containers poll GHCR every 5 minutes and restart on new images (`nickfedor/watchtower`, the maintained fork compatible with Docker API ≥1.40).
 
 ---
@@ -290,7 +291,7 @@ thesis-iot-monitoring/
       analysis/           Multimodal LLM analysis pipeline
       planning/           NL prompt to schedule generation
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                57 pytest tests (async, in-memory SQLite)
+    tests/                64 pytest tests (async, in-memory SQLite)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/
@@ -321,7 +322,8 @@ All commands are JSON payloads on `device/stm32/commands`:
 | Schedule | `{"type":"schedule","tasks":[{"time":"09:00","action":"CAPTURE_IMAGE","objective":"..."}]}` | Stored in RAM, RTC alarms set |
 | Delete schedule | `{"type":"delete_schedule"}` | Clears active schedule |
 | OTA update | `{"type":"firmware_update"}` | Polls server, downloads, flashes, reboots |
-| Sleep toggle | `{"type":"sleep_mode","enabled":true}` | STOP2 between tasks (2uA) |
+| Sleep toggle | `{"type":"sleep_mode","enabled":true}` | DEEP_DORMANT (~2µA) STOP2 between scheduled tasks |
+| Low-power mode | `{"type":"low_power_mode","mode":"ps_rest"}` | WIFI_PS_REST: WiFi-associated STOP2 with wake-on-ping (`"off"` to disable) |
 | Ping | `{"type":"ping"}` | LED strobe (3x red, 3x green) + MQTT ack |
 | WiFi config | `{"type":"set_wifi","ssid":"...","password":"..."}` | Save to flash + reconnect |
 | WiFi portal | `{"type":"start_portal"}` | Start SoftAP at 192.168.10.1 |
