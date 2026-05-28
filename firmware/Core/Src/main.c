@@ -127,6 +127,13 @@ static volatile uint8_t s_sleep_enabled = 0;  /* 0 = stay awake (agent controls 
  *     Board polls MQTT every REST_POLL_S seconds; agent-controllable
  *     at any time via EXTI/MQTT wake or B3 button override. */
 static volatile uint8_t s_lp_mode = 0;
+/* ── Energy phase-timer (task #51) ─────────────────────────────────────────
+ * Accumulate ms in each power state per 60 s window; publish via MQTT when
+ * PS-REST is active. scripts/energy_model.py uses this for duty-cycle energy
+ * modelling (RQ3). All three counters reset after each publish. */
+static uint32_t s_energy_ps_rest_ms = 0; /* time in STOP2 PS-REST this window */
+static uint32_t s_energy_capture_ms = 0; /* time in active capture this window */
+static uint32_t s_energy_report_ms  = 0; /* HAL_GetTick() at last energy publish */
 
 /* ── OTA firmware update (MQTT command) ─────────────────── */
 static volatile uint8_t s_ota_requested = 0;
@@ -890,6 +897,26 @@ int main(void)
             last_ping = HAL_GetTick();
         }
 
+        /* Energy phase-timer: publish state-time breakdown once per minute when
+         * PS-REST is active, enabling server-side duty-cycle energy modelling. */
+        if (s_lp_mode == 1
+            && MQTT_IsConnected()
+            && (HAL_GetTick() - s_energy_report_ms) >= ENERGY_REPORT_INTERVAL_MS)
+        {
+            uint32_t window_ms = HAL_GetTick() - s_energy_report_ms;
+            char emsg[160];
+            snprintf(emsg, sizeof(emsg),
+                     "{\"status\":\"energy\",\"window_ms\":%lu,"
+                     "\"ps_rest_ms\":%lu,\"capture_ms\":%lu}",
+                     (unsigned long)window_ms,
+                     (unsigned long)s_energy_ps_rest_ms,
+                     (unsigned long)s_energy_capture_ms);
+            MQTT_PublishStatus(emsg);
+            s_energy_ps_rest_ms = 0;
+            s_energy_capture_ms = 0;
+            s_energy_report_ms  = HAL_GetTick();
+        }
+
         /* Idle heartbeat: IDLE_BLINK_ON_MS GREEN blip every IDLE_BLINK_PERIOD_MS to prove we are alive */
         static uint32_t last_idle_blink = 0;
         static uint8_t idle_led_on = 0;
@@ -948,7 +975,11 @@ int main(void)
             s_capture_now_task_id = queued_task_id;
             LOG_INFO(TAG_BOOT, "Dequeuing capture task_id=%lu (%d remaining)",
                      (unsigned long)queued_task_id, _capture_queue_count());
-            _do_capture_now();
+            {
+                uint32_t _t_cap = HAL_GetTick();
+                _do_capture_now();
+                s_energy_capture_ms += HAL_GetTick() - _t_cap;
+            }
             poll_start = HAL_GetTick();
         }
 
@@ -2314,8 +2345,10 @@ static void EnterPSRest(void)
     }
 
     uint32_t btn_tick_before = s_button_press_tick;
+    uint32_t _t_sleep = HAL_GetTick();
 
     Scheduler_EnterLowPower();   /* STOP2: wakes on Alarm A / NOTIFY EXTI14 / B3 */
+    s_energy_ps_rest_ms += HAL_GetTick() - _t_sleep; /* phase-timer: accumulate sleep duration */
 
 #if WATCHDOG_ENABLED
     HAL_IWDG_Refresh(&hiwdg);    /* IWDG resumes on STOP2 exit — refresh now */
