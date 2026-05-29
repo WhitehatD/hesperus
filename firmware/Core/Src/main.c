@@ -861,16 +861,17 @@ int main(void)
                 
                 /* OBS-01, OBS-02: Enhanced heartbeat telemetry */
                 char heartbeat[256];
-                snprintf(heartbeat, sizeof(heartbeat), 
+                snprintf(heartbeat, sizeof(heartbeat),
                     "{\"status\":\"online\",\"firmware\":\"" FW_VERSION "\","
                     "\"uptime_s\":%lu,\"wifi_reconnects\":%lu,"
                     "\"mqtt_reconnects\":%lu,\"capture_failures\":%lu,"
-                    "\"ota_failures\":%lu}",
+                    "\"ota_failures\":%lu,\"lp_mode\":\"%s\"}",
                     (unsigned long)(HAL_GetTick() / 1000),
                     (unsigned long)s_telemetry.wifi_reconnects,
                     (unsigned long)s_telemetry.mqtt_reconnects,
                     (unsigned long)s_telemetry.capture_failures,
-                    (unsigned long)s_telemetry.ota_failures);
+                    (unsigned long)s_telemetry.ota_failures,
+                    s_lp_mode ? "ps_rest" : "normal");
                     
                 static uint8_t s_publish_failures = 0;
                 if (MQTT_PublishStatus(heartbeat) != 0) {
@@ -2345,10 +2346,30 @@ static void EnterPSRest(void)
     }
 
     uint32_t btn_tick_before = s_button_press_tick;
-    uint32_t _t_sleep = HAL_GetTick();
+
+    /* RTC-based sleep accounting — SysTick is frozen during STOP2 but the RTC
+     * keeps running (it is the STOP2 wake source).  Measure the actual sleep
+     * duration from the RTC seconds-of-day, then accumulate into the phase-timer.
+     * Midnight wrap is handled the same way as Scheduler_SetShortAlarm(). */
+    RTC_TimeTypeDef _rtc_t0, _rtc_t1;
+    RTC_DateTypeDef _rtc_d;
+    HAL_RTC_GetTime(&hrtc, &_rtc_t0, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &_rtc_d, RTC_FORMAT_BIN);  /* RM0351: always read date after time */
 
     Scheduler_EnterLowPower();   /* STOP2: wakes on Alarm A / NOTIFY EXTI14 / B3 */
-    s_energy_ps_rest_ms += HAL_GetTick() - _t_sleep; /* phase-timer: accumulate sleep duration */
+
+    HAL_RTC_GetTime(&hrtc, &_rtc_t1, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &_rtc_d, RTC_FORMAT_BIN);
+    {
+        uint32_t _s0 = (uint32_t)_rtc_t0.Hours * 3600u
+                     + (uint32_t)_rtc_t0.Minutes * 60u
+                     + (uint32_t)_rtc_t0.Seconds;
+        uint32_t _s1 = (uint32_t)_rtc_t1.Hours * 3600u
+                     + (uint32_t)_rtc_t1.Minutes * 60u
+                     + (uint32_t)_rtc_t1.Seconds;
+        uint32_t _sleep_s = (_s1 >= _s0) ? (_s1 - _s0) : (_s1 + 86400u - _s0);
+        s_energy_ps_rest_ms += _sleep_s * 1000u;
+    }
 
 #if WATCHDOG_ENABLED
     HAL_IWDG_Refresh(&hiwdg);    /* IWDG resumes on STOP2 exit — refresh now */

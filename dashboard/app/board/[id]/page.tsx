@@ -343,6 +343,12 @@ export default function BoardPage({
 				return update;
 			});
 
+			// Reflect board's reported low-power mode so toggle survives refresh
+			// (board is source of truth — next heartbeat restores state after refresh)
+			if (data.lp_mode !== undefined) {
+				setPsRestMode(data.lp_mode === "ps_rest");
+			}
+
 			// Produce detailed log from board status
 			const status = data.status;
 			if (!status) {
