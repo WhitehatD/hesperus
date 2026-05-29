@@ -86,6 +86,11 @@ export default function BoardPage({
 	>({});
 	const [actionLoading, setActionLoading] = useState<string | null>(null);
 	const [powerMode, setPowerMode] = useState<PowerMode>("unknown");
+	// After sending a power-mode command the board still sends heartbeats with the
+	// OLD state until the MQTT command propagates (~2-10 s). Suppress heartbeat-
+	// based powerMode updates for 15 s to prevent the optimistic state from
+	// flickering back before the board confirms the change.
+	const powerModePendingUntil = useRef<number>(0);
 
 	interface EnergyTotals {
 		windows: number;
@@ -409,14 +414,18 @@ export default function BoardPage({
 
 			// Reflect the board's reported power mode live (board = source of truth).
 			// Heartbeat carries lp_mode + sleep_mode (0/1); they are exclusive.
-			if (data.status === "deep_dormant" || data.sleep_mode === 1) {
-				setPowerMode("sleep");
-			} else if (data.status === "awake") {
-				setPowerMode("active");
-			} else if (data.lp_mode === "ps_rest") {
-				setPowerMode("ps_rest");
-			} else if (data.lp_mode === "normal") {
-				setPowerMode("active");
+			// Guard: skip heartbeat-based updates while a mode command is still
+			// propagating to the board — the note_power_command snapshot covers us.
+			if (Date.now() >= powerModePendingUntil.current) {
+				if (data.status === "deep_dormant" || data.sleep_mode === 1) {
+					setPowerMode("sleep");
+				} else if (data.status === "awake") {
+					setPowerMode("active");
+				} else if (data.lp_mode === "ps_rest") {
+					setPowerMode("ps_rest");
+				} else if (data.lp_mode === "normal") {
+					setPowerMode("active");
+				}
 			}
 
 			// Produce detailed log from board status
@@ -649,6 +658,7 @@ export default function BoardPage({
 		const prev = powerMode;
 		setActionLoading("power");
 		setPowerMode(mode); // optimistic — snapshot poll reconciles
+		powerModePendingUntil.current = Date.now() + 15_000; // suppress stale heartbeats
 		const post = async (path: string) => {
 			const res = await fetch(`${apiBase}${path}`, { method: "POST" });
 			if (!res.ok) throw new Error(await res.text());

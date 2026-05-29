@@ -66,8 +66,7 @@ def note_power_command(lp_mode: Optional[str] = None, sleep_mode: Optional[bool]
     """
     if lp_mode is not None:
         _board_snapshot["lp_mode"] = lp_mode
-        if lp_mode == "ps_rest":
-            _board_snapshot["sleep_mode"] = False
+        _board_snapshot["sleep_mode"] = False  # any lp_mode cmd is exclusive with sleep
     if sleep_mode is not None:
         _board_snapshot["sleep_mode"] = sleep_mode
         if sleep_mode:
