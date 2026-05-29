@@ -114,6 +114,9 @@ results/*
 !results/judge_agreement_20260529_015009.md
 !results/planning_score_20260529_000027.jsonl
 !results/plan_scores_20260529_000027.md
+# Inferential statistics (CIs, Kruskal-Wallis, Holm-Wilcoxon, Wilson) — grounds the IEEE RQ1/RQ2 significance claims
+!results/stats_analysis.py
+!results/stats_summary.md
 # v1 (superseded; kept for provenance — referenced by name inside findings_v3.md)
 !results/findings_5way_20260519.md
 !results/findings_cloud_20260519.md
