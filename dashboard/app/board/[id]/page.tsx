@@ -1113,17 +1113,18 @@ export default function BoardPage({
 								)}
 							</div>
 						)}
+
+						{activeTab === "energy" && (
+							<EnergyPanel
+								energy={energy}
+								powerMode={powerMode}
+								hasSchedule={schedules.length > 0}
+								actionLoading={actionLoading}
+								onSetPowerMode={handleSetPowerMode}
+								onReset={handleEnergyReset}
+							/>
+						)}
 					</div>
-					{activeTab === "energy" && (
-						<EnergyPanel
-							energy={energy}
-							powerMode={powerMode}
-							hasSchedule={schedules.length > 0}
-							actionLoading={actionLoading}
-							onSetPowerMode={handleSetPowerMode}
-							onReset={handleEnergyReset}
-						/>
-					)}
 				</div>
 
 				{/* Console — always visible */}
