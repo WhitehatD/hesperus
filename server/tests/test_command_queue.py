@@ -171,3 +171,72 @@ async def test_deep_dormant_message_updates_state():
     assert mqtt_module._board_state == "deep_dormant"
     assert mqtt_module._dormant_until == "09:15"
     mock_client.publish.assert_not_called()
+
+
+# ── Board snapshot for dashboard hydration ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_snapshot_captures_heartbeat_fields():
+    """An online heartbeat with lp_mode/firmware populates the hydration snapshot."""
+    _reset_board_state("online")
+    mock_client = _make_mock_client()
+
+    with patch.object(mqtt_module, "mqtt_client", mock_client):
+        raw_msg = json.dumps(
+            {
+                "status": "online",
+                "firmware": "1.0.300.1780000000",
+                "uptime_s": 142,
+                "lp_mode": "ps_rest",
+                "wifi_reconnects": 0,
+                "mqtt_reconnects": 2,
+            }
+        ).encode()
+        await mqtt_module.on_message(
+            mock_client, settings.mqtt_topic_status, raw_msg, 0, {}
+        )
+
+    snap = mqtt_module.get_board_snapshot()
+    assert snap["state"] == "online"
+    assert snap["lp_mode"] == "ps_rest"
+    assert snap["firmware"] == "1.0.300.1780000000"
+    assert snap["uptime_s"] == 142
+    assert snap["telemetry"]["mqtt_reconnects"] == 2
+    assert snap["last_seen"] is not None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_lp_mode_updates_on_transition():
+    """lp_mode in the snapshot follows the board: ps_rest then back to normal."""
+    _reset_board_state("online")
+    mock_client = _make_mock_client()
+
+    with patch.object(mqtt_module, "mqtt_client", mock_client):
+        await mqtt_module.on_message(
+            mock_client,
+            settings.mqtt_topic_status,
+            json.dumps({"status": "online", "lp_mode": "ps_rest"}).encode(),
+            0,
+            {},
+        )
+        assert mqtt_module.get_board_snapshot()["lp_mode"] == "ps_rest"
+
+        await mqtt_module.on_message(
+            mock_client,
+            settings.mqtt_topic_status,
+            json.dumps({"status": "online", "lp_mode": "normal"}).encode(),
+            0,
+            {},
+        )
+
+    assert mqtt_module.get_board_snapshot()["lp_mode"] == "normal"
+
+
+def test_board_state_endpoint_returns_snapshot(client):
+    """GET /api/board/state returns the aggregated snapshot dict."""
+    resp = client.get("/api/board/state")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "state" in body
+    assert "lp_mode" in body
+    assert "last_seen" in body

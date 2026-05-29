@@ -131,9 +131,9 @@ static volatile uint8_t s_lp_mode = 0;
  * Accumulate ms in each power state per 60 s window; publish via MQTT when
  * PS-REST is active. scripts/energy_model.py uses this for duty-cycle energy
  * modelling (RQ3). All three counters reset after each publish. */
-static uint32_t s_energy_ps_rest_ms = 0; /* time in STOP2 PS-REST this window */
-static uint32_t s_energy_capture_ms = 0; /* time in active capture this window */
-static uint32_t s_energy_report_ms  = 0; /* HAL_GetTick() at last energy publish */
+static uint32_t s_energy_capture_ms = 0; /* time in active capture this window (awake-tick) */
+static uint32_t s_energy_report_ms  = 0; /* HAL_GetTick() at last energy publish (awake-tick anchor) */
+static uint32_t s_energy_wall_start = 0; /* RTC secs-of-day at window start (wall-clock anchor) */
 
 /* ── OTA firmware update (MQTT command) ─────────────────── */
 static volatile uint8_t s_ota_requested = 0;
@@ -463,6 +463,19 @@ static void on_command_received(const char *json_str, uint32_t length)
             {
                 s_lp_mode  = 1;
                 mode_label = "ps_rest";
+                /* Reset energy-window anchors so the first PS-REST window
+                 * starts clean (not contaminated by prior always-awake time). */
+                {
+                    RTC_TimeTypeDef _lp_t;
+                    RTC_DateTypeDef _lp_d;
+                    HAL_RTC_GetTime(&hrtc, &_lp_t, RTC_FORMAT_BIN);
+                    HAL_RTC_GetDate(&hrtc, &_lp_d, RTC_FORMAT_BIN);
+                    s_energy_wall_start = (uint32_t)_lp_t.Hours * 3600u
+                                        + (uint32_t)_lp_t.Minutes * 60u
+                                        + (uint32_t)_lp_t.Seconds;
+                    s_energy_report_ms  = HAL_GetTick();
+                    s_energy_capture_ms = 0;
+                }
             }
             else
             {
@@ -843,6 +856,19 @@ int main(void)
     uint32_t last_ping     = HAL_GetTick();
     uint32_t last_ota_check = HAL_GetTick();
 
+    /* Anchor the energy wall-clock window to boot RTC time, so ps_rest_ms
+     * (computed at publish as wall_ms - awake_tick_ms) is valid from window 1.
+     * RTC runs continuously through STOP2; HAL_GetTick does not. */
+    {
+        RTC_TimeTypeDef _ei_t;
+        RTC_DateTypeDef _ei_d;
+        HAL_RTC_GetTime(&hrtc, &_ei_t, RTC_FORMAT_BIN);
+        HAL_RTC_GetDate(&hrtc, &_ei_d, RTC_FORMAT_BIN);  /* RM: read date after time */
+        s_energy_wall_start = (uint32_t)_ei_t.Hours * 3600u
+                            + (uint32_t)_ei_t.Minutes * 60u
+                            + (uint32_t)_ei_t.Seconds;
+    }
+
     while (1)
     {
         MQTT_ProcessLoop();
@@ -898,24 +924,43 @@ int main(void)
             last_ping = HAL_GetTick();
         }
 
-        /* Energy phase-timer: publish state-time breakdown once per minute when
-         * PS-REST is active, enabling server-side duty-cycle energy modelling. */
-        if (s_lp_mode == 1
-            && MQTT_IsConnected()
-            && (HAL_GetTick() - s_energy_report_ms) >= ENERGY_REPORT_INTERVAL_MS)
+        /* Energy phase-timer: publish state-time breakdown roughly once per
+         * minute (WALL-CLOCK) when PS-REST is active, enabling server-side
+         * duty-cycle energy modelling.  SysTick (HAL_GetTick) freezes during
+         * STOP2 and is not corrected on wake, so the window MUST be timed by the
+         * RTC (runs through STOP2).  ps_rest_ms = wall_ms - awake_tick_ms. */
+        if (s_lp_mode == 1 && MQTT_IsConnected())
         {
-            uint32_t window_ms = HAL_GetTick() - s_energy_report_ms;
-            char emsg[160];
-            snprintf(emsg, sizeof(emsg),
-                     "{\"status\":\"energy\",\"window_ms\":%lu,"
-                     "\"ps_rest_ms\":%lu,\"capture_ms\":%lu}",
-                     (unsigned long)window_ms,
-                     (unsigned long)s_energy_ps_rest_ms,
-                     (unsigned long)s_energy_capture_ms);
-            MQTT_PublishStatus(emsg);
-            s_energy_ps_rest_ms = 0;
-            s_energy_capture_ms = 0;
-            s_energy_report_ms  = HAL_GetTick();
+            RTC_TimeTypeDef _rtc_now;
+            RTC_DateTypeDef _rtc_now_d;
+            HAL_RTC_GetTime(&hrtc, &_rtc_now, RTC_FORMAT_BIN);
+            HAL_RTC_GetDate(&hrtc, &_rtc_now_d, RTC_FORMAT_BIN);  /* RM: date after time */
+            uint32_t _now_s  = (uint32_t)_rtc_now.Hours * 3600u
+                             + (uint32_t)_rtc_now.Minutes * 60u
+                             + (uint32_t)_rtc_now.Seconds;
+            uint32_t _wall_s = (_now_s >= s_energy_wall_start)
+                             ? (_now_s - s_energy_wall_start)
+                             : (_now_s + 86400u - s_energy_wall_start);
+
+            if ((_wall_s * 1000u) >= ENERGY_REPORT_INTERVAL_MS)
+            {
+                uint32_t wall_ms    = _wall_s * 1000u;
+                uint32_t tick_ms    = HAL_GetTick() - s_energy_report_ms; /* awake */
+                uint32_t ps_rest_ms = (wall_ms > tick_ms) ? (wall_ms - tick_ms) : 0u;
+
+                char emsg[160];
+                snprintf(emsg, sizeof(emsg),
+                         "{\"status\":\"energy\",\"window_ms\":%lu,"
+                         "\"ps_rest_ms\":%lu,\"capture_ms\":%lu}",
+                         (unsigned long)wall_ms,
+                         (unsigned long)ps_rest_ms,
+                         (unsigned long)s_energy_capture_ms);
+                MQTT_PublishStatus(emsg);
+
+                s_energy_capture_ms = 0;
+                s_energy_report_ms  = HAL_GetTick();
+                s_energy_wall_start = _now_s;
+            }
         }
 
         /* Idle heartbeat: IDLE_BLINK_ON_MS GREEN blip every IDLE_BLINK_PERIOD_MS to prove we are alive */
@@ -2347,29 +2392,13 @@ static void EnterPSRest(void)
 
     uint32_t btn_tick_before = s_button_press_tick;
 
-    /* RTC-based sleep accounting — SysTick is frozen during STOP2 but the RTC
-     * keeps running (it is the STOP2 wake source).  Measure the actual sleep
-     * duration from the RTC seconds-of-day, then accumulate into the phase-timer.
-     * Midnight wrap is handled the same way as Scheduler_SetShortAlarm(). */
-    RTC_TimeTypeDef _rtc_t0, _rtc_t1;
-    RTC_DateTypeDef _rtc_d;
-    HAL_RTC_GetTime(&hrtc, &_rtc_t0, RTC_FORMAT_BIN);
-    HAL_RTC_GetDate(&hrtc, &_rtc_d, RTC_FORMAT_BIN);  /* RM0351: always read date after time */
-
+    /* STOP2 sleep.  Note: SysTick (HAL_GetTick) is frozen during STOP2 and is
+     * NOT corrected for sleep duration on wake (Scheduler_EnterLowPower only
+     * restores the clock frequency).  Therefore PS-REST sleep time is NOT
+     * measured here per-cycle; it is derived at energy-publish time as
+     * (RTC wall-clock elapsed) - (HAL_GetTick awake elapsed).  See the energy
+     * report block in the main loop. */
     Scheduler_EnterLowPower();   /* STOP2: wakes on Alarm A / NOTIFY EXTI14 / B3 */
-
-    HAL_RTC_GetTime(&hrtc, &_rtc_t1, RTC_FORMAT_BIN);
-    HAL_RTC_GetDate(&hrtc, &_rtc_d, RTC_FORMAT_BIN);
-    {
-        uint32_t _s0 = (uint32_t)_rtc_t0.Hours * 3600u
-                     + (uint32_t)_rtc_t0.Minutes * 60u
-                     + (uint32_t)_rtc_t0.Seconds;
-        uint32_t _s1 = (uint32_t)_rtc_t1.Hours * 3600u
-                     + (uint32_t)_rtc_t1.Minutes * 60u
-                     + (uint32_t)_rtc_t1.Seconds;
-        uint32_t _sleep_s = (_s1 >= _s0) ? (_s1 - _s0) : (_s1 + 86400u - _s0);
-        s_energy_ps_rest_ms += _sleep_s * 1000u;
-    }
 
 #if WATCHDOG_ENABLED
     HAL_IWDG_Refresh(&hiwdg);    /* IWDG resumes on STOP2 exit — refresh now */
