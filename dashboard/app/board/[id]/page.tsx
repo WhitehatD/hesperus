@@ -6,6 +6,9 @@ import AgentChat from "../../components/AgentChat";
 import { useMQTT } from "../../hooks/useMQTT";
 
 type ConnectionState = "online" | "sleeping" | "offline";
+// Single source of truth for the board's power mode, derived from the server
+// board snapshot (state/lp_mode) + live heartbeats. "unknown" = not yet synced.
+type PowerMode = "active" | "ps_rest" | "sleep" | "unknown";
 
 interface BoardState {
 	firmware: string | null;
@@ -82,8 +85,7 @@ export default function BoardPage({
 		Record<number, { status: string; updatedAt: number }>
 	>({});
 	const [actionLoading, setActionLoading] = useState<string | null>(null);
-	const [sleepMode, setSleepMode] = useState(false);
-	const [psRestMode, setPsRestMode] = useState(false);
+	const [powerMode, setPowerMode] = useState<PowerMode>("unknown");
 
 	interface EnergyTotals {
 		windows: number;
@@ -215,17 +217,28 @@ export default function BoardPage({
 			.catch(() => {});
 	}, [apiBase]);
 
-	// Hydrate board state from the server snapshot on mount, so a page refresh
-	// reflects real board state immediately instead of blanking until the next
-	// MQTT heartbeat (sparse in PS-REST — the board sleeps ~97% of the time).
+	// Hydrate board state from the server snapshot — the single source of truth
+	// for power mode + connection. Runs on mount AND polls every 5 s, so a page
+	// refresh reflects real board state immediately instead of blanking until the
+	// next MQTT heartbeat (sparse in PS-REST — the board sleeps ~97% of the time).
 	useEffect(() => {
-		fetch(`${apiBase}/api/board/state`)
-			.then((r) => (r.ok ? r.json() : null))
-			.then((snap) => {
-				if (!snap) return;
-				if (snap.lp_mode != null) {
-					setPsRestMode(snap.lp_mode === "ps_rest");
-				}
+		let cancelled = false;
+		const applySnapshot = async () => {
+			try {
+				const r = await fetch(`${apiBase}/api/board/state`);
+				if (!r.ok) return;
+				const snap = await r.json();
+				if (cancelled || !snap) return;
+
+				// Derive power mode from the board's reported state.
+				if (snap.state === "deep_dormant") {
+					setPowerMode("sleep");
+				} else if (snap.lp_mode === "ps_rest") {
+					setPowerMode("ps_rest");
+				} else if (snap.lp_mode === "normal") {
+					setPowerMode("active");
+				} // else: leave as-is (unknown until the board reports)
+
 				setBoard((prev) => {
 					const lastSeenMs = snap.last_seen
 						? new Date(snap.last_seen).getTime()
@@ -252,8 +265,16 @@ export default function BoardPage({
 						connection,
 					};
 				});
-			})
-			.catch(() => {});
+			} catch {
+				/* transient — next poll retries */
+			}
+		};
+		applySnapshot();
+		const interval = setInterval(applySnapshot, 5000);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
 	}, [apiBase]);
 
 	// Poll schedules as fallback (MQTT push is primary, poll catches reconnects)
@@ -384,10 +405,15 @@ export default function BoardPage({
 				return update;
 			});
 
-			// Reflect board's reported low-power mode so toggle survives refresh
-			// (board is source of truth — next heartbeat restores state after refresh)
-			if (data.lp_mode !== undefined) {
-				setPsRestMode(data.lp_mode === "ps_rest");
+			// Reflect the board's reported power mode live (board = source of truth)
+			if (data.status === "deep_dormant") {
+				setPowerMode("sleep");
+			} else if (data.status === "awake") {
+				setPowerMode("active");
+			} else if (data.lp_mode === "ps_rest") {
+				setPowerMode("ps_rest");
+			} else if (data.lp_mode === "normal") {
+				setPowerMode("active");
 			}
 
 			// Produce detailed log from board status
@@ -612,49 +638,46 @@ export default function BoardPage({
 		fetchSchedules();
 	};
 
-	const handleSleepToggle = async () => {
-		const next = !sleepMode;
-		setSleepMode(next);
-		addLog(
-			"system",
-			"PWR",
-			next ? "Sending sleep command..." : "Sending wake command...",
-		);
-		try {
-			const res = await fetch(
-				`${apiBase}/api/schedules/sleep-mode?enabled=${next}`,
-				{ method: "POST" },
-			);
+	// Single mutually-exclusive power-mode switch. Active/PS-REST/Sleep map to the
+	// board's command set; the firmware enforces exclusivity (enabling one clears
+	// the others), and the board snapshot poll confirms the real resulting state.
+	const handleSetPowerMode = async (mode: Exclude<PowerMode, "unknown">) => {
+		if (mode === powerMode) return;
+		const prev = powerMode;
+		setActionLoading("power");
+		setPowerMode(mode); // optimistic — snapshot poll reconciles
+		const post = async (path: string) => {
+			const res = await fetch(`${apiBase}${path}`, { method: "POST" });
 			if (!res.ok) throw new Error(await res.text());
-			addLog("system", "PWR", next ? "Sleep mode ON" : "Sleep mode OFF");
-		} catch (err) {
-			setSleepMode(!next);
-			addLog("error", "PWR", `Sleep toggle failed: ${err}`);
-		}
-	};
-
-	const handlePsRestToggle = async () => {
-		const next = !psRestMode;
-		setActionLoading("ps-rest");
-		addLog(
-			"system",
-			"PWR",
-			next ? "Enabling PS-REST low-power mode..." : "Disabling PS-REST mode...",
-		);
+		};
 		try {
-			const mode = next ? "ps_rest" : "off";
-			const res = await fetch(`${apiBase}/api/low-power-mode?mode=${mode}`, {
-				method: "POST",
-			});
-			if (!res.ok) throw new Error(await res.text());
-			setPsRestMode(next);
-			addLog(
-				"system",
-				"PWR",
-				next ? "PS-REST ON — energy telemetry will begin" : "PS-REST OFF",
-			);
+			if (mode === "ps_rest") {
+				await post(`/api/low-power-mode?mode=ps_rest`);
+				addLog(
+					"system",
+					"PWR",
+					"Power mode → PS-REST (energy telemetry begins)",
+				);
+			} else if (mode === "sleep") {
+				await post(`/api/schedules/sleep-mode?enabled=true`);
+				addLog(
+					"system",
+					"PWR",
+					"Power mode → Sleep (deep dormant; wakes at next schedule or B3)",
+				);
+			} else {
+				// Active: clear both light-sleep (PS-REST) and deep-sleep.
+				await post(`/api/low-power-mode?mode=off`);
+				await post(`/api/schedules/sleep-mode?enabled=false`);
+				addLog(
+					"system",
+					"PWR",
+					"Power mode → Active (always awake & connected)",
+				);
+			}
 		} catch (err) {
-			addLog("error", "PWR", `PS-REST toggle failed: ${err}`);
+			setPowerMode(prev); // revert on failure
+			addLog("error", "PWR", `Power mode change failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -806,24 +829,6 @@ export default function BoardPage({
 					>
 						{actionLoading === "setup" ? "Sending..." : "Setup"}
 					</button>
-					<button
-						className={`btn-action${sleepMode ? " active" : ""}`}
-						onClick={handleSleepToggle}
-					>
-						{sleepMode ? "Wake" : "Sleep"}
-					</button>
-					<button
-						className={`btn-action${psRestMode ? " active" : ""}`}
-						onClick={handlePsRestToggle}
-						disabled={actionLoading !== null}
-						title="Toggle PS-REST low-power mode (enables energy telemetry)"
-					>
-						{actionLoading === "ps-rest"
-							? "Sending..."
-							: psRestMode
-								? "PS-REST ON"
-								: "PS-REST"}
-					</button>
 					<button className="btn-action" onClick={handleRefresh}>
 						Refresh
 					</button>
@@ -837,6 +842,18 @@ export default function BoardPage({
 								? "Standby"
 								: "Offline"}
 					</div>
+					<span
+						className={`header-chip power-chip power-${powerMode}`}
+						title="Current power mode — change it in the Power tab"
+					>
+						{powerMode === "ps_rest"
+							? "PS-REST"
+							: powerMode === "sleep"
+								? "Sleep"
+								: powerMode === "active"
+									? "Active"
+									: "Power \u2026"}
+					</span>
 					<span className="header-chip">
 						FW {board.firmware ? `v${board.firmware}` : "\u2014"}
 					</span>
@@ -1097,9 +1114,10 @@ export default function BoardPage({
 					{activeTab === "energy" && (
 						<EnergyPanel
 							energy={energy}
-							psRestMode={psRestMode}
+							powerMode={powerMode}
+							hasSchedule={schedules.length > 0}
 							actionLoading={actionLoading}
-							onPsRestToggle={handlePsRestToggle}
+							onSetPowerMode={handleSetPowerMode}
 							onReset={handleEnergyReset}
 						/>
 					)}
@@ -1413,17 +1431,25 @@ interface EnergyPanelProps {
 		lastWindowMs: number;
 		lastUpdate: number | null;
 	};
-	psRestMode: boolean;
+	powerMode: PowerMode;
+	hasSchedule: boolean;
 	actionLoading: string | null;
-	onPsRestToggle: () => void;
+	onSetPowerMode: (mode: "active" | "ps_rest" | "sleep") => void;
 	onReset: () => void;
 }
 
+const POWER_MODES = [
+	{ id: "active", label: "Active", current: "~22 mA" },
+	{ id: "ps_rest", label: "PS-REST", current: "~3 mA" },
+	{ id: "sleep", label: "Sleep", current: "~2 µA" },
+] as const;
+
 function EnergyPanel({
 	energy,
-	psRestMode,
+	powerMode,
+	hasSchedule,
 	actionLoading,
-	onPsRestToggle,
+	onSetPowerMode,
 	onReset,
 }: EnergyPanelProps) {
 	const m = measuredDailyEnergy(
@@ -1437,40 +1463,63 @@ function EnergyPanel({
 	const iCap = activeBurstCurrentMa(); // MCU + camera + Wi-Fi upload
 	const iOther = I_MCU_RUN_MA + I_WIFI_PS_MA; // awake, camera off
 
+	const modeDesc: Record<PowerMode, string> = {
+		unknown: "Syncing power mode from the board\u2026",
+		active:
+			"Always awake & connected. Highest power — use for setup and live work.",
+		ps_rest:
+			"MCU sleeps in STOP2 between ~3 s polls; Wi-Fi stays connected in 802.11 power-save (~3 mA). Stays reachable. This is the RQ3 energy-measurement mode — a window is reported every ~60 s.",
+		sleep:
+			"Deep dormant: Wi-Fi + camera off (~2 µA). The board is UNREACHABLE and wakes only at the next scheduled capture or a physical B3 press.",
+	};
+
 	return (
 		<div className="energy-panel">
-			{/* PS-REST control */}
-			<div className="energy-control-row">
-				<span className="energy-label">PS-REST mode</span>
-				<button
-					className={`btn-action${psRestMode ? " active" : ""}`}
-					onClick={onPsRestToggle}
-					disabled={actionLoading !== null}
-				>
-					{actionLoading === "ps-rest"
-						? "Sending..."
-						: psRestMode
-							? "ON — disable"
-							: "OFF — enable"}
-				</button>
-				{energy.windows > 0 && (
+			{/* Power mode — mutually exclusive segmented control */}
+			<fieldset className="power-mode-control">
+				<legend className="energy-label">Power mode</legend>
+				<div className="power-mode-segments">
+					{POWER_MODES.map((opt) => (
+						<button
+							key={opt.id}
+							className={`power-seg${powerMode === opt.id ? " active" : ""}`}
+							onClick={() => onSetPowerMode(opt.id)}
+							disabled={actionLoading !== null || powerMode === opt.id}
+							aria-pressed={powerMode === opt.id}
+						>
+							<span className="power-seg-label">{opt.label}</span>
+							<span className="power-seg-current">{opt.current}</span>
+						</button>
+					))}
+				</div>
+				<div className="power-mode-desc">
+					{actionLoading === "power"
+						? "Switching power mode\u2026"
+						: modeDesc[powerMode]}
+				</div>
+				{powerMode === "sleep" && !hasSchedule && (
+					<div className="power-mode-warn">
+						⚠ No schedule set — the board will stay dormant until you press the
+						physical B3 button. Add a schedule so it wakes itself to capture.
+					</div>
+				)}
+			</fieldset>
+
+			{energy.windows > 0 && (
+				<div className="energy-actions-row">
+					<span className="energy-section-sub" style={{ margin: 0 }}>
+						RQ3 energy — measured on-device while in PS-REST.
+					</span>
 					<button
 						className="btn-action"
 						onClick={onReset}
 						disabled={actionLoading !== null}
 						title="Clear stored energy windows and start a fresh measurement run"
 					>
-						{actionLoading === "energy-reset" ? "Resetting..." : "Reset"}
+						{actionLoading === "energy-reset" ? "Resetting…" : "Reset run"}
 					</button>
-				)}
-			</div>
-
-			<div className="energy-section-sub">
-				PS-REST = the low-power duty cycle: the MCU sleeps in STOP2 and Wi-Fi
-				runs in 802.11 power-save between captures, waking only to poll or
-				capture. Enable it to measure RQ3 energy; the board reports a window
-				roughly every 60&nbsp;s.
-			</div>
+				</div>
+			)}
 
 			{energy.windows === 0 ? (
 				<div className="energy-empty">

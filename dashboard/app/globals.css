@@ -15,6 +15,8 @@
 	--text-secondary: #a1a1aa;
 	--text-tertiary: #52525b;
 	--text-muted: #3f3f46;
+	/* Readable caption/help text — --text-muted (#3f3f46) is too dark on panels */
+	--text-help: #8b8b96;
 
 	--accent: #3b82f6;
 	--accent-glow: rgba(59, 130, 246, 0.15);
@@ -2432,18 +2434,20 @@ body {
 .energy-empty {
 	text-align: center;
 	padding: 28px 16px;
-	color: var(--text-muted);
+	color: var(--text-secondary);
 	font-size: 0.8rem;
 	line-height: 1.5;
 }
 
 .energy-summary-row {
 	display: flex;
+	flex-wrap: wrap;
 	gap: 8px;
 }
 
 .energy-stat {
-	flex: 1;
+	flex: 1 1 90px;
+	min-width: 90px;
 	display: flex;
 	flex-direction: column;
 	align-items: center;
@@ -2492,9 +2496,9 @@ body {
 
 /* One-line explainer under a section title */
 .energy-section-sub {
-	font-size: 0.64rem;
-	line-height: 1.4;
-	color: var(--text-muted);
+	font-size: 0.66rem;
+	line-height: 1.45;
+	color: var(--text-help);
 	margin: -2px 0 2px;
 }
 
@@ -2506,10 +2510,125 @@ body {
 
 /* Per-field caption explaining what a value means */
 .energy-help {
-	font-size: 0.58rem;
+	font-size: 0.6rem;
 	line-height: 1.35;
-	color: var(--text-muted);
+	color: var(--text-help);
 	text-align: center;
+}
+
+/* ── Power-mode segmented control (Active / PS-REST / Sleep) ───────────── */
+.power-mode-control {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 0 0 14px;
+	/* reset <fieldset> defaults */
+	border: 0;
+	padding: 0;
+	min-inline-size: 0;
+}
+
+.power-mode-control > .energy-label {
+	/* reset <legend> defaults so it behaves like the other panel labels */
+	padding: 0;
+	margin-bottom: 2px;
+}
+
+.power-mode-segments {
+	display: flex;
+	gap: 4px;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 3px;
+}
+
+.power-seg {
+	flex: 1 1 0;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 1px;
+	padding: 7px 4px;
+	border: none;
+	border-radius: calc(var(--radius-sm) - 2px);
+	background: transparent;
+	color: var(--text-secondary);
+	cursor: pointer;
+	transition:
+		background 0.12s ease,
+		color 0.12s ease;
+}
+
+.power-seg:hover:not(:disabled):not(.active) {
+	background: var(--bg-surface-hover);
+	color: var(--text-primary);
+}
+
+.power-seg.active {
+	background: var(--accent);
+	color: #fff;
+}
+
+.power-seg:disabled {
+	cursor: default;
+}
+
+.power-seg-label {
+	font-size: 0.72rem;
+	font-weight: 600;
+}
+
+.power-seg-current {
+	font-size: 0.58rem;
+	opacity: 0.85;
+	font-family: var(--font-mono);
+}
+
+.power-mode-desc {
+	font-size: 0.66rem;
+	line-height: 1.45;
+	color: var(--text-secondary);
+}
+
+.power-mode-warn {
+	font-size: 0.64rem;
+	line-height: 1.4;
+	color: #fbbf24;
+	background: rgba(251, 191, 36, 0.08);
+	border: 1px solid rgba(251, 191, 36, 0.25);
+	border-radius: var(--radius-sm);
+	padding: 6px 8px;
+}
+
+.energy-actions-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin-bottom: 8px;
+}
+
+/* Header power-mode chip (read-only indicator) */
+.power-chip.power-ps_rest {
+	color: #34d399;
+	border-color: rgba(52, 211, 153, 0.3);
+}
+
+.power-chip.power-sleep {
+	color: #818cf8;
+	border-color: rgba(129, 140, 248, 0.3);
+}
+
+.power-chip.power-active {
+	color: #fbbf24;
+	border-color: rgba(251, 191, 36, 0.3);
+}
+
+.power-chip.power-unknown {
+	color: var(--text-tertiary);
 }
 
 /* Stacked duty-cycle bar */
@@ -2567,9 +2686,9 @@ body {
 .energy-legend-help {
 	flex-basis: 100%;
 	margin-left: 12px;
-	font-size: 0.58rem;
+	font-size: 0.6rem;
 	line-height: 1.35;
-	color: var(--text-muted);
+	color: var(--text-help);
 }
 
 .energy-legend-rest::before {
@@ -2585,7 +2704,7 @@ body {
 /* Projection grid */
 .energy-projection-grid {
 	display: grid;
-	grid-template-columns: 1fr 1fr;
+	grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
 	gap: 6px;
 }
 

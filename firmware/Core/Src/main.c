@@ -447,6 +447,13 @@ static void on_command_received(const char *json_str, uint32_t length)
         if (enabled_obj && cJSON_IsBool(enabled_obj))
         {
             s_sleep_enabled = cJSON_IsTrue(enabled_obj) ? 1 : 0;
+            if (s_sleep_enabled)
+            {
+                /* Deep-dormant and PS-REST are mutually exclusive power modes —
+                 * enabling Sleep must clear PS-REST or the PS-REST gate would
+                 * keep the board in light sleep instead of going dormant. */
+                s_lp_mode = 0;
+            }
             LOG_INFO(TAG_MQTT, ">> SLEEP_MODE %s", s_sleep_enabled ? "ENABLED" : "DISABLED");
         }
     }
@@ -462,6 +469,7 @@ static void on_command_received(const char *json_str, uint32_t length)
             if (strcmp(mode_obj->valuestring, "ps_rest") == 0)
             {
                 s_lp_mode  = 1;
+                s_sleep_enabled = 0;  /* exclusivity: PS-REST clears deep-sleep */
                 mode_label = "ps_rest";
                 /* Reset energy-window anchors so the first PS-REST window
                  * starts clean (not contaminated by prior always-awake time). */
