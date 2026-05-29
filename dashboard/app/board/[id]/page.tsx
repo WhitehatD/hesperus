@@ -660,6 +660,34 @@ export default function BoardPage({
 		}
 	};
 
+	const handleEnergyReset = async () => {
+		setActionLoading("energy-reset");
+		try {
+			const res = await fetch(`${apiBase}/api/benchmark/energy/reset`, {
+				method: "POST",
+			});
+			if (!res.ok) throw new Error(await res.text());
+			const body = await res.json();
+			setEnergy({
+				windows: 0,
+				totalWindowMs: 0,
+				totalPsRestMs: 0,
+				totalCaptureMs: 0,
+				lastWindowMs: 0,
+				lastUpdate: null,
+			});
+			addLog(
+				"system",
+				"PWR",
+				`Energy windows reset (${body.deleted ?? 0} cleared) — fresh run`,
+			);
+		} catch (err) {
+			addLog("error", "PWR", `Energy reset failed: ${err}`);
+		} finally {
+			setActionLoading(null);
+		}
+	};
+
 	const handleActivateSchedule = async (scheduleId: number) => {
 		setActionLoading(`activate-${scheduleId}`);
 		try {
@@ -1072,6 +1100,7 @@ export default function BoardPage({
 							psRestMode={psRestMode}
 							actionLoading={actionLoading}
 							onPsRestToggle={handlePsRestToggle}
+							onReset={handleEnergyReset}
 						/>
 					)}
 				</div>
@@ -1387,6 +1416,7 @@ interface EnergyPanelProps {
 	psRestMode: boolean;
 	actionLoading: string | null;
 	onPsRestToggle: () => void;
+	onReset: () => void;
 }
 
 function EnergyPanel({
@@ -1394,6 +1424,7 @@ function EnergyPanel({
 	psRestMode,
 	actionLoading,
 	onPsRestToggle,
+	onReset,
 }: EnergyPanelProps) {
 	const m = measuredDailyEnergy(
 		energy.totalWindowMs,
@@ -1417,6 +1448,16 @@ function EnergyPanel({
 							? "ON — disable"
 							: "OFF — enable"}
 				</button>
+				{energy.windows > 0 && (
+					<button
+						className="btn-action"
+						onClick={onReset}
+						disabled={actionLoading !== null}
+						title="Clear stored energy windows and start a fresh measurement run"
+					>
+						{actionLoading === "energy-reset" ? "Resetting..." : "Reset"}
+					</button>
+				)}
 			</div>
 
 			{energy.windows === 0 ? (
