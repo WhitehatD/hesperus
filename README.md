@@ -25,29 +25,29 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 
 | Layer | Technology | Lines of Code | What It Does |
 |-------|-----------|---------------|--------------|
-| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~4,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
-| **Backend** | FastAPI, SQLAlchemy async, Python | ~3,000 | AI planning engine, multimodal LLM orchestration, MQTT broker bridge, image pipeline (RGB565 to JPEG), SSE streaming |
-| **Frontend** | Next.js 16, React 19, TypeScript | ~2,000 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
+| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
+| **Backend** | FastAPI, SQLAlchemy async, Python | ~5,000 | AI planning engine, multimodal LLM orchestration, MQTT broker bridge, image pipeline (RGB565 to JPEG), SSE streaming |
+| **Frontend** | Next.js 16, React 19, TypeScript | ~2,400 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 64 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 66 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
 ## Key Findings
 
-The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, [20 indoor scenes](scripts/benchmark_images/), 13 planning prompts, repeated trials). The highest-leverage results:
+The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, [20 indoor scenes](scripts/benchmark_images/), 13 planning prompts, repeated trials). The main results:
 
-- **A uniform, *deliberate* "immediate-action drop" across every VLM provider — the headline result.** When a request combines an immediate capture with a recurring one — *"take a photo **now** and then every 45 minutes"* — all five tested backends (Claude Haiku/Sonnet, Gemini 3, Qwen3-VL) silently discard the *now* and emit only the recurring schedule. It is preserved **0% of the time across 5 backends × 4 prompt variants × repeated trials**, it is neither provider- nor scale-specific (the strongest planners do it too), and the captured reasoning trace shows it is *deliberate* — the model explicitly names both intents, then forwards only one. This is a concrete, reproducible instance of what the literature calls [*constraint drift*](https://arxiv.org/html/2605.10481) (a constraint that stays visible in the prompt while losing operational force), specialised to a failure mode — immediate-vs-recurring collapse in natural-language → tool-call scheduling — that is not otherwise documented. **Takeaway:** any "now *and* recurring" request needs a prompt-level guard or a post-processing split; the schedule alone cannot be trusted to honour it.
+- **A uniform, *deliberate* "immediate-action drop" across every VLM provider — the headline result.** When a request combines an immediate capture with a recurring one — *"take a photo **now** and then every 45 minutes"* — all five tested backends (Claude Haiku/Sonnet, Gemini 3, Qwen3-VL) silently discard the *now* and emit only the recurring schedule. It is preserved **0% of the time across 5 backends × 4 prompt variants × repeated trials**, it is neither provider- nor scale-specific (the strongest planners do it too), and the captured reasoning trace shows it is *deliberate* — the model explicitly names both intents, then forwards only one. This is a concrete, reproducible instance of *constraint drift* (a constraint that stays visible in the prompt while losing operational force), specialised to immediate-vs-recurring collapse in natural-language → tool-call scheduling. **Takeaway:** any "now *and* recurring" request needs a prompt-level guard or a post-processing split; the schedule alone cannot be trusted to honour it.
 
-- **A local 30B model is the deployment sweet spot.** Qwen3-VL-30B on a single GPU lands within ~0.6 points (of 9, LLM-judged) of the best cloud model on analysis quality, at **0.77 s median latency — 5–15× faster than cloud, at zero per-call cost — with a ~10× tighter latency tail.** Cloud Claude still wins on *planning* routing (≈100% vs Qwen's 77%); the 3B model is too weak (no tool-use, lowest quality). Recommendation: local VLM for perception, cloud for accuracy-critical planning.
+- **A local 30B model is the deployment sweet spot.** Qwen3-VL-30B on a single GPU lands within ~0.6 points (of 9, LLM-judged) of the best cloud model on analysis quality, at **0.77 s median latency — 5–10× faster than cloud, at zero per-call cost — with a ~10× tighter latency tail.** Cloud Claude still wins on *planning* routing (≈100% vs Qwen's 77%); the 3B model is too weak (no tool-use, lowest quality). Recommendation: local VLM for perception, cloud for accuracy-critical planning.
 
-- **Extended thinking buys nothing here.** A no-thinking control arm matched or beat the thinking model on *both* planning and analysis quality while saving latency and tokens — *corroborating* (not discovering) recent findings that VLM reasoning [plateaus quickly on visual tasks](https://arxiv.org/html/2604.11177v1).
+- **Extended thinking buys nothing here.** A no-thinking control arm matched or beat the thinking model on *both* planning and analysis quality while saving latency and tokens, so extended reasoning adds cost without accuracy in this perception-and-scheduling setting.
 
 - **A duty-cycled node can stay agent-responsive.** The firmware sleeps in STOP2 between captures (datasheet ~2 µA floor; ~250× lower daily energy than continuous capture by duty-cycle accounting) yet remains reachable: a **WIFI_PS_REST** mode keeps WiFi associated through sleep and wakes the MCU in **0.1–2.6 s on an incoming command** (sub-second via the WiFi NOTIFY line, verified on hardware). Enabling it required two under-documented STM32U5 fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock. Energy figures are datasheet-grounded duty-cycle models, not power-meter measurements.
 
-> Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report. The evaluation corpus is the 20 curated [`scripts/benchmark_images/`](scripts/benchmark_images/) (MIT Indoor Scenes — Quattoni & Torralba, CVPR 2009; per-image provenance in [`MANIFEST.tsv`](scripts/benchmark_images/MANIFEST.tsv)), and the raw run is `results/benchmark_20260528_203558.jsonl`.
+> Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report. The quality ranking is robust to judge choice: a second, independent Gemini 3 judge agrees on the backend ranking at Spearman ρ = 0.83, with no self-preference bias. The evaluation corpus is the 20 curated [`scripts/benchmark_images/`](scripts/benchmark_images/) (MIT Indoor Scenes — Quattoni & Torralba, CVPR 2009; per-image provenance in [`MANIFEST.tsv`](scripts/benchmark_images/MANIFEST.tsv)), and the raw run is `results/benchmark_20260528_203558.jsonl`.
 
 ---
 
@@ -92,10 +92,10 @@ flowchart LR
     Result --> Dashboard
 ```
 
-Four LLM backends are compared for thesis evaluation:
-- **Claude Sonnet 4.6 / Haiku 4.5** via Anthropic API — primary backend (planning + analysis + agent)
-- **Qwen3-VL-30B-A3B** via vLLM — open-weight, self-hosted
-- **Qwen2.5-VL-3B** via vLLM — lightweight edge candidate
+Six analysis backends are compared for thesis evaluation (the Claude entries include a no-thinking control arm):
+- **Claude Sonnet 4.6 / Sonnet 4.6 (no-think) / Haiku 4.5** via Anthropic API — primary backend (planning + analysis + agent)
+- **Qwen3-VL-30B-A3B** via llama.cpp — open-weight, self-hosted on an RTX 6000 Ada
+- **Qwen2.5-VL-3B** via llama.cpp — lightweight edge candidate
 - **Gemini 3 Flash** via API — commercial baseline
 
 ---
@@ -248,7 +248,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 
 ### Firmware (Bare-Metal, No RTOS)
 
-- **Custom MQTT 3.1.1 client** over the EMW3080's TCP socket API. Connect, subscribe, publish, ping, and auto-reconnect in ~400 lines of C.
+- **Custom MQTT 3.1.1 client** over the EMW3080's TCP socket API. Connect, subscribe, publish, ping, and auto-reconnect in ~500 lines of C.
 - **Adaptive AEC convergence** — polls the OV5640's luminance register at 50ms intervals. In well-lit scenes, captures in ~300ms. In dark scenes, detects AEC saturation (stable readings) and exits early instead of wasting the full timeout. Night mode extends exposure to 4x VTS (~300ms) automatically.
 - **Over-the-air updates** — board polls for new firmware, downloads to RAM in 2KB chunks (avoiding SPI/flash contention), CRC32-verifies, erases inactive flash bank, writes, and performs atomic bank swap. Automatic rollback on boot failure.
 - **Adaptive low-power sleep (agent-selectable via `low_power_mode`)** — *WIFI_PS_REST*: WiFi stays associated in 802.11 power-save while the MCU sleeps in STOP2, waking on a short RTC poll or **sub-second on the WiFi NOTIFY line** when a command arrives (wake-on-ping measured 0.1–2.6 s on hardware) — low-power *and* agent-responsive. *DEEP_DORMANT* (`sleep_mode`): WiFi off, ~2µA STOP2 until the next scheduled capture or a B3 button press. The IWDG watchdog is frozen in STOP via its option byte so it never resets the board mid-sleep, yet still guards the active phases and recovers a wake-time hang. (STOP2 wake required two STM32U5 silicon-config fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock — both verified on-device.)
@@ -276,7 +276,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (64 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
+- **Full pipeline**: pytest (66 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
 - **Watchtower auto-update** — production containers poll GHCR every 5 minutes and restart on new images (`nickfedor/watchtower`, the maintained fork compatible with Docker API ≥1.40).
 
 ---
@@ -307,7 +307,7 @@ thesis-iot-monitoring/
       analysis/           Multimodal LLM analysis pipeline
       planning/           NL prompt to schedule generation
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                64 pytest tests (async, in-memory SQLite)
+    tests/                66 pytest tests (async, in-memory SQLite)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/
