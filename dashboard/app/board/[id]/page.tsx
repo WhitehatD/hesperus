@@ -74,15 +74,33 @@ export default function BoardPage({
 	});
 	const [images, setImages] = useState<ImageCapture[]>([]);
 	const [selectedImage, setSelectedImage] = useState<ImageCapture | null>(null);
-	const [activeTab, setActiveTab] = useState<"gallery" | "schedules">(
-		"gallery",
-	);
+	const [activeTab, setActiveTab] = useState<
+		"gallery" | "schedules" | "energy"
+	>("gallery");
 	const [schedules, setSchedules] = useState<any[]>([]);
 	const [taskStatuses, setTaskStatuses] = useState<
 		Record<number, { status: string; updatedAt: number }>
 	>({});
 	const [actionLoading, setActionLoading] = useState<string | null>(null);
 	const [sleepMode, setSleepMode] = useState(false);
+	const [psRestMode, setPsRestMode] = useState(false);
+
+	interface EnergyTotals {
+		windows: number;
+		totalWindowMs: number;
+		totalPsRestMs: number;
+		totalCaptureMs: number;
+		lastWindowMs: number;
+		lastUpdate: number | null;
+	}
+	const [energy, setEnergy] = useState<EnergyTotals>({
+		windows: 0,
+		totalWindowMs: 0,
+		totalPsRestMs: 0,
+		totalCaptureMs: 0,
+		lastWindowMs: 0,
+		lastUpdate: null,
+	});
 	const [editingSchedule, setEditingSchedule] = useState<{
 		id: number;
 		name: string;
@@ -175,6 +193,27 @@ export default function BoardPage({
 		fetchImages();
 		fetchSchedules();
 	}, [fetchImages, fetchSchedules]);
+
+	// Seed cumulative energy totals from the server on mount
+	useEffect(() => {
+		fetch(`${apiBase}/api/benchmark/energy`)
+			.then((r) => {
+				if (!r.ok) return null;
+				return r.json();
+			})
+			.then((data) => {
+				if (!data) return;
+				setEnergy({
+					windows: data.windows ?? 0,
+					totalWindowMs: data.total_window_ms ?? 0,
+					totalPsRestMs: data.total_ps_rest_ms ?? 0,
+					totalCaptureMs: data.total_capture_ms ?? 0,
+					lastWindowMs: 0,
+					lastUpdate: data.windows > 0 ? Date.now() : null,
+				});
+			})
+			.catch(() => {});
+	}, [apiBase]);
 
 	// Poll schedules as fallback (MQTT push is primary, poll catches reconnects)
 	useEffect(() => {
@@ -313,6 +352,30 @@ export default function BoardPage({
 					"HB",
 					"Heartbeat received",
 					data.firmware ? `fw ${data.firmware}` : undefined,
+				);
+				return;
+			}
+
+			// Energy phase-timer window (RQ3)
+			if (status === "energy") {
+				const winMs: number = data.window_ms ?? 0;
+				const psMs: number = data.ps_rest_ms ?? 0;
+				const capMs: number = data.capture_ms ?? 0;
+				setEnergy((prev) => ({
+					windows: prev.windows + 1,
+					totalWindowMs: prev.totalWindowMs + winMs,
+					totalPsRestMs: prev.totalPsRestMs + psMs,
+					totalCaptureMs: prev.totalCaptureMs + capMs,
+					lastWindowMs: winMs,
+					lastUpdate: Date.now(),
+				}));
+				const psPct = winMs > 0 ? ((psMs / winMs) * 100).toFixed(1) : "0.0";
+				const capPct = winMs > 0 ? ((capMs / winMs) * 100).toFixed(2) : "0.00";
+				addLog(
+					"info",
+					"ENERGY",
+					`Window ${(winMs / 1000).toFixed(0)}s — ps_rest ${psPct}% capture ${capPct}%`,
+					`ps=${psMs}ms cap=${capMs}ms`,
 				);
 				return;
 			}
@@ -523,6 +586,33 @@ export default function BoardPage({
 		}
 	};
 
+	const handlePsRestToggle = async () => {
+		const next = !psRestMode;
+		setActionLoading("ps-rest");
+		addLog(
+			"system",
+			"PWR",
+			next ? "Enabling PS-REST low-power mode..." : "Disabling PS-REST mode...",
+		);
+		try {
+			const mode = next ? "ps_rest" : "off";
+			const res = await fetch(`${apiBase}/api/low-power-mode?mode=${mode}`, {
+				method: "POST",
+			});
+			if (!res.ok) throw new Error(await res.text());
+			setPsRestMode(next);
+			addLog(
+				"system",
+				"PWR",
+				next ? "PS-REST ON — energy telemetry will begin" : "PS-REST OFF",
+			);
+		} catch (err) {
+			addLog("error", "PWR", `PS-REST toggle failed: ${err}`);
+		} finally {
+			setActionLoading(null);
+		}
+	};
+
 	const handleActivateSchedule = async (scheduleId: number) => {
 		setActionLoading(`activate-${scheduleId}`);
 		try {
@@ -647,6 +737,18 @@ export default function BoardPage({
 					>
 						{sleepMode ? "Wake" : "Sleep"}
 					</button>
+					<button
+						className={`btn-action${psRestMode ? " active" : ""}`}
+						onClick={handlePsRestToggle}
+						disabled={actionLoading !== null}
+						title="Toggle PS-REST low-power mode (enables energy telemetry)"
+					>
+						{actionLoading === "ps-rest"
+							? "Sending..."
+							: psRestMode
+								? "PS-REST ON"
+								: "PS-REST"}
+					</button>
 					<button className="btn-action" onClick={handleRefresh}>
 						Refresh
 					</button>
@@ -701,6 +803,15 @@ export default function BoardPage({
 							Schedules
 							{schedules.length > 0 && (
 								<span className="tab-count">{schedules.length}</span>
+							)}
+						</button>
+						<button
+							className={`panel-tab ${activeTab === "energy" ? "active" : ""}`}
+							onClick={() => setActiveTab("energy")}
+						>
+							Energy
+							{energy.windows > 0 && (
+								<span className="tab-count">{energy.windows}</span>
 							)}
 						</button>
 					</div>
@@ -908,6 +1019,14 @@ export default function BoardPage({
 							</div>
 						)}
 					</div>
+					{activeTab === "energy" && (
+						<EnergyPanel
+							energy={energy}
+							psRestMode={psRestMode}
+							actionLoading={actionLoading}
+							onPsRestToggle={handlePsRestToggle}
+						/>
+					)}
 				</div>
 
 				{/* Console — always visible */}
@@ -1139,6 +1258,225 @@ export default function BoardPage({
 						</div>
 					</div>
 				</div>
+			)}
+		</div>
+	);
+}
+
+// ── Energy model constants — mirrored exactly from scripts/energy_model.py ──
+// Datasheet current figures (typical @ ~3.0-3.3 V)
+const I_MCU_RUN_MA = 19.0; // STM32U585 Run @160MHz
+const I_MCU_STOP2_UA = 2.0; // STOP2 + RTC (bench-verified ~2 uA)
+const I_CAM_ACTIVE_MA = 150.0; // OV5640 active capture
+const I_CAM_OFF_UA = 20.0; // OV5640 power-down
+const I_WIFI_ACTIVE_MA = 230.0; // EMW3080 connected + uploading
+const I_WIFI_PS_MA = 3.0; // EMW3080 802.11 power-save / DTIM-sleep
+// Note: I_WIFI_OFF_UA (10.0 uA) is used by DEEP_DORMANT mode only; not in measured path
+const VOLTAGE_V = 3.3;
+const BATTERY_MAH = 2000.0;
+
+function activeBurstCurrentMa(): number {
+	return I_MCU_RUN_MA + I_CAM_ACTIVE_MA + I_WIFI_ACTIVE_MA;
+}
+
+function wifiPsRestCurrentMa(): number {
+	return I_WIFI_PS_MA + (I_MCU_STOP2_UA + I_CAM_OFF_UA) / 1000.0;
+}
+
+function continuousDailyJ(): number {
+	const iA = activeBurstCurrentMa() / 1000.0;
+	return iA * VOLTAGE_V * 86400.0;
+}
+
+interface MeasuredEnergy {
+	fRest: number;
+	fCap: number;
+	fOther: number;
+	avgMa: number;
+	dailyJ: number;
+	batteryDays: number;
+	savingsRatio: number;
+}
+
+function measuredDailyEnergy(
+	totalWindowMs: number,
+	totalPsRestMs: number,
+	totalCaptureMs: number,
+): MeasuredEnergy | null {
+	if (totalWindowMs <= 0) return null;
+	const fRest = totalPsRestMs / totalWindowMs;
+	const fCap = totalCaptureMs / totalWindowMs;
+	const fOther = Math.max(1.0 - fRest - fCap, 0.0);
+	const iRest = wifiPsRestCurrentMa();
+	const iCap = activeBurstCurrentMa();
+	const iOther = I_MCU_RUN_MA + I_WIFI_PS_MA; // awake but not capturing (camera off)
+	const avgMa = fRest * iRest + fCap * iCap + fOther * iOther;
+	const dailyJ = (avgMa / 1000.0) * VOLTAGE_V * 86400.0;
+	const batteryJ = (BATTERY_MAH / 1000.0) * VOLTAGE_V * 3600.0;
+	const batteryDays = batteryJ / Math.max(dailyJ, 1e-9);
+	const savingsRatio = continuousDailyJ() / Math.max(dailyJ, 1e-9);
+	return { fRest, fCap, fOther, avgMa, dailyJ, batteryDays, savingsRatio };
+}
+
+function fmtMs(ms: number): string {
+	const totalSec = Math.floor(ms / 1000);
+	const h = Math.floor(totalSec / 3600);
+	const m = Math.floor((totalSec % 3600) / 60);
+	const s = totalSec % 60;
+	if (h > 0) return `${h}h ${m}m`;
+	if (m > 0) return `${m}m ${s}s`;
+	return `${s}s`;
+}
+
+interface EnergyPanelProps {
+	energy: {
+		windows: number;
+		totalWindowMs: number;
+		totalPsRestMs: number;
+		totalCaptureMs: number;
+		lastWindowMs: number;
+		lastUpdate: number | null;
+	};
+	psRestMode: boolean;
+	actionLoading: string | null;
+	onPsRestToggle: () => void;
+}
+
+function EnergyPanel({
+	energy,
+	psRestMode,
+	actionLoading,
+	onPsRestToggle,
+}: EnergyPanelProps) {
+	const m = measuredDailyEnergy(
+		energy.totalWindowMs,
+		energy.totalPsRestMs,
+		energy.totalCaptureMs,
+	);
+
+	return (
+		<div className="energy-panel">
+			{/* PS-REST control */}
+			<div className="energy-control-row">
+				<span className="energy-label">PS-REST mode</span>
+				<button
+					className={`btn-action${psRestMode ? " active" : ""}`}
+					onClick={onPsRestToggle}
+					disabled={actionLoading !== null}
+				>
+					{actionLoading === "ps-rest"
+						? "Sending..."
+						: psRestMode
+							? "ON — disable"
+							: "OFF — enable"}
+				</button>
+			</div>
+
+			{energy.windows === 0 ? (
+				<div className="energy-empty">
+					No energy telemetry yet — enable PS-REST to start the run.
+				</div>
+			) : (
+				<>
+					{/* Summary row */}
+					<div className="energy-summary-row">
+						<div className="energy-stat">
+							<span className="energy-stat-value">{energy.windows}</span>
+							<span className="energy-stat-label">windows</span>
+						</div>
+						<div className="energy-stat">
+							<span className="energy-stat-value">
+								{fmtMs(energy.totalWindowMs)}
+							</span>
+							<span className="energy-stat-label">observed</span>
+						</div>
+						<div className="energy-stat">
+							<span className="energy-stat-value">
+								{energy.lastUpdate
+									? new Date(energy.lastUpdate).toLocaleTimeString("en-GB", {
+											hour: "2-digit",
+											minute: "2-digit",
+											second: "2-digit",
+										})
+									: "\u2014"}
+							</span>
+							<span className="energy-stat-label">last window</span>
+						</div>
+					</div>
+
+					{/* Duty split */}
+					{m && (
+						<>
+							<div className="energy-section-title">Measured duty split</div>
+							<div className="energy-duty-bar">
+								<div
+									className="energy-duty-seg energy-duty-rest"
+									style={{ width: `${m.fRest * 100}%` }}
+									title={`PS-REST ${(m.fRest * 100).toFixed(1)}%`}
+								/>
+								<div
+									className="energy-duty-seg energy-duty-cap"
+									style={{ width: `${m.fCap * 100}%` }}
+									title={`Capture ${(m.fCap * 100).toFixed(2)}%`}
+								/>
+								<div
+									className="energy-duty-seg energy-duty-other"
+									style={{ width: `${m.fOther * 100}%` }}
+									title={`Other ${(m.fOther * 100).toFixed(1)}%`}
+								/>
+							</div>
+							<div className="energy-duty-legend">
+								<span className="energy-legend-item energy-legend-rest">
+									PS-REST {(m.fRest * 100).toFixed(1)}%
+								</span>
+								<span className="energy-legend-item energy-legend-cap">
+									Capture {(m.fCap * 100).toFixed(2)}%
+								</span>
+								<span className="energy-legend-item energy-legend-other">
+									Other {(m.fOther * 100).toFixed(1)}%
+								</span>
+							</div>
+
+							{/* Indicative projection */}
+							<div className="energy-section-title">
+								Indicative projection{" "}
+								<span className="energy-section-note">
+									(authoritative: <code>energy_model.py</code>)
+								</span>
+							</div>
+							<div className="energy-projection-grid">
+								<div className="energy-proj-item">
+									<span className="energy-proj-value">
+										{m.avgMa.toFixed(2)} mA
+									</span>
+									<span className="energy-proj-label">avg current</span>
+								</div>
+								<div className="energy-proj-item">
+									<span className="energy-proj-value">
+										{m.dailyJ.toFixed(1)} J
+									</span>
+									<span className="energy-proj-label">energy / day</span>
+								</div>
+								<div className="energy-proj-item">
+									<span className="energy-proj-value">
+										{m.batteryDays >= 30
+											? `${(m.batteryDays / 30.4).toFixed(1)} mo`
+											: `${m.batteryDays.toFixed(1)} d`}
+									</span>
+									<span className="energy-proj-label">
+										battery ({BATTERY_MAH.toFixed(0)} mAh)
+									</span>
+								</div>
+								<div className="energy-proj-item">
+									<span className="energy-proj-value energy-savings">
+										{m.savingsRatio.toFixed(0)}x
+									</span>
+									<span className="energy-proj-label">vs continuous</span>
+								</div>
+							</div>
+						</>
+					)}
+				</>
 			)}
 		</div>
 	);

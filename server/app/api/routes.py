@@ -121,6 +121,29 @@ async def erase_wifi(request: Request):
         "command": "erase_wifi",
     }
 
+@router.post("/low-power-mode")
+async def low_power_mode(mode: str = "ps_rest"):
+    """
+    Toggle the board's WIFI_PS_REST low-power mode.
+
+    mode="ps_rest": the MCU sleeps in STOP2 while WiFi stays associated in
+    802.11 power-save. In this mode the firmware publishes per-minute energy
+    phase-timer windows (status="energy"), which feed the RQ3 duty-cycle model.
+    mode="off": return to normal active operation (no energy windows).
+    """
+    if mode not in ("ps_rest", "off"):
+        raise HTTPException(status_code=400, detail="mode must be 'ps_rest' or 'off'")
+
+    command = {"type": "low_power_mode", "mode": mode}
+    command_json = json.dumps(command)
+    send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
+
+    return {
+        "status": "sent",
+        "command": "low_power_mode",
+        "mode": mode,
+    }
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload_image(task_id: int, file: UploadFile = File(...)):
     """

@@ -266,3 +266,28 @@ def test_capture_publishes_to_mqtt(client):
     assert command["type"] == "capture_now"
     assert "task_id" in command
     assert command["task_id"] >= 1
+
+
+def test_low_power_mode_publishes_to_mqtt(client):
+    """POST /api/low-power-mode should publish a low_power_mode command."""
+    import app.mqtt.client as mqtt_mod
+
+    mqtt_mod._board_state = "online"  # ensure immediate publish, not queued
+    mock_mqtt = client._mock_mqtt
+    mock_mqtt.publish.reset_mock()
+
+    resp = client.post("/api/low-power-mode", params={"mode": "ps_rest"})
+    assert resp.status_code == 200
+    assert resp.json()["mode"] == "ps_rest"
+    mock_mqtt.publish.assert_called_once()
+
+    payload = mock_mqtt.publish.call_args[0][1]
+    command = json.loads(payload)
+    assert command["type"] == "low_power_mode"
+    assert command["mode"] == "ps_rest"
+
+
+def test_low_power_mode_rejects_bad_mode(client):
+    """POST /api/low-power-mode with an invalid mode returns 400."""
+    resp = client.post("/api/low-power-mode", params={"mode": "banana"})
+    assert resp.status_code == 400
