@@ -239,4 +239,35 @@ def test_board_state_endpoint_returns_snapshot(client):
     body = resp.json()
     assert "state" in body
     assert "lp_mode" in body
+    assert "sleep_mode" in body
     assert "last_seen" in body
+
+
+@pytest.mark.asyncio
+async def test_snapshot_tracks_sleep_mode_from_heartbeat():
+    """Heartbeat sleep_mode (0/1) is captured as a bool in the snapshot."""
+    _reset_board_state("online")
+    mock_client = _make_mock_client()
+    with patch.object(mqtt_module, "mqtt_client", mock_client):
+        await mqtt_module.on_message(
+            mock_client,
+            settings.mqtt_topic_status,
+            json.dumps({"status": "online", "lp_mode": "normal", "sleep_mode": 1}).encode(),
+            0,
+            {},
+        )
+    assert mqtt_module.get_board_snapshot()["sleep_mode"] is True
+
+
+def test_note_power_command_is_mutually_exclusive():
+    """Optimistic snapshot updates mirror the board's power-mode exclusivity."""
+    # Enabling sleep clears PS-REST.
+    mqtt_module.note_power_command(sleep_mode=True)
+    snap = mqtt_module.get_board_snapshot()
+    assert snap["sleep_mode"] is True
+    assert snap["lp_mode"] == "normal"
+    # Switching to PS-REST clears sleep.
+    mqtt_module.note_power_command(lp_mode="ps_rest")
+    snap = mqtt_module.get_board_snapshot()
+    assert snap["lp_mode"] == "ps_rest"
+    assert snap["sleep_mode"] is False

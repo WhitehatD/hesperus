@@ -35,6 +35,7 @@ _command_queue: list[str] = []                # payloads pending flush, FIFO
 _board_snapshot: dict = {
     "state": "unknown",        # online | deep_dormant | unknown
     "lp_mode": None,           # "ps_rest" | "normal" | None
+    "sleep_mode": None,        # bool — deep-sleep armed (reported by heartbeat)
     "firmware": None,
     "uptime_s": None,
     "dormant_until": None,
@@ -51,6 +52,26 @@ def get_board_state() -> str:
 def get_board_snapshot() -> dict:
     """Return the last-known aggregated board snapshot for dashboard hydration."""
     return dict(_board_snapshot)
+
+
+def note_power_command(lp_mode: Optional[str] = None, sleep_mode: Optional[bool] = None) -> None:
+    """Optimistically reflect a just-sent power-mode command in the snapshot.
+
+    The board confirms its real state in the next heartbeat (which carries both
+    lp_mode and sleep_mode), but heartbeats are sparse in PS-REST/Sleep — so the
+    dashboard's 5 s snapshot poll would otherwise reconcile the toggle back to
+    the stale mode for several seconds. Updating the snapshot here gives instant,
+    correct feedback; the heartbeat remains the source of truth and overwrites it.
+    The board enforces exclusivity, so mirror it here too.
+    """
+    if lp_mode is not None:
+        _board_snapshot["lp_mode"] = lp_mode
+        if lp_mode == "ps_rest":
+            _board_snapshot["sleep_mode"] = False
+    if sleep_mode is not None:
+        _board_snapshot["sleep_mode"] = sleep_mode
+        if sleep_mode:
+            _board_snapshot["lp_mode"] = "normal"
 
 
 # ── Chokepoint ────────────────────────────────────────────────────────────────
@@ -179,6 +200,11 @@ async def on_message(client, topic, payload, qos, properties):
         _board_snapshot["last_seen"] = datetime.now(timezone.utc).isoformat()
         if data.get("lp_mode") is not None:
             _board_snapshot["lp_mode"] = data["lp_mode"]
+        if "sleep_mode" in data:
+            # heartbeat sends 0/1; deep_dormant implies sleep is armed
+            _board_snapshot["sleep_mode"] = bool(data["sleep_mode"])
+        elif status == "deep_dormant":
+            _board_snapshot["sleep_mode"] = True
         if data.get("firmware") is not None:
             _board_snapshot["firmware"] = data["firmware"]
         if data.get("uptime_s") is not None:

@@ -138,6 +138,12 @@ async def low_power_mode(mode: str = "ps_rest"):
     command_json = json.dumps(command)
     send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
 
+    # Optimistically reflect in the snapshot for instant dashboard feedback
+    # (the heartbeat confirms; board enforces exclusivity).
+    from app.mqtt.client import note_power_command
+
+    note_power_command(lp_mode=("ps_rest" if mode == "ps_rest" else "normal"))
+
     return {
         "status": "sent",
         "command": "low_power_mode",
