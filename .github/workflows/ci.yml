@@ -289,9 +289,14 @@ jobs:
             mkdir -p ~/.docker
             echo "$GHCR_TOKEN" | docker login ghcr.io -u github --password-stdin
 
-            # Pull latest images and force-recreate containers
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --remove-orphans
+            # Pull new images for app services only — mosquitto is infrastructure
+            # and must NOT be restarted on code-only deploys (it holds live MQTT
+            # session state; restarting it drops all connected boards mid-experiment).
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet server dashboard
+            # Force-recreate only server + dashboard; leave mosquitto + watchtower untouched
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --no-deps server dashboard
+            # Ensure infra services are running (no-op if already up, starts if stopped)
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FIRMWARE_UPLOAD_TOKEN: ${{ secrets.FIRMWARE_UPLOAD_TOKEN }}
