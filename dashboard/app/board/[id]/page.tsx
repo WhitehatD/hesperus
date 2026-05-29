@@ -1476,13 +1476,9 @@ function EnergyPanel({
 	return (
 		<div className="energy-panel">
 			{/* Power mode — mutually exclusive segmented control */}
-			<div className="power-mode-control">
-				<span className="energy-label">Power mode</span>
-				<div
-					className="power-mode-segments"
-					role="group"
-					aria-label="Power mode"
-				>
+			<fieldset className="power-mode-control">
+				<legend className="energy-label">Power mode</legend>
+				<div className="power-mode-segments">
 					{POWER_MODES.map((opt) => (
 						<button
 							key={opt.id}
@@ -1507,7 +1503,7 @@ function EnergyPanel({
 						physical B3 button. Add a schedule so it wakes itself to capture.
 					</div>
 				)}
-			</div>
+			</fieldset>
 
 			{energy.windows > 0 && (
 				<div className="energy-actions-row">

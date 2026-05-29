@@ -2521,7 +2521,17 @@ body {
 	display: flex;
 	flex-direction: column;
 	gap: 8px;
-	margin-bottom: 14px;
+	margin: 0 0 14px;
+	/* reset <fieldset> defaults */
+	border: 0;
+	padding: 0;
+	min-inline-size: 0;
+}
+
+.power-mode-control > .energy-label {
+	/* reset <legend> defaults so it behaves like the other panel labels */
+	padding: 0;
+	margin-bottom: 2px;
 }
 
 .power-mode-segments {
