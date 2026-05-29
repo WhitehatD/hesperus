@@ -113,3 +113,15 @@ def test_benchmark_energy_endpoint_empty(client):
     assert data["total_active_ms"] == 0
     assert data["measured_active_fraction"] is None
     assert data["rows"] == []
+
+
+def test_benchmark_energy_reset(client):
+    """POST /api/benchmark/energy/reset clears rows and returns a deleted count."""
+    resp = client.post("/api/benchmark/energy/reset")
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["status"] == "reset"
+    assert "deleted" in body and isinstance(body["deleted"], int)
+    # After reset the energy aggregate must be empty.
+    after = client.get("/api/benchmark/energy")
+    assert after.json()["windows"] == 0

@@ -15,7 +15,7 @@ import tempfile
 import time
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
@@ -91,6 +91,20 @@ async def list_energy(db: AsyncSession = Depends(get_db)):
             for r in rows
         ],
     }
+
+
+@router.post("/energy/reset")
+async def reset_energy(db: AsyncSession = Depends(get_db)):
+    """Clear all energy phase-timer rows to start a clean RQ3 measurement run.
+
+    The dashboard shows the CUMULATIVE duty split across all stored windows, so
+    stale or invalid windows (e.g. captured before a firmware fix, where
+    ps_rest_ms was misreported) pollute the average. The operator resets before
+    a fresh run so the measured duty cycle reflects only valid windows.
+    """
+    result = await db.execute(delete(EnergyTelemetry))
+    await db.commit()
+    return {"status": "reset", "deleted": int(result.rowcount or 0)}
 
 
 # ── Planning benchmark ───────────────────────────────────────────────────────

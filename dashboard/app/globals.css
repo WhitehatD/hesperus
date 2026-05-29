@@ -2490,6 +2490,28 @@ body {
 	color: var(--text-tertiary);
 }
 
+/* One-line explainer under a section title */
+.energy-section-sub {
+	font-size: 0.64rem;
+	line-height: 1.4;
+	color: var(--text-muted);
+	margin: -2px 0 2px;
+}
+
+.energy-section-sub code {
+	font-family: var(--font-mono);
+	font-size: 0.6rem;
+	color: var(--text-tertiary);
+}
+
+/* Per-field caption explaining what a value means */
+.energy-help {
+	font-size: 0.58rem;
+	line-height: 1.35;
+	color: var(--text-muted);
+	text-align: center;
+}
+
 /* Stacked duty-cycle bar */
 .energy-duty-bar {
 	display: flex;
@@ -2519,8 +2541,8 @@ body {
 
 .energy-duty-legend {
 	display: flex;
-	gap: 10px;
-	flex-wrap: wrap;
+	flex-direction: column;
+	gap: 6px;
 }
 
 .energy-legend-item {
@@ -2529,6 +2551,7 @@ body {
 	display: flex;
 	align-items: center;
 	gap: 4px;
+	flex-wrap: wrap;
 }
 
 .energy-legend-item::before {
@@ -2537,6 +2560,16 @@ body {
 	width: 8px;
 	height: 8px;
 	border-radius: 2px;
+	flex: 0 0 auto;
+}
+
+/* Explainer that wraps to its own line under the legend label */
+.energy-legend-help {
+	flex-basis: 100%;
+	margin-left: 12px;
+	font-size: 0.58rem;
+	line-height: 1.35;
+	color: var(--text-muted);
 }
 
 .energy-legend-rest::before {

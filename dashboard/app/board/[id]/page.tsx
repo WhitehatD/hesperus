@@ -660,6 +660,34 @@ export default function BoardPage({
 		}
 	};
 
+	const handleEnergyReset = async () => {
+		setActionLoading("energy-reset");
+		try {
+			const res = await fetch(`${apiBase}/api/benchmark/energy/reset`, {
+				method: "POST",
+			});
+			if (!res.ok) throw new Error(await res.text());
+			const body = await res.json();
+			setEnergy({
+				windows: 0,
+				totalWindowMs: 0,
+				totalPsRestMs: 0,
+				totalCaptureMs: 0,
+				lastWindowMs: 0,
+				lastUpdate: null,
+			});
+			addLog(
+				"system",
+				"PWR",
+				`Energy windows reset (${body.deleted ?? 0} cleared) — fresh run`,
+			);
+		} catch (err) {
+			addLog("error", "PWR", `Energy reset failed: ${err}`);
+		} finally {
+			setActionLoading(null);
+		}
+	};
+
 	const handleActivateSchedule = async (scheduleId: number) => {
 		setActionLoading(`activate-${scheduleId}`);
 		try {
@@ -1072,6 +1100,7 @@ export default function BoardPage({
 							psRestMode={psRestMode}
 							actionLoading={actionLoading}
 							onPsRestToggle={handlePsRestToggle}
+							onReset={handleEnergyReset}
 						/>
 					)}
 				</div>
@@ -1387,6 +1416,7 @@ interface EnergyPanelProps {
 	psRestMode: boolean;
 	actionLoading: string | null;
 	onPsRestToggle: () => void;
+	onReset: () => void;
 }
 
 function EnergyPanel({
@@ -1394,12 +1424,18 @@ function EnergyPanel({
 	psRestMode,
 	actionLoading,
 	onPsRestToggle,
+	onReset,
 }: EnergyPanelProps) {
 	const m = measuredDailyEnergy(
 		energy.totalWindowMs,
 		energy.totalPsRestMs,
 		energy.totalCaptureMs,
 	);
+	// Per-state current draws (mA) used by the model — shown inline so each
+	// duty-split slice is self-explanatory.
+	const iRest = wifiPsRestCurrentMa(); // STOP2 + Wi-Fi power-save
+	const iCap = activeBurstCurrentMa(); // MCU + camera + Wi-Fi upload
+	const iOther = I_MCU_RUN_MA + I_WIFI_PS_MA; // awake, camera off
 
 	return (
 		<div className="energy-panel">
@@ -1417,6 +1453,23 @@ function EnergyPanel({
 							? "ON — disable"
 							: "OFF — enable"}
 				</button>
+				{energy.windows > 0 && (
+					<button
+						className="btn-action"
+						onClick={onReset}
+						disabled={actionLoading !== null}
+						title="Clear stored energy windows and start a fresh measurement run"
+					>
+						{actionLoading === "energy-reset" ? "Resetting..." : "Reset"}
+					</button>
+				)}
+			</div>
+
+			<div className="energy-section-sub">
+				PS-REST = the low-power duty cycle: the MCU sleeps in STOP2 and Wi-Fi
+				runs in 802.11 power-save between captures, waking only to poll or
+				capture. Enable it to measure RQ3 energy; the board reports a window
+				roughly every 60&nbsp;s.
 			</div>
 
 			{energy.windows === 0 ? (
@@ -1430,12 +1483,18 @@ function EnergyPanel({
 						<div className="energy-stat">
 							<span className="energy-stat-value">{energy.windows}</span>
 							<span className="energy-stat-label">windows</span>
+							<span className="energy-help">
+								60&nbsp;s wall-clock windows the board has reported this run
+							</span>
 						</div>
 						<div className="energy-stat">
 							<span className="energy-stat-value">
 								{fmtMs(energy.totalWindowMs)}
 							</span>
 							<span className="energy-stat-label">observed</span>
+							<span className="energy-help">
+								total real time measured (sum of all windows)
+							</span>
 						</div>
 						<div className="energy-stat">
 							<span className="energy-stat-value">
@@ -1448,6 +1507,9 @@ function EnergyPanel({
 									: "\u2014"}
 							</span>
 							<span className="energy-stat-label">last window</span>
+							<span className="energy-help">
+								clock time the newest window arrived
+							</span>
 						</div>
 					</div>
 
@@ -1455,32 +1517,46 @@ function EnergyPanel({
 					{m && (
 						<>
 							<div className="energy-section-title">Measured duty split</div>
+							<div className="energy-section-sub">
+								Share of real (wall-clock) time the board spent in each power
+								state — measured on-device via the RTC, not estimated. These
+								three add up to 100%.
+							</div>
 							<div className="energy-duty-bar">
 								<div
 									className="energy-duty-seg energy-duty-rest"
 									style={{ width: `${m.fRest * 100}%` }}
-									title={`PS-REST ${(m.fRest * 100).toFixed(1)}%`}
+									title={`PS-REST ${(m.fRest * 100).toFixed(1)}% — STOP2 sleep + Wi-Fi power-save, ~${iRest.toFixed(1)} mA`}
 								/>
 								<div
 									className="energy-duty-seg energy-duty-cap"
 									style={{ width: `${m.fCap * 100}%` }}
-									title={`Capture ${(m.fCap * 100).toFixed(2)}%`}
+									title={`Capture ${(m.fCap * 100).toFixed(2)}% — camera + Wi-Fi upload active, ~${iCap.toFixed(0)} mA`}
 								/>
 								<div
 									className="energy-duty-seg energy-duty-other"
 									style={{ width: `${m.fOther * 100}%` }}
-									title={`Other ${(m.fOther * 100).toFixed(1)}%`}
+									title={`Other ${(m.fOther * 100).toFixed(1)}% — awake & idle, camera off, ~${iOther.toFixed(0)} mA`}
 								/>
 							</div>
 							<div className="energy-duty-legend">
 								<span className="energy-legend-item energy-legend-rest">
 									PS-REST {(m.fRest * 100).toFixed(1)}%
+									<span className="energy-legend-help">
+										asleep (STOP2) + Wi-Fi power-save · ~{iRest.toFixed(1)} mA
+									</span>
 								</span>
 								<span className="energy-legend-item energy-legend-cap">
 									Capture {(m.fCap * 100).toFixed(2)}%
+									<span className="energy-legend-help">
+										camera + Wi-Fi upload · ~{iCap.toFixed(0)} mA
+									</span>
 								</span>
 								<span className="energy-legend-item energy-legend-other">
 									Other {(m.fOther * 100).toFixed(1)}%
+									<span className="energy-legend-help">
+										awake & idle, camera off · ~{iOther.toFixed(0)} mA
+									</span>
 								</span>
 							</div>
 
@@ -1491,18 +1567,29 @@ function EnergyPanel({
 									(authoritative: <code>energy_model.py</code>)
 								</span>
 							</div>
+							<div className="energy-section-sub">
+								The measured duty split above, extrapolated to a full day using
+								datasheet component currents at 3.3&nbsp;V. Indicative only —
+								the thesis figures come from <code>energy_model.py</code>.
+							</div>
 							<div className="energy-projection-grid">
 								<div className="energy-proj-item">
 									<span className="energy-proj-value">
 										{m.avgMa.toFixed(2)} mA
 									</span>
 									<span className="energy-proj-label">avg current</span>
+									<span className="energy-help">
+										duty-weighted mean draw at 3.3&nbsp;V
+									</span>
 								</div>
 								<div className="energy-proj-item">
 									<span className="energy-proj-value">
 										{m.dailyJ.toFixed(1)} J
 									</span>
 									<span className="energy-proj-label">energy / day</span>
+									<span className="energy-help">
+										= avg current × 3.3&nbsp;V × 24&nbsp;h
+									</span>
 								</div>
 								<div className="energy-proj-item">
 									<span className="energy-proj-value">
@@ -1513,12 +1600,19 @@ function EnergyPanel({
 									<span className="energy-proj-label">
 										battery ({BATTERY_MAH.toFixed(0)} mAh)
 									</span>
+									<span className="energy-help">
+										projected runtime on one {BATTERY_MAH.toFixed(0)}&nbsp;mAh
+										cell
+									</span>
 								</div>
 								<div className="energy-proj-item">
 									<span className="energy-proj-value energy-savings">
 										{m.savingsRatio.toFixed(0)}x
 									</span>
 									<span className="energy-proj-label">vs continuous</span>
+									<span className="energy-help">
+										longer than always-on capture (no sleep)
+									</span>
 								</div>
 							</div>
 						</>
