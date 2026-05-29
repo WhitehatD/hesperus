@@ -899,13 +899,14 @@ int main(void)
                     "{\"status\":\"online\",\"firmware\":\"" FW_VERSION "\","
                     "\"uptime_s\":%lu,\"wifi_reconnects\":%lu,"
                     "\"mqtt_reconnects\":%lu,\"capture_failures\":%lu,"
-                    "\"ota_failures\":%lu,\"lp_mode\":\"%s\"}",
+                    "\"ota_failures\":%lu,\"lp_mode\":\"%s\",\"sleep_mode\":%d}",
                     (unsigned long)(HAL_GetTick() / 1000),
                     (unsigned long)s_telemetry.wifi_reconnects,
                     (unsigned long)s_telemetry.mqtt_reconnects,
                     (unsigned long)s_telemetry.capture_failures,
                     (unsigned long)s_telemetry.ota_failures,
-                    s_lp_mode ? "ps_rest" : "normal");
+                    s_lp_mode ? "ps_rest" : "normal",
+                    s_sleep_enabled ? 1 : 0);
                     
                 static uint8_t s_publish_failures = 0;
                 if (MQTT_PublishStatus(heartbeat) != 0) {

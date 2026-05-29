@@ -109,9 +109,16 @@ async def deactivate_schedule(schedule_id: int, db: AsyncSession = Depends(get_d
 
 @router.post("/sleep-mode", status_code=200)
 async def set_sleep_mode(enabled: bool = True):
-    """Toggle sleep mode on the STM32 board via MQTT."""
+    """Toggle deep-sleep mode on the STM32 board via MQTT."""
     payload = json.dumps({"type": "sleep_mode", "enabled": enabled})
     send_board_command(mqtt_client, settings.mqtt_topic_commands, payload)
+
+    # Optimistically reflect in the snapshot so the dashboard's Sleep toggle does
+    # not flip back to Active before the next (sparse) heartbeat confirms it.
+    from app.mqtt.client import note_power_command
+
+    note_power_command(sleep_mode=enabled)
+
     return {"status": "ok", "sleep_enabled": enabled}
 
 

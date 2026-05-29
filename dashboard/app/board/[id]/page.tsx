@@ -230,8 +230,10 @@ export default function BoardPage({
 				const snap = await r.json();
 				if (cancelled || !snap) return;
 
-				// Derive power mode from the board's reported state.
-				if (snap.state === "deep_dormant") {
+				// Derive power mode from the board's reported state. Sleep (deep
+				// dormant, or armed-but-awake when no schedule) wins, then PS-REST,
+				// then Active. lp_mode and sleep_mode are exclusive on the board.
+				if (snap.state === "deep_dormant" || snap.sleep_mode === true) {
 					setPowerMode("sleep");
 				} else if (snap.lp_mode === "ps_rest") {
 					setPowerMode("ps_rest");
@@ -405,8 +407,9 @@ export default function BoardPage({
 				return update;
 			});
 
-			// Reflect the board's reported power mode live (board = source of truth)
-			if (data.status === "deep_dormant") {
+			// Reflect the board's reported power mode live (board = source of truth).
+			// Heartbeat carries lp_mode + sleep_mode (0/1); they are exclusive.
+			if (data.status === "deep_dormant" || data.sleep_mode === 1) {
 				setPowerMode("sleep");
 			} else if (data.status === "awake") {
 				setPowerMode("active");
