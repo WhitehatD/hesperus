@@ -215,6 +215,47 @@ export default function BoardPage({
 			.catch(() => {});
 	}, [apiBase]);
 
+	// Hydrate board state from the server snapshot on mount, so a page refresh
+	// reflects real board state immediately instead of blanking until the next
+	// MQTT heartbeat (sparse in PS-REST — the board sleeps ~97% of the time).
+	useEffect(() => {
+		fetch(`${apiBase}/api/board/state`)
+			.then((r) => (r.ok ? r.json() : null))
+			.then((snap) => {
+				if (!snap) return;
+				if (snap.lp_mode != null) {
+					setPsRestMode(snap.lp_mode === "ps_rest");
+				}
+				setBoard((prev) => {
+					const lastSeenMs = snap.last_seen
+						? new Date(snap.last_seen).getTime()
+						: prev.lastSeen;
+					const ageMs =
+						lastSeenMs != null
+							? Date.now() - lastSeenMs
+							: Number.POSITIVE_INFINITY;
+					let connection: ConnectionState = prev.connection;
+					if (snap.state === "deep_dormant") {
+						connection = "sleeping";
+					} else if (snap.state === "online") {
+						connection =
+							ageMs < 15000
+								? "online"
+								: ageMs < 120000
+									? "sleeping"
+									: "offline";
+					}
+					return {
+						...prev,
+						firmware: snap.firmware ?? prev.firmware,
+						lastSeen: lastSeenMs,
+						connection,
+					};
+				});
+			})
+			.catch(() => {});
+	}, [apiBase]);
+
 	// Poll schedules as fallback (MQTT push is primary, poll catches reconnects)
 	useEffect(() => {
 		const interval = setInterval(fetchSchedules, 30000);

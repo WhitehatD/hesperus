@@ -144,6 +144,22 @@ async def low_power_mode(mode: str = "ps_rest"):
         "mode": mode,
     }
 
+
+@router.get("/board/state")
+async def board_state():
+    """Last-known aggregated board snapshot for dashboard hydration on load.
+
+    The dashboard holds board status (connection, PS-REST toggle, telemetry)
+    in ephemeral client state, so a page refresh would otherwise blank it until
+    the next MQTT heartbeat — which is sparse in PS-REST (board sleeps ~97% of
+    the time). This endpoint returns the server's running snapshot, built from
+    the MQTT status stream, so the UI reflects real board state immediately.
+    """
+    from app.mqtt.client import get_board_snapshot
+
+    return get_board_snapshot()
+
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload_image(task_id: int, file: UploadFile = File(...)):
     """

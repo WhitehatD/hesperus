@@ -28,10 +28,29 @@ _board_state: str = "unknown"
 _dormant_until: Optional[str] = None          # e.g. "07:30" from firmware msg
 _command_queue: list[str] = []                # payloads pending flush, FIFO
 
+# ── Last-known board snapshot ─────────────────────────────────────────────────
+# Aggregated from the MQTT status stream so the dashboard can hydrate its full
+# state on page load (REST) instead of waiting for the next sparse heartbeat
+# (heartbeats are rare in PS-REST, where the board sleeps ~97% of the time).
+_board_snapshot: dict = {
+    "state": "unknown",        # online | deep_dormant | unknown
+    "lp_mode": None,           # "ps_rest" | "normal" | None
+    "firmware": None,
+    "uptime_s": None,
+    "dormant_until": None,
+    "last_seen": None,         # ISO-8601 UTC of last status message
+    "telemetry": {},           # wifi/mqtt reconnects, capture/ota failures
+}
+
 
 def get_board_state() -> str:
     """Return the current tracked board state (for monitoring/debugging)."""
     return _board_state
+
+
+def get_board_snapshot() -> dict:
+    """Return the last-known aggregated board snapshot for dashboard hydration."""
+    return dict(_board_snapshot)
 
 
 # ── Chokepoint ────────────────────────────────────────────────────────────────
@@ -149,6 +168,28 @@ async def on_message(client, topic, payload, qos, properties):
         elif _board_state != "online":
             _board_state = "online"
             _dormant_until = None
+
+    # ── Aggregate last-known snapshot for dashboard hydration ────────────────
+    # Mutate in place (dict) so a page refresh can GET the full current state.
+    if status is not None:
+        from datetime import datetime, timezone
+
+        _board_snapshot["state"] = _board_state
+        _board_snapshot["dormant_until"] = _dormant_until
+        _board_snapshot["last_seen"] = datetime.now(timezone.utc).isoformat()
+        if data.get("lp_mode") is not None:
+            _board_snapshot["lp_mode"] = data["lp_mode"]
+        if data.get("firmware") is not None:
+            _board_snapshot["firmware"] = data["firmware"]
+        if data.get("uptime_s") is not None:
+            _board_snapshot["uptime_s"] = data["uptime_s"]
+        _tele = {
+            k: data[k]
+            for k in ("wifi_reconnects", "mqtt_reconnects", "capture_failures", "ota_failures")
+            if k in data
+        }
+        if _tele:
+            _board_snapshot["telemetry"] = _tele
 
     # ── Energy phase-timer telemetry (RQ3 measured duty cycle) ───────────────
     if status == "energy":
