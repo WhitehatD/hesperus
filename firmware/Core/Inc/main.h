@@ -22,5 +22,6 @@ extern RTC_HandleTypeDef hrtc;
 
 /* ── System Function Prototypes ────────────────────────── */
 void SystemClock_Config(void);
+void Watchdog_Refresh(void);
 
 #endif /* MAIN_H */

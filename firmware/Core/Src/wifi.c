@@ -146,6 +146,7 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
              * iPhone hotspots can be very slow (10-30s) to respond to
              * embedded DHCP clients — be patient and yield aggressively. */
             MX_WIFI_IO_YIELD(wifi_obj_get(), 5000);
+            Watchdog_Refresh();
 
             uint8_t ip[4] = {0};
             bool got_ip = false;
@@ -169,6 +170,7 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
                 }
                 /* Yield 2s between retries to process SPI + DHCP exchanges */
                 MX_WIFI_IO_YIELD(wifi_obj_get(), 2000);
+                Watchdog_Refresh();
             }
 
             if (got_ip)

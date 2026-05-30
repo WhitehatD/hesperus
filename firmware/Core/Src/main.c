@@ -32,6 +32,7 @@
 #include "scheduler.h"
 #include "ota_update.h"
 #include "wifi_credentials.h"
+#include "board_settings.h"
 #include "captive_portal.h"
 #include "upload_async.h"
 #include "mx_wifi.h"
@@ -187,6 +188,7 @@ static void EnterPSRest(void);
 static void Watchdog_Init(void);
 static void Watchdog_FreezeInStop(void);
 #endif
+void Watchdog_Refresh(void);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  SEC-11: cJSON Static Bump Allocator (Fintech Heap Protection)
@@ -470,6 +472,7 @@ static void on_command_received(const char *json_str, uint32_t length)
             {
                 s_lp_mode  = 1;
                 s_sleep_enabled = 0;  /* exclusivity: PS-REST clears deep-sleep */
+                BoardSettings_SaveLPMode(1u);
                 mode_label = "ps_rest";
                 /* Reset energy-window anchors so the first PS-REST window
                  * starts clean (not contaminated by prior always-awake time). */
@@ -489,6 +492,7 @@ static void on_command_received(const char *json_str, uint32_t length)
             {
                 s_lp_mode  = 0;
                 mode_label = "off";
+                BoardSettings_SaveLPMode(0u);
             }
         }
         LOG_INFO(TAG_MQTT, ">> LOW_POWER_MODE %s", mode_label);
@@ -877,6 +881,19 @@ int main(void)
                             + (uint32_t)_ei_t.Seconds;
     }
 
+    /* Restore persisted LP mode: auto-resume PS-REST after any reboot.
+     * Safe: EnterPSRest() guards on MQTT_IsConnected() -- restoring
+     * lp_mode=1 with MQTT connected simply starts PS-REST immediately. */
+    {
+        uint8_t restored_lp = 0u;
+        if (BoardSettings_LoadLPMode(&restored_lp) == BSET_OK && restored_lp <= 1u)
+        {
+            s_lp_mode = restored_lp;
+            if (s_lp_mode == 1)
+                LOG_INFO(TAG_BOOT, "PS-REST restored from flash settings");
+        }
+    }
+
     while (1)
     {
         MQTT_ProcessLoop();
@@ -927,6 +944,21 @@ int main(void)
             {
                 LOG_WARN(TAG_MQTT, "MQTT offline, attempting reconnect...");
                 s_telemetry.mqtt_reconnects++;
+                /* WiFi L2 reconnect: the EMW3080 in powersave mode does not
+                 * auto-reassociate after a prolonged AP outage. Without this,
+                 * MQTT_Init() fails immediately every 5 s and the board spins
+                 * offline indefinitely (IWDG refreshed by the fast poll loop
+                 * so no watchdog reset -- silent indefinite failure). */
+                if (s_has_runtime_wifi && MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
+                {
+                    LOG_WARN(TAG_WIFI, "WiFi L2 lost -- reconnecting before MQTT");
+                    s_telemetry.wifi_reconnects++;
+                    Watchdog_Refresh();
+                    WiFi_DeInit();
+                    WiFi_Init();
+                    WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                    Watchdog_Refresh();
+                }
                 MQTT_Init(&mqtt_cfg);
                 MQTT_SubscribeCommands(on_command_received);
             }
@@ -1630,6 +1662,13 @@ static void Watchdog_FreezeInStop(void)
     {
         LOG_INFO(TAG_BOOT, "IWDG already frozen in STOP — safe for low-power sleep");
     }
+}
+
+void Watchdog_Refresh(void)
+{
+#if WATCHDOG_ENABLED
+    HAL_IWDG_Refresh(&hiwdg);
+#endif
 }
 
 static void Watchdog_Init(void)
