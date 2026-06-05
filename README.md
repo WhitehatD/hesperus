@@ -202,7 +202,7 @@ The frontend maps these to a visual execution trace: thinking indicator → spin
 
 ### 5. Real-Time MQTT Feedback
 
-While the agent executes, the board independently publishes status updates over MQTT. The dashboard subscribes to 5 active topics and renders everything into a unified console:
+While the agent executes, the board independently publishes status updates over MQTT. The dashboard subscribes to 6 active topics and renders everything into a unified console:
 
 | Topic | Direction | Content |
 |-------|-----------|---------|
@@ -210,6 +210,7 @@ While the agent executes, the board independently publishes status updates over 
 | `device/{id}/logs` | Board → Dashboard | Raw firmware debug logs (`[ms] [LEVEL] [TAG] message`) |
 | `dashboard/images/new` | Server → Dashboard | New image notification (triggers gallery refresh) |
 | `dashboard/analysis/new` | Server → Dashboard | AI analysis result (updates gallery overlay) |
+| `dashboard/logs` | Server → Dashboard | Server-side application logs (deploy, errors, agent activity) |
 | `dashboard/schedules/updated` | Server → Dashboard | Full schedule state (activation, deactivation, task completion) |
 
 The schedule updates topic (`dashboard/schedules/updated`) fires whenever any schedule state changes — activation, deactivation, deletion, or individual task completion. The server publishes the full schedule list, and the frontend replaces its state, giving instant real-time visibility into monitoring progress without polling.
