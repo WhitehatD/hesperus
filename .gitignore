@@ -128,13 +128,9 @@ scripts/benchmark_images/*.mp4
 scripts/benchmark_images/*.mov
 
 # ============================================
-# Claude Code runtime (session state, caches — not user content)
-.claude/.tmp/
-.claude/.discovery-cache.json
-.claude/.session-state.json
-.claude/.session-name
-.claude/governance.md.bak.*
-.claude/settings.local.json
+# Development tooling (not submission content)
+.claude/
+.husky/
 scratchpad_*.json
 
 # crag-generated agent/IDE configs (not tracked — only .github/workflows/gates.yml kept)
@@ -184,7 +180,6 @@ presentation.md
 # ============================================
 # Local worktrees and temp files
 # ============================================
-.claude/worktrees/
 latex/
 slides.pptx
 ~$*.pptx

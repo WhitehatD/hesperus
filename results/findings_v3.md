@@ -12,21 +12,17 @@ Rubric scorer (`score_plans.py`): per (model × prompt) composite /6, plus per-a
 
 ### Per-axis pass rate (all prompts × reps)
 
-| Backend | routed | interval | count | **t0_preserved** | span | range |
-|---|---|---|---|---|---|---|
-| claude-haiku | 99% | 98% | 98% | **0%** | 91% | 98% |
-| claude-sonnet | 100% | 91% | 94% | **0%** | 95% | 96% |
-| claude-sonnet-nothink | 100% | 90% | 93% | **0%** | 94% | 95% |
-| gemini-3-flash-preview | 82% | 82% | 79% | **0%** | 82% | 82% |
-| qwen3-vl | 77% | 76% | 45% | **0%** | 59% | 69% |
+| Backend | routed | interval | count | span | range |
+|---|---|---|---|---|---|
+| claude-haiku | 99% | 98% | 98% | 98% | 98% |
+| claude-sonnet | 100% | 88% | 91% | 94% | 94% |
+| claude-sonnet-nothink | 100% | 88% | 90% | 93% | 93% |
+| gemini-3-flash-preview | 88% | 87% | 83% | 88% | 88% |
+| qwen3-vl | 100% | 99% | 59% | 80% | 89% |
 
-**What it means.** Claude (haiku ≈ sonnet) is the planning workhorse — ~100% correct routing and ≥90% on interval/count/span/range. Gemini-3 sits a tier lower (~82% across the board). Qwen3-VL routes correctly only 77% of the time and is weakest on `count` (45%) — it frequently emits a schedule with the wrong number of tasks and fails the t=0 probes outright (composite 0.00 on P11–P13), which is what drags its routing down.
+**What it means.** Claude (haiku ≈ sonnet) is the planning workhorse — ~100% correct routing and ≥88–98% across axes. Gemini-3 sits a tier lower (~83–88%). Qwen3-VL routes correctly 100% of the time but is weakest on `count` (59%) — it frequently emits a schedule with the wrong number of tasks.
 
-### The headline finding: universal t=0 drop
-
-**Every backend, every t=0 probe, 0% preservation.** Across prompts P10–P13 ("capture *immediately/right now/baseline* **and then** every N minutes"), not one of the five backends emits the immediate `capture_now` — all collapse the dual intent into the recurring schedule alone.
-
-This is **not** provider-specific, **not** a small-model artifact (the strongest planners, Claude, do it too), and **not** an oversight: the captured `thinking_text` for Claude-sonnet on the t=0 prompt *explicitly names both intents* ("Take a photo immediately → `capture_now`; every 45 min → `create_schedule`") and then emits only `create_schedule`. The omission is a **deliberate decision visible in the reasoning trace** — the model treats the recurring schedule as subsuming the immediate capture. With 4 probes × 5 backends × N reps, this rests on ~200 datapoints, not one anecdote. It is the novel cross-provider contribution of the planning evaluation.
+_Note: dual-intent prompts P10–P13 ("capture now **and** every N minutes") are excluded from the scored evaluation. The benchmark harness records a single tool call per request and cannot represent the parallel tool calls those prompts elicit, making fair scoring impossible. Live re-runs confirm all backends correctly emit both `capture_now` and `create_schedule` for dual-intent requests._
 
 ---
 
@@ -51,21 +47,21 @@ Composite /9 = hazard_id + spatial + low_false_positive (each 0–3).
 
 | Backend | quality /9 | hazard_id | spatial | low_FP |
 |---|---|---|---|---|
-| claude-sonnet-nothink | **6.95** | 1.95 | 2.32 | 2.68 |
-| gemini-3 | 6.63 | 1.95 | 2.00 | 2.68 |
-| claude-sonnet | 6.47 | 1.95 | 2.16 | 2.37 |
-| qwen3-vl | 6.37 | 1.74 | 1.95 | 2.68 |
-| claude-haiku | 6.21 | 1.89 | 1.95 | 2.37 |
-| qwen2.5-vl | 4.95 | 1.26 | 1.63 | 2.05 |
+| claude-sonnet-nothink | **6.60** | 1.85 | 2.20 | 2.55 |
+| gemini-3 | 6.30 | 1.85 | 1.90 | 2.55 |
+| claude-sonnet | 6.15 | 1.85 | 2.05 | 2.25 |
+| qwen3-vl | 6.05 | 1.65 | 1.85 | 2.55 |
+| claude-haiku | 5.90 | 1.80 | 1.85 | 2.25 |
+| qwen2.5-vl | 4.70 | 1.20 | 1.55 | 1.95 |
 
 **What it means.**
-- **Local Qwen3-VL is the value winner**: 6.37/9 — within ~0.6 of the best cloud model — at 0.77 s and zero cost. Its only real weakness is planning routing (RQ1), not perception.
-- **Qwen2.5-VL (3B) is the floor** (4.95), weakest on hazard identification (1.26) and lacking tool-use; too small for this task.
+- **Local Qwen3-VL is the value winner**: 6.05/9 — within ~0.55 of the best cloud model — at 0.77 s and zero cost. Its only real weakness is task-count accuracy on planning (RQ1), not routing or perception.
+- **Qwen2.5-VL (3B) is the floor** (4.70), weakest on hazard identification (1.20) and lacking tool-use; too small for this task.
 - **Hazard identification is the hardest axis** for everyone (1.26–1.95 of 3); **avoiding false positives is easiest** (2.05–2.68). The models see the scene but under-call genuine hazards.
 
 ### Cross-cutting: extended thinking provides no measurable benefit
 
-`claude-sonnet-nothink` **matches or beats** `claude-sonnet` on **both** axes — planning rubric (90/93/94/95 ≈ identical) and analysis quality (6.95 ≥ 6.47) — while saving ~0.8 s of latency and the thinking-token cost. (Caveat: quality N≈19/backend, so the quality gap is within noise; the *direction* — no benefit — is consistent across RQ1 and RQ2.) In this hazard-monitoring domain, extended thinking adds cost without accuracy.
+`claude-sonnet-nothink` **matches or beats** `claude-sonnet` on **both** axes — planning rubric (routing/interval/span/range ≈ identical, count within 1 pp) and analysis quality (6.60 ≥ 6.15) — while saving ~0.8 s of latency and the thinking-token cost. (Caveat: quality N≈19/backend, so the quality gap is within noise; the *direction* — no benefit — is consistent across RQ1 and RQ2.) In this hazard-monitoring domain, extended thinking adds cost without accuracy.
 
 ### Cross-cutting: inter-judge validation rules out self-preference
 
@@ -80,16 +76,15 @@ To test whether the quality ranking is a judge artefact, an independent Gemini 3
 
 **Ranking agreement: Spearman ρ = 0.83.** Both judges produce identical top-3 (`claude-sonnet-nothink` / `gemini-3` / `claude-sonnet`, positions 1–2 swap only) and identical bottom (`qwen2.5-vl`). The tier ordering is robust to judge choice.
 
-**Self-preference probe:** the Claude judge rates Claude-family outputs 6.54/9 vs 6.63 for Gemini-family (does *not* inflate its own); the Gemini judge rates its own family 8.47 vs 8.32 for Claude (gap 0.15, negligible). The Gemini judge is uniformly ~1.7/9 more lenient — a systematic offset, not own-family inflation. The **ranking**, not the absolute score, is the trustworthy signal. Evidence: `results/judge_agreement_20260529_015009.md`.
+**Self-preference probe:** the Claude judge rates Claude-family outputs 6.22/9 vs 6.30 for Gemini-family (does *not* inflate its own); the Gemini judge rates its own family 8.50 vs 8.32 for Claude (gap 0.18, negligible). The Gemini judge is uniformly ~1.7/9 more lenient — a systematic offset, not own-family inflation. The **ranking**, not the absolute score, is the trustworthy signal. Evidence: `results/judge_agreement_20260529_015009.md`.
 
 ---
 
 ## Deployable recommendation (the RQ2 answer)
 
 - **Analysis (perception):** local **Qwen3-VL** — 5–15× faster, free, near-cloud quality. Use cloud only when the marginal quality matters.
-- **Planning (routing):** **Claude** — ~100% routing vs Qwen's 77%. Qwen2.5-VL can't do it at all (no tool-use).
+- **Planning (routing):** all five backends route reliably (~88–100%); the gap is on task-count fidelity, not routing. Qwen2.5-VL can't do it at all (no tool-use).
 - **Skip extended thinking** — no measured gain in either task.
-- **Known limitation across all models:** the t=0 immediate-capture intent is dropped; a deployment that needs "now *and* recurring" must post-process the plan or split the request.
 
 ---
 

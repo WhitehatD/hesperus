@@ -306,7 +306,7 @@ thesis-iot-monitoring/
       analysis/           Multimodal LLM analysis pipeline
       planning/           NL prompt to schedule generation
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                66 pytest tests (async, in-memory SQLite)
+    tests/                74 pytest tests (async, in-memory SQLite)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/

@@ -1,6 +1,6 @@
 # Inferential statistics (RQ2)
 
-_Generated 2026-06-05T02:18:00 by stats_analysis.py (seed=42, 10000 bootstrap resamples)._
+_Generated 2026-06-05T02:29:59 by stats_analysis.py (seed=42, 10000 bootstrap resamples)._
 
 Sources: `judge_scores_20260529_000539.jsonl` (quality), `planning_score_20260529_000027.jsonl` (planning).
 
