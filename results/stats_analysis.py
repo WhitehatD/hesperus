@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Statistical analysis for the thesis evaluation (RQ1 + RQ2).
+"""Statistical analysis for the thesis evaluation (RQ2).
 
 Computes the inferential statistics that back the claims in the paper:
 
@@ -10,10 +10,6 @@ Computes the inferential statistics that back the claims in the paper:
       are separable at all.
     - Pairwise exact Wilcoxon signed-rank tests (paired by image) with
       Holm-Bonferroni correction for the multiple-comparison family.
-
-  RQ1 (planning, t=0 constraint preservation):
-    - Wilson score 95% CI on the 0/200 t=0-preserved proportion, so the
-      headline "0%" claim carries an upper bound rather than a bare zero.
 
 Reads only the committed canonical result files; emits a timestamped markdown
 summary next to them. Pure stdlib + numpy + scipy, deterministic (fixed seed).
@@ -40,7 +36,6 @@ CLAUDE_FAMILY = ("claude-haiku", "claude-sonnet", "claude-sonnet-nothink")
 GEMINI_FAMILY = ("gemini-3",)
 
 QUALITY_AXES = ("hazard_identification", "spatial_reasoning", "false_positive_rate")
-T0_PROMPT_IDX = (9, 10, 11, 12)  # P10-P13: the four immediate+periodic probes
 BOOTSTRAP_RESAMPLES = 10_000
 SEED = 42
 
@@ -104,17 +99,6 @@ def paired_wilcoxon(a_scores: dict[str, int], b_scores: dict[str, int]) -> tuple
     return len(images), float(p)
 
 
-# --------------------------------------------------------------------------- #
-# RQ1: t=0 preservation
-# --------------------------------------------------------------------------- #
-def load_t0() -> tuple[int, int]:
-    """Return (preserved, total) over the four immediate+periodic probes."""
-    rows = _read_jsonl(PLANNING_FILE)
-    probe = [r for r in rows if r["_prompt_idx"] in T0_PROMPT_IDX]
-    preserved = sum(int(r["score"]["axes"].get("t0_preserved", 0) == 1) for r in probe)
-    return preserved, len(probe)
-
-
 def composite_by_image_model(path: Path) -> dict[tuple[str, str], int]:
     """{(image, model): composite} for one judge file."""
     out: dict[tuple[str, str], int] = {}
@@ -154,16 +138,6 @@ def inter_judge() -> dict:
     }
 
 
-def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    if n == 0:
-        return 0.0, 0.0
-    phat = successes / n
-    denom = 1 + z**2 / n
-    center = (phat + z**2 / (2 * n)) / denom
-    half = (z * ((phat * (1 - phat) / n + z**2 / (4 * n**2)) ** 0.5)) / denom
-    return max(0.0, center - half), min(1.0, center + half)
-
-
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
@@ -191,30 +165,29 @@ def main() -> None:
     top5 = [m for m in quality if m != "qwen2.5-vl"]
     h_top5, p_top5 = stats.kruskal(*[quality[m]["scores"] for m in top5])
 
-    # Pairwise Wilcoxon (the comparisons the paper's claims rest on)
-    pairs = [
-        ("claude-sonnet-nothink", "claude-sonnet"),   # thinking vs no-thinking
-        ("claude-sonnet-nothink", "qwen3-vl"),         # best vs local 30B
-        ("claude-sonnet", "qwen3-vl"),
-        ("gemini-3", "qwen3-vl"),
-        ("qwen3-vl", "claude-haiku"),
-        ("claude-sonnet-nothink", "qwen2.5-vl"),       # field vs 3B floor
-        ("qwen3-vl", "qwen2.5-vl"),
-    ]
-    raw = []
-    for a, b in pairs:
-        n, p = paired_wilcoxon(quality[a]["by_image"], quality[b]["by_image"])
-        diff = np.mean(quality[a]["scores"]) - np.mean(quality[b]["scores"])
-        raw.append((a, b, n, p, float(diff)))
-    holm = holm_bonferroni([r[3] for r in raw])
+    # Pairwise exact Wilcoxon. Test ALL ten top-five pairs (not a hand-picked
+    # subset) so "no two of the five differ" is an honest claim; Holm-correct
+    # within the ten-pair family. The 3B floor model is compared against each of
+    # the five separately (its own five-pair family).
+    import itertools
+    top5_pairs = list(itertools.combinations(top5, 2))        # 10 pairs
+    floor_pairs = [(m, "qwen2.5-vl") for m in top5]           # 5 pairs
 
-    preserved, total = load_t0()
-    w_lo, w_hi = wilson_ci(preserved, total)
+    def _run(pair_list):
+        rows = []
+        for a, b in pair_list:
+            n, p = paired_wilcoxon(quality[a]["by_image"], quality[b]["by_image"])
+            diff = np.mean(quality[a]["scores"]) - np.mean(quality[b]["scores"])
+            rows.append((a, b, n, p, float(diff)))
+        return rows, holm_bonferroni([r[3] for r in rows])
+
+    raw, holm = _run(top5_pairs)
+    floor_raw, floor_holm = _run(floor_pairs)
 
     # --- emit markdown (stable filename; provenance timestamp is in the header) ---
     out = RESULTS_DIR / "stats_summary.md"
     L = []
-    L.append(f"# Inferential statistics (RQ1 + RQ2)\n")
+    L.append(f"# Inferential statistics (RQ2)\n")
     L.append(f"_Generated {_dt.datetime.now().isoformat(timespec='seconds')} "
              f"by stats_analysis.py (seed={SEED}, {BOOTSTRAP_RESAMPLES} bootstrap resamples)._\n")
     L.append(f"Sources: `{JUDGE_FILE.name}` (quality), `{PLANNING_FILE.name}` (planning).\n")
@@ -233,10 +206,19 @@ def main() -> None:
              f"({'no significant difference' if p_top5 >= 0.05 else 'significant'}).")
     L.append("")
 
-    L.append("## RQ2 quality: pairwise exact Wilcoxon signed-rank + Holm correction\n")
+    L.append("## RQ2 quality: all ten top-five pairwise exact Wilcoxon + Holm (over the 10-pair family)\n")
     L.append("| Comparison (a vs b) | n | mean diff | p (exact) | p (Holm) | sig |")
     L.append("|---|---|---|---|---|---|")
     for (a, b, n, p, diff), p_holm in zip(raw, holm):
+        sig = "*" if p_holm < 0.05 else "ns"
+        L.append(f"| {a} vs {b} | {n} | {diff:+.2f} | {p:.3f} | {p_holm:.3f} | {sig} |")
+    L.append(f"- Minimum top-five p(Holm) = {min(holm):.3f} "
+             f"({'all non-significant' if min(holm) >= 0.05 else 'at least one significant'}).")
+    L.append("")
+    L.append("## RQ2 quality: 3B floor model vs each of the top five (Holm over the 5-pair family)\n")
+    L.append("| Comparison (a vs b) | n | mean diff | p (exact) | p (Holm) | sig |")
+    L.append("|---|---|---|---|---|---|")
+    for (a, b, n, p, diff), p_holm in zip(floor_raw, floor_holm):
         sig = "*" if p_holm < 0.05 else "ns"
         L.append(f"| {a} vs {b} | {n} | {diff:+.2f} | {p:.3f} | {p_holm:.3f} | {sig} |")
     L.append("")
@@ -252,12 +234,6 @@ def main() -> None:
              f"**{gj_other:.2f}** (own-family lean {gj_own - gj_other:+.2f}).")
     L.append("- Neither judge inflates its own family. "
              "Supersedes the stale 6.54 / 6.63 / 8.47 in judge_agreement_20260529_015009.md.")
-    L.append("")
-
-    L.append("## RQ1: t=0 constraint preservation (Wilson 95% CI)\n")
-    L.append(f"- Preserved {preserved}/{total} across P10-P13 (all five backends, all reps).")
-    L.append(f"- Proportion = {preserved/total:.1%}; Wilson 95% CI = "
-             f"[{w_lo:.1%}, {w_hi:.1%}].")
     L.append("")
 
     out.write_text("\n".join(L), encoding="utf-8")

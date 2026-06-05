@@ -10,7 +10,7 @@ A complete edge-to-cloud system where you tell an AI agent *what to monitor* in 
 
 <p align="center">
   <img src="https://img.shields.io/badge/STM32U585AI-Cortex--M33-03234B?style=flat-square&logo=stmicroelectronics&logoColor=white" />
-  <img src="https://img.shields.io/badge/FastAPI-Python_3.12-009688?style=flat-square&logo=fastapi&logoColor=white" />
+  <img src="https://img.shields.io/badge/FastAPI-Python_3.11-009688?style=flat-square&logo=fastapi&logoColor=white" />
   <img src="https://img.shields.io/badge/Next.js_16-React_19-000?style=flat-square&logo=next.js" />
   <img src="https://img.shields.io/badge/MQTT-Mosquitto-660066?style=flat-square&logo=eclipsemosquitto&logoColor=white" />
   <img src="https://img.shields.io/badge/OTA-Dual_Bank_Flash-FF6F00?style=flat-square" />
@@ -27,25 +27,23 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 |-------|-----------|---------------|--------------|
 | **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
 | **Backend** | FastAPI, SQLAlchemy async, Python | ~5,000 | AI planning engine, multimodal LLM orchestration, MQTT broker bridge, image pipeline (RGB565 to JPEG), SSE streaming |
-| **Frontend** | Next.js 16, React 19, TypeScript | ~2,400 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
+| **Frontend** | Next.js 16, React 19, TypeScript | ~3,000 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 66 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 74 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
 ## Key Findings
 
-The working system doubles as an empirical study (1,850 inference calls across 6 vision-language backends, [20 indoor scenes](scripts/benchmark_images/), 13 planning prompts, repeated trials). The main results:
+The working system doubles as an empirical study (1,200 analysis calls across 6 vision-language backends on [20 indoor scenes](scripts/benchmark_images/), plus 450 planning calls on 9 scheduling prompts, repeated trials). The main results:
 
-- **A uniform, *deliberate* "immediate-action drop" across every VLM provider — the headline result.** When a request combines an immediate capture with a recurring one — *"take a photo **now** and then every 45 minutes"* — all five tested backends (Claude Haiku/Sonnet, Gemini 3, Qwen3-VL) silently discard the *now* and emit only the recurring schedule. It is preserved **0% of the time across 5 backends × 4 prompt variants × repeated trials**, it is neither provider- nor scale-specific (the strongest planners do it too), and the captured reasoning trace shows it is *deliberate* — the model explicitly names both intents, then forwards only one. This is a concrete, reproducible instance of *constraint drift* (a constraint that stays visible in the prompt while losing operational force), specialised to immediate-vs-recurring collapse in natural-language → tool-call scheduling. **Takeaway:** any "now *and* recurring" request needs a prompt-level guard or a post-processing split; the schedule alone cannot be trusted to honour it.
-
-- **A local 30B model is the deployment sweet spot.** Qwen3-VL-30B on a single GPU lands within ~0.6 points (of 9, LLM-judged) of the best cloud model on analysis quality, at **0.77 s median latency — 5–10× faster than cloud, at zero per-call cost — with a ~10× tighter latency tail.** Cloud Claude still wins on *planning* routing (≈100% vs Qwen's 77%); the 3B model is too weak (no tool-use, lowest quality). Recommendation: local VLM for perception, cloud for accuracy-critical planning.
+- **A local 30B model is the deployment sweet spot.** Qwen3-VL-30B on a single GPU lands within ~0.6 points (of 9, LLM-judged) of the best cloud model on analysis quality, at **0.77 s median latency — 5–10× faster than cloud, at zero per-call cost — with a ~10× tighter latency tail.** On planning it routes natural-language requests as reliably as cloud Claude (≈100%) and trails only on schedule-count accuracy (59% vs 91–98%); the 3B model is excluded as too weak — it does not emit valid tool calls and scores lowest on quality. Recommendation: local VLM for perception, cloud for count-critical planning.
 
 - **Extended thinking buys nothing here.** A no-thinking control arm matched or beat the thinking model on *both* planning and analysis quality while saving latency and tokens, so extended reasoning adds cost without accuracy in this perception-and-scheduling setting.
 
-- **A duty-cycled node can stay agent-responsive.** The firmware sleeps in STOP2 between captures (datasheet ~2 µA floor; ~250× lower daily energy than continuous capture by duty-cycle accounting) yet remains reachable: a **WIFI_PS_REST** mode keeps WiFi associated through sleep and wakes the MCU in **0.1–2.6 s on an incoming command** (sub-second via the WiFi NOTIFY line, verified on hardware). Enabling it required two under-documented STM32U5 fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock. Energy figures are datasheet-grounded duty-cycle models, not power-meter measurements.
+- **A duty-cycled node can stay agent-responsive.** The firmware sleeps in STOP2 between captures (datasheet ~2 µA floor) yet remains reachable: a **WIFI_PS_REST** mode keeps WiFi associated through sleep, and the MCU wakes from STOP2 on a 3-second poll cycle to check for commands, giving a **0.1–2.6 s command latency** (measured on hardware). Over 129 h of live deployment the on-device phase-timer measured a **100× lower daily energy** than continuous capture (252× projected for the WiFi-off DEEP_DORMANT schedule). The duty cycle is measured on-device; the absolute currents remain datasheet values (no power meter), so the Joule figures carry datasheet uncertainty while the ratio does not.
 
 > Full per-backend tables, methodology, and limitations: [`results/findings_v3.md`](results/findings_v3.md) and the IEEE report. The quality ranking is robust to judge choice: a second, independent Gemini 3 judge agrees on the backend ranking at Spearman ρ = 0.83, with no self-preference bias. The evaluation corpus is the 20 curated [`scripts/benchmark_images/`](scripts/benchmark_images/) (MIT Indoor Scenes — Quattoni & Torralba, CVPR 2009; per-image provenance in [`MANIFEST.tsv`](scripts/benchmark_images/MANIFEST.tsv)), and the raw run is `results/benchmark_20260528_203558.jsonl`.
 
@@ -251,9 +249,9 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 - **Custom MQTT 3.1.1 client** over the EMW3080's TCP socket API. Connect, subscribe, publish, ping, and auto-reconnect in ~500 lines of C.
 - **Adaptive AEC convergence** — polls the OV5640's luminance register at 50ms intervals. In well-lit scenes, captures in ~300ms. In dark scenes, detects AEC saturation (stable readings) and exits early instead of wasting the full timeout. Night mode extends exposure to 4x VTS (~300ms) automatically.
 - **Over-the-air updates** — board polls for new firmware, downloads to RAM in 2KB chunks (avoiding SPI/flash contention), CRC32-verifies, erases inactive flash bank, writes, and performs atomic bank swap. Automatic rollback on boot failure.
-- **Adaptive low-power sleep (agent-selectable via `low_power_mode`)** — *WIFI_PS_REST*: WiFi stays associated in 802.11 power-save while the MCU sleeps in STOP2, waking on a short RTC poll or **sub-second on the WiFi NOTIFY line** when a command arrives (wake-on-ping measured 0.1–2.6 s on hardware) — low-power *and* agent-responsive. *DEEP_DORMANT* (`sleep_mode`): WiFi off, ~2µA STOP2 until the next scheduled capture or a B3 button press. The IWDG watchdog is frozen in STOP via its option byte so it never resets the board mid-sleep, yet still guards the active phases and recovers a wake-time hang. (STOP2 wake required two STM32U5 silicon-config fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock — both verified on-device.)
+- **Adaptive low-power sleep (agent-selectable via `low_power_mode`)** — *WIFI_PS_REST*: WiFi stays associated in 802.11 power-save while the MCU sleeps in STOP2, waking from STOP2 on a 3-second poll cycle to check for commands (command latency measured 0.1–2.6 s on hardware) — low-power *and* agent-responsive. *DEEP_DORMANT* (`sleep_mode`): WiFi off, ~2µA STOP2 until the next scheduled capture or a B3 button press. The IWDG watchdog is frozen in STOP via its option byte so it never resets the board mid-sleep, yet still guards the active phases and recovers a wake-time hang. (STOP2 wake required two STM32U5 silicon-config fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock — both verified on-device.)
 - **Captive portal WiFi provisioning** — no hardcoded credentials. Board starts a SoftAP (`IoT-Setup-XXXX`, password `setup123`) with DNS redirect for automatic captive portal detection on iOS/Android/Windows. Three entry paths: (1) first boot with no stored credentials, (2) stored credentials fail to connect after 3 retries, (3) **hold the B3 USER button for 3 seconds** — RED LED lights at 1s to signal "keep holding", 5x GREEN blinks confirm portal entry. Short press (<3s) triggers an instant capture.
-- **Phone hotspot compatible** — EMW3080 uses `MX_WIFI_SEC_AUTO` (WPA2/WPA3 PSK), 2.4GHz only. Explicit 30-second DHCP patience for iPhone hotspot latency. Server addressed by raw IP — no DNS dependency. Does **not** support WPA2-Enterprise (802.1X/RADIUS), which is why university WiFi networks are incompatible.
+- **Phone hotspot compatible** — EMW3080 uses `MX_WIFI_SEC_AUTO` (WPA/WPA2 PSK only; the module firmware does not support SAE/dragonfly handshake), 2.4GHz only. Explicit 30-second DHCP patience for iPhone hotspot latency. Server addressed by raw IP — no DNS dependency. Does **not** support WPA2-Enterprise (802.1X/RADIUS), which is why university WiFi networks are incompatible.
 - **11 MQTT command types**: capture_now, capture_sequence, schedule, delete_schedule, firmware_update, sleep_mode, low_power_mode, ping, set_wifi, start_portal, erase_wifi.
 
 ### Backend (FastAPI + AI)
@@ -261,7 +259,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 - **AI planning engine** — translates natural language monitoring requests into executable HH:MM task schedules with objectives. The planner is model-agnostic (Claude, Gemini, Qwen).
 - **Agentic chat with 14 tools** — the dashboard chat is backed by Claude with tool_use. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language.
 - **Full capture pipeline with SSE streaming** — when the agent triggers a capture, the server streams real-time progress events (command sent, image received, per-image analysis, inline thumbnail URL) back to the dashboard. Heartbeat events every 5 s keep the SSE connection alive. For sequences, each image completion is a separate step.
-- **RGB565 to JPEG conversion** — the OV5640 outputs BGR565 little-endian. The server correctly extracts B[15:11] G[10:5] R[4:0], scales to 8-bit, and saves as JPEG.
+- **RGB565 to JPEG conversion** — the OV5640 outputs standard RGB565 (a byte-swap setting packs the bytes low-byte-first). The server extracts R[15:11] G[10:5] B[4:0], scales to 8-bit (guarding against uint8 overflow), and saves as JPEG.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.
 - **Real-time schedule notifications** — every schedule state change (activate, deactivate, delete, task completion) publishes the full schedule list to `dashboard/schedules/updated` via MQTT, so the frontend updates instantly without polling.
 - **Dormancy-safe command delivery** — all board commands route through a single `send_board_command()` chokepoint. When the board reports `deep_dormant`, commands are queued in order and replayed automatically on the next wake, so commands issued during deep sleep are never lost (the board's MQTT is QoS 0, so the broker won't buffer them).
@@ -276,8 +274,8 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (66 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
-- **Watchtower auto-update** — production containers poll GHCR every 5 minutes and restart on new images (`nickfedor/watchtower`, the maintained fork compatible with Docker API ≥1.40).
+- **Full pipeline**: pytest (74 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
+- **CI-driven deploy** — on each push the CI job force-recreates the server and dashboard containers on the VPS over SSH; a `nickfedor/watchtower` service additionally polls GHCR every 5 minutes as a fallback.
 
 ---
 
@@ -297,7 +295,7 @@ thesis-iot-monitoring/
       firmware_config.h   All tuneable parameters in one file
     Drivers/              ST BSP + OV5640 + EMW3080 drivers
 
-  server/                 FastAPI backend (Python 3.12)
+  server/                 FastAPI backend (Python 3.11)
     app/
       api/
         agent_routes.py   Agentic chat (Claude tool_use + SSE streaming)
@@ -320,7 +318,7 @@ thesis-iot-monitoring/
 
   mosquitto/              MQTT broker configuration
   docker-compose.yml      Development stack
-  docker-compose.prod.yml Production (GHCR images + Watchtower)
+  docker-compose.prod.yml Production (GHCR images, CI force-recreate + Watchtower fallback)
   .github/workflows/
     ci.yml                Adaptive CI/CD pipeline
 ```
