@@ -360,7 +360,10 @@ def score_one_plan(rubric: dict, row: dict) -> dict:
             # uniform intervals matching expected.
             first_interval_short = intervals[0] < rubric["expected_interval_min"] * 0.6
 
-        if keyword_preserved or first_interval_short:
+        emitted_capture_now = any(
+            (tc.get("name") == "capture_now") for tc in (row.get("tool_calls") or [])
+        )
+        if emitted_capture_now or keyword_preserved or first_interval_short:
             score["t0_preserved"] = 1
         else:
             notes.append(

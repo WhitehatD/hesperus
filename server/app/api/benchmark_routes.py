@@ -298,6 +298,7 @@ async def _plan_with_claude(prompt: str, model_key: str) -> dict:
 
     tool_name = None
     tool_input = None
+    tool_calls: list[dict] = []
     raw_text_parts: list[str] = []
     thinking_parts: list[str] = []
 
@@ -308,13 +309,23 @@ async def _plan_with_claude(prompt: str, model_key: str) -> dict:
         elif btype == "text":
             raw_text_parts.append(getattr(block, "text", "") or "")
         elif btype == "tool_use":
-            tool_name = block.name
-            tool_input = block.input
+            tool_calls.append({"name": block.name, "input": block.input})
+
+    # Record EVERY tool call. A model may legitimately emit several in one turn
+    # (e.g. capture_now + create_schedule for an immediate+periodic request);
+    # keeping only one silently undercounts parallel tool use. Pick
+    # create_schedule as the primary so the schedule axes are scored against it
+    # even when a parallel capture_now is also present.
+    if tool_calls:
+        _primary = next((t for t in tool_calls if t["name"] == "create_schedule"), tool_calls[0])
+        tool_name = _primary["name"]
+        tool_input = _primary["input"]
 
     thinking_text = "".join(thinking_parts)
     result = {
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "tool_calls": tool_calls,
         "raw_text": "".join(raw_text_parts),
         "thinking_text": thinking_text,
         "success": tool_name is not None,
@@ -388,18 +399,24 @@ async def _plan_with_claude_nothink(prompt: str) -> dict:
 
     tool_name = None
     tool_input = None
+    tool_calls: list[dict] = []
     raw_text_parts: list[str] = []
     for block in response.content:
         btype = getattr(block, "type", None)
         if btype == "text":
             raw_text_parts.append(getattr(block, "text", "") or "")
         elif btype == "tool_use":
-            tool_name = block.name
-            tool_input = block.input
+            tool_calls.append({"name": block.name, "input": block.input})
+
+    if tool_calls:
+        _primary = next((t for t in tool_calls if t["name"] == "create_schedule"), tool_calls[0])
+        tool_name = _primary["name"]
+        tool_input = _primary["input"]
 
     result = {
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "tool_calls": tool_calls,
         "raw_text": "".join(raw_text_parts),
         "thinking_text": "",  # intentionally empty — this arm has thinking off
         "success": tool_name is not None,
@@ -504,22 +521,26 @@ async def _plan_with_qwen(prompt: str) -> dict:
     tool_calls = msg.tool_calls or []
     raw_text = msg.content or ""
 
+    import json as _json
     tool_name = None
     tool_input = None
-    if tool_calls:
-        tc = tool_calls[0]
-        tool_name = tc.function.name
-        # llama.cpp returns args as a JSON string; parse defensively
-        import json as _json
+    parsed_tool_calls: list[dict] = []
+    for tc in tool_calls:
         try:
-            tool_input = _json.loads(tc.function.arguments) if tc.function.arguments else {}
+            _args = _json.loads(tc.function.arguments) if tc.function.arguments else {}
         except _json.JSONDecodeError:
-            tool_input = {"_raw_arguments": tc.function.arguments}
+            _args = {"_raw_arguments": tc.function.arguments}
+        parsed_tool_calls.append({"name": tc.function.name, "input": _args})
+    if parsed_tool_calls:
+        _primary = next((t for t in parsed_tool_calls if t["name"] == "create_schedule"), parsed_tool_calls[0])
+        tool_name = _primary["name"]
+        tool_input = _primary["input"]
 
     usage = getattr(response, "usage", None)
     result = {
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "tool_calls": parsed_tool_calls,
         "raw_text": raw_text,
         "thinking_text": "",  # Qwen3-VL via llama.cpp default jinja: no thinking exposed
         "success": tool_name is not None,
@@ -617,6 +638,7 @@ async def _plan_with_gemini(prompt: str) -> dict:
 
     tool_name = None
     tool_input = None
+    tool_calls: list[dict] = []
     raw_text = ""
 
     for candidate in response.candidates or []:
@@ -624,14 +646,20 @@ async def _plan_with_gemini(prompt: str) -> dict:
             if part.text:
                 raw_text += part.text
             if part.function_call:
-                tool_name = part.function_call.name
                 # Gemini returns a MapComposite — convert to plain dict
-                tool_input = dict(part.function_call.args) if part.function_call.args else {}
+                _args = dict(part.function_call.args) if part.function_call.args else {}
+                tool_calls.append({"name": part.function_call.name, "input": _args})
+
+    if tool_calls:
+        _primary = next((t for t in tool_calls if t["name"] == "create_schedule"), tool_calls[0])
+        tool_name = _primary["name"]
+        tool_input = _primary["input"]
 
     meta = getattr(response, "usage_metadata", None)
     result = {
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "tool_calls": tool_calls,
         "raw_text": raw_text,
         "thinking_text": "",  # Gemini's thought_signature is opaque; not captured here
         "success": tool_name is not None,
