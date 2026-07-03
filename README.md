@@ -8,6 +8,8 @@ A complete edge-to-cloud system where you tell an AI agent *what to monitor* in 
 >
 > Alexandru-Ionut Cioc | Supervisors: Prof. Tang & Prof. Kouzinopoulos | 2026
 
+> **The headline result:** a self-hosted 30B vision model matched the best cloud model's quality within statistical noise at five to ten times the speed (0.77s vs 3.6 to 7.8s per call). Write-up: [ciocandco.com/writing/self-hosted-vs-cloud-vlm-benchmark](https://ciocandco.com/writing/self-hosted-vs-cloud-vlm-benchmark) | full findings: [results/findings_v3.md](results/findings_v3.md)
+
 <p align="center">
   <img src="https://img.shields.io/badge/STM32U585AI-Cortex--M33-03234B?style=flat-square&logo=stmicroelectronics&logoColor=white" />
   <img src="https://img.shields.io/badge/FastAPI-Python_3.11-009688?style=flat-square&logo=fastapi&logoColor=white" />
