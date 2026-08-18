@@ -43,9 +43,16 @@ echo "wrote $ENV_FILE"
 
 docker run --rm -v "$DEPLOY_DIR/mosquitto:/mosquitto/config" eclipse-mosquitto:2 \
   mosquitto_passwd -b -c /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD"
-chown hesperus-deploy:hesperus-deploy "$DEPLOY_DIR/mosquitto/passwd"
+# Must be owned by the mosquitto user INSIDE the container (uid/gid 1883),
+# not by hesperus-deploy. The broker drops privileges to that user and reads
+# the pwfile as it — with hesperus-deploy:600 it fails to start entirely
+# ("password-file: Error: Unable to open pwfile"), which then shows up as an
+# unhealthy container and a failed deploy. deploy.sh only does a `-f`
+# existence test on this path, which needs directory traversal, not file
+# read, so it doesn't need to own or read it.
+chown 1883:1883 "$DEPLOY_DIR/mosquitto/passwd"
 chmod 600 "$DEPLOY_DIR/mosquitto/passwd"
-echo "wrote $DEPLOY_DIR/mosquitto/passwd"
+echo "wrote $DEPLOY_DIR/mosquitto/passwd (owned by container uid 1883)"
 
 echo "Done. Next deploy (push to main, or: sudo -u hesperus-deploy /opt/hesperus/infra/deploy.sh)"
 echo "will pick these up. mosquitto itself is NOT restarted by this script or by deploy.sh —"
