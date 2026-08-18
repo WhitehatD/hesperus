@@ -24,10 +24,22 @@ services:
     ports: !override
       - "1883:1883"
       - "127.0.0.1:9001:9001"
+    healthcheck:
+      # Base compose's healthcheck subscribes anonymously — fails immediately
+      # once allow_anonymous is false (mosquitto.prod.conf). Override with
+      # authenticated creds, read from the persistent env file docker compose
+      # already substitutes ${VAR} from (see infra/deploy.sh).
+      test: ["CMD-SHELL", "mosquitto_sub -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t '$$SYS/#' -C 1 -W 3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    environment:
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
     volumes: !override
       # mosquitto.prod.conf requires auth (allow_anonymous false); passwd is
-      # generated fresh from MQTT_USERNAME/MQTT_PASSWORD at deploy time by
-      # infra/deploy.sh — never committed to the repo.
+      # written by infra/rotate-secrets.sh (run manually as root, outside the
+      # CI/deploy hot path) — never committed to the repo.
       - ./mosquitto/mosquitto.prod.conf:/mosquitto/config/mosquitto.conf
       - ./mosquitto/passwd:/mosquitto/config/passwd:ro
       - mosquitto_data:/mosquitto/data
@@ -83,7 +95,12 @@ services:
                                             # Forgejo/ntfy/Umami/oauth2-proxy containers)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${DOCKER_CONFIG:-~/.docker}/config.json:/config.json:ro
+      # No docker config mount — ghcr.io/whitehatd/hesperus-{server,dashboard}
+      # are public packages, watchtower needs no registry credentials to poll
+      # them. (The old mount pointed at a path that didn't exist on the
+      # hesperus-deploy user's home dir; docker silently auto-created it as a
+      # DIRECTORY instead of a file, which then made every docker-compose
+      # invocation print "Error parsing config file: ... is a directory".)
     restart: unless-stopped
 
 volumes:
