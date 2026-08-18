@@ -105,13 +105,22 @@ MQTT_USERNAME        ?=
 MQTT_PASSWORD        ?=
 FIRMWARE_UPLOAD_TOKEN ?=
 
+# Upload chunk size — numeric, not a secret, so a real default (not empty
+# string) is required here; unlike the credentials above, an empty -D would
+# produce invalid C (`#define HTTP_UPLOAD_CHUNK_SIZE`, no value). 4096 is
+# resilient on high-latency links (cellular hotspot); the old 16384 was
+# tuned for low-latency home WiFi only — see firmware_config.h comment.
+# make HTTP_UPLOAD_CHUNK_SIZE=16384 to restore the old benchmark config.
+HTTP_UPLOAD_CHUNK_SIZE ?= 4096
+
 C_DEFS = \
 -DSTM32U585xx \
 -DUSE_HAL_DRIVER \
 -DFW_VERSION=\"$(FW_VER_STR)\" \
 -DMQTT_USERNAME=\"$(MQTT_USERNAME)\" \
 -DMQTT_PASSWORD=\"$(MQTT_PASSWORD)\" \
--DFIRMWARE_UPLOAD_TOKEN=\"$(FIRMWARE_UPLOAD_TOKEN)\"
+-DFIRMWARE_UPLOAD_TOKEN=\"$(FIRMWARE_UPLOAD_TOKEN)\" \
+-DHTTP_UPLOAD_CHUNK_SIZE=$(HTTP_UPLOAD_CHUNK_SIZE)
 
 # Force rebuild when version changes (incremental builds miss -D flag changes)
 VERSION_FILE := $(BUILD_DIR)/.fw_version
@@ -187,6 +196,29 @@ size: $(BUILD_DIR)/$(TARGET).elf
 	$(SZ) $<
 
 flash: $(BUILD_DIR)/$(TARGET).bin
+	@# `flash`'s own prerequisite ($(TARGET).bin) triggers a full rebuild every
+	@# invocation (BUILD_EPOCH forces it, see comment above) — using
+	@# `make MQTT_USERNAME=... M_PASSWORD=...` and then plain `make flash`
+	@# does NOT reuse the first invocation's credentials; the second
+	@# invocation's ?= defaults (empty) win and silently flash a
+	@# credential-less binary. Bit us for real on 2026-08-18: board looped
+	@# CONNACK rc=5 for ~30 min before a packet capture proved the CONNECT
+	@# flags had no username/password bits set at all. ALWAYS pass every
+	@# credential to the SAME `make flash ...` invocation.
+	@if [ -z "$(MQTT_USERNAME)" ] || [ -z "$(MQTT_PASSWORD)" ]; then \
+		echo ""; \
+		echo "############################################################"; \
+		echo "#  WARNING: flashing WITHOUT MQTT credentials.              #"; \
+		echo "#  MQTT_USERNAME/MQTT_PASSWORD are empty -> the board will  #"; \
+		echo "#  send an unauthenticated CONNECT and be rejected by any   #"; \
+		echo "#  broker that requires auth (rc=5, reset-loops forever).   #"; \
+		echo "#  Pass them to THIS command:                               #"; \
+		echo "#    make flash MQTT_USERNAME=... MQTT_PASSWORD=...         #"; \
+		echo "############################################################"; \
+		echo ""; \
+	else \
+		echo "Flashing with MQTT_USERNAME='$(MQTT_USERNAME)' (password set, $(shell echo -n '$(MQTT_PASSWORD)' | wc -c) chars)"; \
+	fi
 	"C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe" -c port=SWD -w $< 0x08000000 -v -rst
 
 clean:

@@ -256,6 +256,9 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.image }}:latest
             ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_MQTT_USERNAME=${{ secrets.DASHBOARD_MQTT_USERNAME }}
+            NEXT_PUBLIC_MQTT_PASSWORD=${{ secrets.DASHBOARD_MQTT_PASSWORD }}
 
   # ══════════════════════════════════════════════════════════════════════════
   #  Stage 3: Automated Infrastructure Deployment

@@ -12,6 +12,7 @@ Endpoints:
 """
 
 import hashlib
+import hmac
 import os
 import struct
 import json
@@ -112,13 +113,22 @@ async def get_firmware_history():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/firmware/version", response_model=FirmwareVersionResponse)
-async def get_firmware_version():
+async def get_firmware_version(x_firmware_token: str | None = Header(None)):
     """
     Return the current firmware version metadata.
     The STM32 board calls this to check if an update is available.
 
+    Authentication: requires X-Firmware-Token header when configured. Added
+    2026-08-18 alongside /firmware/download — not because the version number
+    itself is sensitive, but for symmetry with download and because leaving
+    it open let anyone probe for whether an update is pending.
+
     Returns 200 with version info, or 404 if no firmware has been uploaded.
     """
+    if settings.firmware_upload_token:
+        if not hmac.compare_digest(x_firmware_token or "", settings.firmware_upload_token):
+            raise HTTPException(status_code=403, detail="Invalid firmware token")
+
     meta = _load_metadata()
     if meta is None:
         raise HTTPException(status_code=404, detail="No firmware binary uploaded")
@@ -136,13 +146,27 @@ async def get_firmware_version():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/firmware/download")
-async def download_firmware():
+async def download_firmware(x_firmware_token: str | None = Header(None)):
     """
     Stream the firmware binary to the STM32 board.
     The board downloads this during OTA_DownloadAndFlash().
 
+    Authentication: requires X-Firmware-Token header when configured. Added
+    2026-08-18 — this endpoint serves a binary with MQTT credentials and the
+    upload token compiled in as plaintext -D strings (see ci.yml's Build
+    Firmware step). Leaving it open would let anyone recover both secrets
+    with `curl .../firmware/download | grep -a`, unwinding the MQTT-auth and
+    upload-auth fixes made the same day. No firmware had actually been
+    uploaded yet when this was found (verified 404, not a live leak) but the
+    exposure was imminent — the very next successful CI run would have
+    served a real binary.
+
     Returns the raw .bin file with appropriate headers for streaming.
     """
+    if settings.firmware_upload_token:
+        if not hmac.compare_digest(x_firmware_token or "", settings.firmware_upload_token):
+            raise HTTPException(status_code=403, detail="Invalid firmware token")
+
     if not FIRMWARE_BIN.exists():
         raise HTTPException(status_code=404, detail="No firmware binary available")
 
@@ -174,7 +198,7 @@ async def upload_firmware(
     """
     # ── Authentication ────────────────────────────────────
     if settings.firmware_upload_token:
-        if x_firmware_token != settings.firmware_upload_token:
+        if not hmac.compare_digest(x_firmware_token or "", settings.firmware_upload_token):
             raise HTTPException(status_code=403, detail="Invalid firmware upload token")
 
     # ── Read and validate binary ──────────────────────────
@@ -254,7 +278,7 @@ async def notify_firmware_update(
     """
     # ── Authentication ────────────────────────────────────
     if settings.firmware_upload_token:
-        if x_firmware_token != settings.firmware_upload_token:
+        if not hmac.compare_digest(x_firmware_token or "", settings.firmware_upload_token):
             raise HTTPException(status_code=403, detail="Invalid firmware token")
 
     # ── Publish OTA trigger to MQTT ──────────────────────

@@ -62,7 +62,18 @@ export function useMQTT(topics: string[], onMessage?: MessageHandler) {
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnect controlled by topicKey, topics accessed via ref
 	useEffect(() => {
-		const client = mqtt.connect(getMqttUrl(), { reconnectPeriod: 3000 });
+		// Read-only credentials — enforced by mosquitto's ACL (mosquitto/acl:
+		// `hesperus-dashboard` has `topic read` only, never `readwrite`), not
+		// by keeping this value out of the bundle. It's in the client JS,
+		// visible to anyone via devtools; that's fine because the ACL means
+		// the worst a leaked value enables is watching telemetry, never
+		// publishing a board command. Do NOT reuse the board's own
+		// (readwrite) credentials here.
+		const client = mqtt.connect(getMqttUrl(), {
+			reconnectPeriod: 3000,
+			username: process.env.NEXT_PUBLIC_MQTT_USERNAME || undefined,
+			password: process.env.NEXT_PUBLIC_MQTT_PASSWORD || undefined,
+		});
 		clientRef.current = client;
 
 		client.on("connect", () => {

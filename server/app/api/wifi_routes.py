@@ -7,9 +7,11 @@ import json
 from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
 from sqlalchemy import select, update
 
+from app.api.routes import verify_board_token
 from app.api.schemas import WifiConfigRequest, WifiConfigResponse
 from app.config import settings
 from app.db import database as db
@@ -30,7 +32,7 @@ def _get_fernet() -> Fernet:
     return Fernet(key.encode() if isinstance(key, str) else key)
 
 
-@router.post("/wifi/config", response_model=WifiConfigResponse)
+@router.post("/wifi/config", response_model=WifiConfigResponse, dependencies=[Depends(verify_board_token)])
 async def set_wifi_config(request: WifiConfigRequest):
     """
     Set WiFi credentials for the STM32 board.

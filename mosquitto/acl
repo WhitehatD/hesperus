@@ -1,0 +1,28 @@
+# Hesperus MQTT ACL
+#
+# Two identities with deliberately different power:
+#
+#   hesperus-board     — the STM32 firmware. Full read/write on its own
+#                        topics: it must publish status/telemetry AND
+#                        subscribe to commands.
+#
+#   hesperus-dashboard — the browser client (dashboard/app/hooks/useMQTT.ts).
+#                        READ ONLY. Its credentials are compiled into the
+#                        public JS bundle and are therefore effectively
+#                        public — anyone can read them out of devtools. That
+#                        is acceptable ONLY because this ACL forbids it from
+#                        publishing: the worst an attacker can do with them
+#                        is watch telemetry, not issue board commands.
+#                        Without this ACL, handing the browser working
+#                        credentials would re-open exactly the hole the
+#                        2026-08-18 MQTT auth work closed (anonymous clients
+#                        publishing erase_wifi/set_wifi/firmware_update).
+#
+# The FastAPI server connects as hesperus-board too (it must publish
+# commands) — see server/app/mqtt/client.py.
+
+user hesperus-board
+topic readwrite device/stm32/#
+
+user hesperus-dashboard
+topic read device/stm32/#

@@ -42,6 +42,7 @@ services:
       # CI/deploy hot path) — never committed to the repo.
       - ./mosquitto/mosquitto.prod.conf:/mosquitto/config/mosquitto.conf
       - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - ./mosquitto/acl:/mosquitto/config/acl:ro
       - mosquitto_data:/mosquitto/data
       - mosquitto_log:/mosquitto/log
 

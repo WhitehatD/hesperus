@@ -57,6 +57,41 @@ def test_set_wifi_config_publishes_mqtt(client):
     assert payload["password"] == "mqttpass123"
 
 
+def test_set_wifi_config_auth_required(client):
+    """POST /api/wifi/config should reject unauthenticated requests when a
+    board token is configured. Previously completely unauthenticated —
+    anyone could remotely push arbitrary WiFi credentials to the board
+    (full takeover: redirect it onto attacker-controlled WiFi). Fixed
+    2026-08-19 alongside the OTA endpoint auth gap, both found by adversarial
+    verification the day after the infra-core redeploy."""
+    from unittest.mock import patch
+
+    with patch("app.api.routes.settings") as mock_settings:
+        mock_settings.firmware_upload_token = "secret-board-token-2026"
+
+        resp = client.post(
+            "/api/wifi/config",
+            json={"ssid": "AttackerNet", "password": "hijacked123"},
+        )
+        assert resp.status_code == 403
+
+
+def test_set_wifi_config_auth_valid(client):
+    """POST /api/wifi/config should accept a valid X-Upload-Token."""
+    from unittest.mock import patch
+
+    with patch("app.api.routes.settings") as mock_settings:
+        mock_settings.firmware_upload_token = "secret-board-token-2026"
+
+        resp = client.post(
+            "/api/wifi/config",
+            json={"ssid": "TestNetwork", "password": "securepass123"},
+            headers={"X-Upload-Token": "secret-board-token-2026"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ssid"] == "TestNetwork"
+
+
 def test_set_wifi_config_invalid_ssid_empty(client):
     """POST /api/wifi/config with empty SSID should return 422."""
     resp = client.post(

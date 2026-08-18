@@ -55,6 +55,20 @@ def test_firmware_version_with_firmware(client, tmp_path):
         assert data["crc32"] == 12345678
 
 
+def test_firmware_version_auth_required(client, tmp_path):
+    """GET /api/firmware/version should reject unauthenticated requests when
+    a token is configured. Previously unauthenticated (matched download's
+    gap). Fixed 2026-08-19."""
+    fw_meta = tmp_path / "firmware.json"
+    fw_meta.write_text(json.dumps({"version": "0.3", "size": 1024, "crc32": 1, "filename": "f.bin"}))
+
+    with patch("app.api.firmware_routes.FIRMWARE_META", fw_meta), \
+         patch("app.api.firmware_routes.settings") as mock_settings:
+        mock_settings.firmware_upload_token = "secret-fw-token-2026"
+        resp = client.get("/api/firmware/version")
+        assert resp.status_code == 403
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Download Endpoint
 # ══════════════════════════════════════════════════════════════════════════════
@@ -76,6 +90,40 @@ def test_firmware_download_with_firmware(client, tmp_path):
         resp = client.get("/api/firmware/download")
         assert resp.status_code == 200
         assert len(resp.content) == len(fw_data)
+        assert resp.content[:4] == b"\xDE\xAD\xBE\xEF"
+
+
+def test_firmware_download_auth_required(client, tmp_path):
+    """GET /api/firmware/download should reject unauthenticated requests
+    when a token is configured. This was the more serious of the two OTA
+    gaps found 2026-08-19: the served binary has the MQTT password and
+    upload token compiled in as plaintext -D strings (see ci.yml's Build
+    Firmware step), so an open download endpoint would have handed both
+    secrets to anyone the moment the first real binary was uploaded."""
+    fw_bin = tmp_path / "firmware.bin"
+    fw_bin.write_bytes(b"\xDE\xAD\xBE\xEF" * 256)
+
+    with patch("app.api.firmware_routes.FIRMWARE_BIN", fw_bin), \
+         patch("app.api.firmware_routes.settings") as mock_settings:
+        mock_settings.firmware_upload_token = "secret-fw-token-2026"
+        resp = client.get("/api/firmware/download")
+        assert resp.status_code == 403
+
+
+def test_firmware_download_auth_valid(client, tmp_path):
+    """GET /api/firmware/download should accept a valid X-Firmware-Token."""
+    fw_bin = tmp_path / "firmware.bin"
+    fw_data = b"\xDE\xAD\xBE\xEF" * 256
+    fw_bin.write_bytes(fw_data)
+
+    with patch("app.api.firmware_routes.FIRMWARE_BIN", fw_bin), \
+         patch("app.api.firmware_routes.settings") as mock_settings:
+        mock_settings.firmware_upload_token = "secret-fw-token-2026"
+        resp = client.get(
+            "/api/firmware/download",
+            headers={"X-Firmware-Token": "secret-fw-token-2026"},
+        )
+        assert resp.status_code == 200
         assert resp.content[:4] == b"\xDE\xAD\xBE\xEF"
 
 

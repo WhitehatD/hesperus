@@ -196,7 +196,21 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Upload Optimization
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define HTTP_UPLOAD_CHUNK_SIZE      16384  /* 16KB chunks — halve SPI round-trips for 2× throughput */
+/* 16KB chunks — halve SPI round-trips for 2× throughput. This is the value
+ * all published benchmark numbers (results/findings_v3.md) were measured
+ * with; do not change it casually.
+ *
+ * 2026-08-18: image upload proved flaky over a 4G phone hotspot (mss 1410) —
+ * "Send failed after 3 retries" at offsets 19862, 22682, 8582 of 614400.
+ * Tested 4096 as a fix; it did NOT help, and the random (non-chunk-aligned)
+ * failure offsets indicate a lossy/jittery uplink rather than a buffer-size
+ * threshold, so the change was reverted. One upload DID succeed on the same
+ * link, confirming it's flaky rather than broken. Retest on real WiFi before
+ * concluding anything about upload reliability. Overridable for experiments:
+ * make HTTP_UPLOAD_CHUNK_SIZE=4096 */
+#ifndef HTTP_UPLOAD_CHUNK_SIZE
+#define HTTP_UPLOAD_CHUNK_SIZE      16384
+#endif
 #define HTTP_UPLOAD_MAX_RETRIES     2      /* Retry full POST on socket connect failure */
 #define HTTP_UPLOAD_RETRY_DELAY_MS  500    /* Delay between retries */
 

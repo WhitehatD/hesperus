@@ -4,6 +4,7 @@ REST endpoints for planning, image upload, visual analysis, and result retrieval
 """
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -47,7 +48,7 @@ def verify_board_token(request: Request) -> None:
     FIRMWARE_UPLOAD_TOKEN or every board-facing endpoint is unauthenticated.
     """
     token = request.headers.get("X-Upload-Token", "")
-    if settings.firmware_upload_token and token != settings.firmware_upload_token:
+    if settings.firmware_upload_token and not hmac.compare_digest(token, settings.firmware_upload_token):
         raise HTTPException(status_code=403, detail="Invalid or missing X-Upload-Token")
 
 

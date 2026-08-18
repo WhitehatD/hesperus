@@ -364,9 +364,10 @@ OTAStatus_t OTA_CheckForUpdate(OTAVersionInfo_t *info)
     int header_len = snprintf(header, sizeof(header),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Firmware-Token: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
-        OTA_VERSION_PATH, SERVER_HOST, SERVER_PORT);
+        OTA_VERSION_PATH, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
 
     /* Open socket */
     int32_t sock = _ota_socket_open();
@@ -507,9 +508,10 @@ OTAStatus_t OTA_DownloadAndFlash(const OTAVersionInfo_t *info,
     int header_len = snprintf(header, sizeof(header),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Firmware-Token: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
-        OTA_DOWNLOAD_PATH, SERVER_HOST, SERVER_PORT);
+        OTA_DOWNLOAD_PATH, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
 
     /* SPI warm-up: let the EMW3080 fully drain any residual MIPC state
      * from the MQTT disconnect + Camera deinit before we start fresh
