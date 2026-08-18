@@ -108,8 +108,25 @@ jobs:
   build-firmware:
     name: Build & Upload Firmware
     runs-on: ubuntu-latest
-    needs: changes
-    if: github.ref == 'refs/heads/main' && needs.changes.outputs.firmware == 'true'
+    # Needs deploy-vps, not just changes: the "Upload Firmware to Server" step
+    # POSTs to DEPLOY_SERVER_URL, which only exists once the server container
+    # is actually up. Found the hard way — this job used to run in parallel
+    # with build-server/deploy-vps and got connection-refused on a fresh
+    # deploy where the server had never been started before.
+    #
+    # deploy-vps only RUNS when server/dashboard changed — a firmware-only
+    # push skips it, and by default a job needing a skipped job also skips.
+    # always() + checking .result explicitly avoids that: proceed unless
+    # deploy-vps actually failed. When deploy-vps is skipped, the server is
+    # presumably already up from a prior deploy (steady state), so the
+    # upload is still safe to attempt.
+    needs: [changes, deploy-vps]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.firmware == 'true' &&
+      needs.deploy-vps.result != 'failure' &&
+      needs.deploy-vps.result != 'cancelled'
 
     steps:
       - uses: actions/checkout@v4

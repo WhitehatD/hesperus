@@ -35,8 +35,16 @@ chmod +x "$DEPLOY_DIR/infra/deploy.sh"
 
 echo "== 2/6: hesperus-deploy restricted system user =="
 if ! id -u hesperus-deploy >/dev/null 2>&1; then
-  useradd --system --create-home --shell /usr/sbin/nologin hesperus-deploy
+  # NOTE: shell must be a REAL shell, not /usr/sbin/nologin. sshd executes a
+  # ForceCommand *through the user's login shell* — with nologin the session
+  # dies with "This account is currently not available." and the forced
+  # command never runs. The blast radius is bounded by ForceCommand (which
+  # applies to every session regardless of what the client asks for), not by
+  # the shell. Account still has no password and cannot be logged into
+  # interactively (ForceCommand + PermitTTY no).
+  useradd --system --create-home --shell /bin/bash hesperus-deploy
 fi
+usermod --shell /bin/bash hesperus-deploy   # idempotent: fix pre-existing nologin
 usermod -aG docker hesperus-deploy   # required to run docker compose — NOTE this
                                       # is root-equivalent via the docker socket;
                                       # the ForceCommand restriction below is what

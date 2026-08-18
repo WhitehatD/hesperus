@@ -128,12 +128,16 @@ def test_upload_image_auth_required(client):
         assert resp.status_code == 403
 
 
-def test_upload_image_auth_valid(client):
+def test_upload_image_auth_valid(client, tmp_path):
     """POST /api/upload should accept a valid X-Upload-Token."""
     fake_jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
 
     with patch("app.api.routes.settings") as mock_settings:
         mock_settings.firmware_upload_token = "secret-board-token-2026"
+        # Must pin upload_dir too — a bare MagicMock attribute stringifies into
+        # a literal "MagicMock/settings.upload_dir/..." path and writes real
+        # files into the repo working tree.
+        mock_settings.upload_dir = str(tmp_path)
 
         resp = client.post(
             "/api/upload",
