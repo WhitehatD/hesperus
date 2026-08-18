@@ -67,7 +67,28 @@ echo "== 4/6: ufw — board ingress ports only =="
 ufw allow 8000/tcp comment 'hesperus-iot board ingress (HTTP upload)'
 ufw allow 1883/tcp comment 'hesperus-iot board ingress (MQTT)'
 
-echo "== 5/6: nginx vhost — hesperus.ciocandco.com =="
+echo "== 5/6: nginx vhost — hesperus.ciocandco.com (HTTP-only bootstrap) =="
+# Two-stage write: the HTTPS server block references cert files that don't
+# exist yet. Writing both blocks in one shot and running `nginx -t` before
+# certbot has run would fail nginx -t, which (set -e) aborts the whole
+# script. Write HTTP-only first, reload, get the cert, THEN add the HTTPS
+# block and reload again.
+cat > /etc/nginx/sites-available/hesperus.ciocandco.com <<'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name hesperus.ciocandco.com;
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://$host$request_uri; }
+}
+EOF
+ln -sf /etc/nginx/sites-available/hesperus.ciocandco.com /etc/nginx/sites-enabled/hesperus.ciocandco.com
+nginx -t
+systemctl reload nginx
+
+echo "== 6/6: certbot — standalone cert, then full vhost with HTTPS block =="
+certbot certonly --webroot -w /var/www/html -d hesperus.ciocandco.com --non-interactive --agree-tos -m alex@ciocandco.com
+
 cat > /etc/nginx/sites-available/hesperus.ciocandco.com <<'EOF'
 # Hesperus dashboard — reverse proxy to the loopback-bound Next.js container.
 # Standalone LE cert, independent of the main ciocandco.com multi-SAN cert —
@@ -138,11 +159,7 @@ server {
     }
 }
 EOF
-ln -sf /etc/nginx/sites-available/hesperus.ciocandco.com /etc/nginx/sites-enabled/hesperus.ciocandco.com
-
-echo "== 6/6: certbot — standalone cert for hesperus.ciocandco.com =="
-nginx -t && systemctl reload nginx   # reload with HTTP-only server block first (ACME challenge path needs to resolve)
-certbot certonly --webroot -w /var/www/html -d hesperus.ciocandco.com --non-interactive --agree-tos -m alex@ciocandco.com
-nginx -t && systemctl reload nginx   # reload again — now the HTTPS block's cert files exist
+nginx -t
+systemctl reload nginx
 
 echo "== Done. Verify with the checks in the plan's Verification section. =="
