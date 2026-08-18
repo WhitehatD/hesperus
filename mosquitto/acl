@@ -23,6 +23,13 @@
 
 user hesperus-board
 topic readwrite device/stm32/#
+# $SYS read is required by the container healthcheck, which does
+# `mosquitto_sub -t '$SYS/#' -C 1 -W 3` (docker-compose.prod.yml). Without
+# this the subscribe is silently denied, no message ever arrives, the 3s
+# wait times out, and the container is marked unhealthy forever — which in
+# turn blocks `depends_on: condition: service_healthy` and fails deploys.
+# $SYS is broker metadata (uptime, client counts), not device data.
+topic read $SYS/#
 
 user hesperus-dashboard
 topic read device/stm32/#
