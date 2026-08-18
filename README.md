@@ -1,8 +1,13 @@
-# Autonomous IoT Visual Monitoring System
+# Hesperus
 
-**Natural language in, autonomous visual intelligence out.**
+**Autonomous IoT Visual Monitoring — natural language in, autonomous visual intelligence out.**
 
 A complete edge-to-cloud system where you tell an AI agent *what to monitor* in plain English, and a physical STM32 camera board autonomously captures, uploads, and analyzes images using multimodal LLMs — no camera feeds, no manual triggers, no human in the loop.
+
+> Named for the evening star — the light that appears at dusk, when the watch begins. The
+> system's core behavior isn't continuous watching, it's a device that wakes on schedule,
+> captures once, and returns to dormancy: the *duty cycle*, not the *stare*, is the point
+> (see [Key Findings](#key-findings) below — a 100–252× energy reduction depends on it).
 
 > Bachelor Thesis — Design and Implementation of an Autonomous IoT Visual Monitoring System with Cloud-Based AI Planning and Analysis
 >
@@ -285,7 +290,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ## Repository Structure
 
 ```
-thesis-iot-monitoring/
+hesperus/
   firmware/               Bare-metal C (ARM GCC, STM32U585AI)
     Core/Src/
       main.c              Event loop, scheduler, command dispatch
@@ -353,8 +358,8 @@ All commands are JSON payloads on `device/stm32/commands`:
 ### Cloud (VPS or local)
 
 ```bash
-git clone https://github.com/whitehatd/thesis-iot-monitoring.git
-cd thesis-iot-monitoring
+git clone https://github.com/whitehatd/hesperus.git
+cd hesperus
 cp server/.env.example server/.env   # Configure API keys
 docker compose up -d                 # Mosquitto + FastAPI + Dashboard
 ```

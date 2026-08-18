@@ -1,0 +1,4 @@
+# Shell scripts must keep LF line endings regardless of local Windows git
+# config — a CRLF shebang line (#!/usr/bin/env bash\r) fails to execute on
+# the Linux VPS with a "bad interpreter" error.
+*.sh text eol=lf

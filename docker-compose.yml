@@ -2,7 +2,7 @@ services:
   # ── MQTT Broker ──────────────────────────────────────
   mosquitto:
     image: eclipse-mosquitto:2
-    container_name: thesis-mosquitto
+    container_name: hesperus-mosquitto
     ports:
       - "1883:1883"   # MQTT
       - "9001:9001"   # WebSocket (for dashboard)
@@ -22,7 +22,7 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
-    container_name: thesis-server
+    container_name: hesperus-server
     ports:
       - "8000:8000"
     env_file:
@@ -55,7 +55,7 @@ services:
       args:
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
         - NEXT_PUBLIC_MQTT_WS_URL=${NEXT_PUBLIC_MQTT_WS_URL:-ws://localhost:9001}
-    container_name: thesis-dashboard
+    container_name: hesperus-dashboard
     ports:
       - "80:3000"
     environment:

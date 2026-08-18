@@ -1,4 +1,4 @@
-name: Thesis IoT CI/CD Pipeline
+name: Hesperus CI/CD Pipeline
 
 on:
   push:
@@ -152,7 +152,7 @@ jobs:
           HTTP_CODE=$(curl -s -o /tmp/upload_resp.json -w "%{http_code}" \
             -X POST "${DEPLOY_URL}/api/firmware/upload?version=${FW_VERSION}" \
             -H "X-Firmware-Token: ${FIRMWARE_TOKEN}" \
-            -F "file=@firmware/build/thesis-iot-firmware.bin" \
+            -F "file=@firmware/build/hesperus-firmware.bin" \
             --connect-timeout 15 \
             --max-time 60)
             
@@ -184,7 +184,7 @@ jobs:
 
       - name: Compute lowercase image name
         id: meta
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/thesis-server" >> "$GITHUB_OUTPUT"
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hesperus-server" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -216,7 +216,7 @@ jobs:
 
       - name: Compute lowercase image name
         id: meta
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/thesis-dashboard" >> "$GITHUB_OUTPUT"
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hesperus-dashboard" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -249,54 +249,21 @@ jobs:
     
     steps:
       - name: Execute Remote SSH Deployment
+        # DEPLOY_USER's SSH key is a FORCED COMMAND (see infra/vps-provision.sh
+        # sshd Match block: ForceCommand /opt/hesperus/deploy.sh). Whatever this
+        # step sends as `script` is ignored server-side — the box always runs
+        # infra/deploy.sh instead, hard-scoped to /opt/hesperus. This is
+        # deliberate: infra-core is a shared host (Forgejo/ntfy/Umami/etc. also
+        # live there), so the deploy key must not be able to run arbitrary
+        # commands even if the secret ever leaked. Env vars still reach the
+        # forced command via SSH's AcceptEnv/SendEnv (independent of ForceCommand).
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           envs: ANTHROPIC_API_KEY,FIRMWARE_UPLOAD_TOKEN,GEMINI_API_KEY,GHCR_TOKEN
-          script: |
-            # Find the deployment directory containing our docker-compose.prod.yml
-            FILE_PATH=$(find /root /home /opt /var/www -maxdepth 4 -type f -name "docker-compose.prod.yml" 2>/dev/null | head -n 1)
-
-            if [ -z "$FILE_PATH" ]; then
-              echo "Deployment directory not found on VPS! Attempting to clone..."
-              cd ~
-              git clone https://github.com/${GITHUB_REPOSITORY}.git thesis-iot-monitoring || { echo "Clone failed"; exit 1; }
-              cd thesis-iot-monitoring
-            else
-              DEPLOY_DIR=$(dirname "$FILE_PATH")
-              echo "Found deployment directory at $DEPLOY_DIR"
-              cd "$DEPLOY_DIR"
-              git fetch origin main
-              git reset --hard origin/main
-            fi
-
-            # Inject secrets into persistent VPS env file
-            ENV_FILE="$(pwd)/.env.prod"
-            printf '%s\n' \
-              "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
-              "FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN}" \
-              "GEMINI_API_KEY=${GEMINI_API_KEY}" \
-              > "$ENV_FILE"
-            chmod 600 "$ENV_FILE"
-
-            set -a
-            source "$ENV_FILE"
-            set +a
-
-            # Authenticate with GHCR so docker compose pull can fetch private images
-            mkdir -p ~/.docker
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u github --password-stdin
-
-            # Pull new images for app services only — mosquitto is infrastructure
-            # and must NOT be restarted on code-only deploys (it holds live MQTT
-            # session state; restarting it drops all connected boards mid-experiment).
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet server dashboard
-            # Force-recreate only server + dashboard; leave mosquitto + watchtower untouched
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --no-deps server dashboard
-            # Ensure infra services are running (no-op if already up, starts if stopped)
-            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+          script: echo "invoking Hesperus deploy (server enforces infra/deploy.sh via ForceCommand)"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FIRMWARE_UPLOAD_TOKEN: ${{ secrets.FIRMWARE_UPLOAD_TOKEN }}

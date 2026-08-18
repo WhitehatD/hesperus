@@ -389,8 +389,8 @@ style: |
 </p>
 
 <div class="links">
-  <span class="chip live">89.167.11.147 — live</span>
-  <span class="chip">github.com/WhitehatD/thesis-iot-monitoring</span>
+  <span class="chip live">hesperus.ciocandco.com — live</span>
+  <span class="chip">github.com/WhitehatD/hesperus</span>
 </div>
 
 <!-- Speaker note: Good morning. To orient everyone in one sentence: this is a system that takes a plain-English monitoring request and turns it into autonomous hardware behaviour — running live on my desk right now at the IP shown. The core idea: you describe what to monitor in plain English, like "check the parking lot every morning at 8", and a physical microcontroller does the rest — schedules itself, wakes up, captures, sends the image to an AI for analysis, and streams the result back to a live dashboard. No human in the loop. -->

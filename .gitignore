@@ -133,7 +133,9 @@ scripts/benchmark_images/*.mov
 .husky/
 scratchpad_*.json
 
-# crag-generated agent/IDE configs (not tracked — only .github/workflows/gates.yml kept)
+# crag-generated agent/IDE configs (not tracked). Quality gates run inside
+# ci.yml — the generated gates.yml/governance-guard.yml workflows are not
+# kept either (see .claude/governance.md "Deployment" section).
 # ============================================
 .agent/
 

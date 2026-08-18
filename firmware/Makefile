@@ -20,7 +20,7 @@ HEX    = $(CP) -O ihex
 BIN    = $(CP) -O binary -S
 
 # ── Project ───────────────────────────────────────────
-TARGET = thesis-iot-firmware
+TARGET = hesperus-firmware
 BUILD_DIR = build
 
 # ── MCU flags ─────────────────────────────────────────

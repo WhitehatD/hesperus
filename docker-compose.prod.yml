@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Production Docker Compose — Thesis IoT Visual Monitoring
+#  Production Docker Compose — Hesperus (Autonomous IoT Visual Monitoring)
 #
 #  Deploy with:  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
@@ -8,13 +8,29 @@
 #    - Adds Watchtower for automatic container updates
 #    - Mounts firmware volume for OTA binary storage
 #    - No hot-reload volume mounts
+#    - Dashboard rebound to a loopback port (infra-core's host nginx owns 80/443
+#      across multiple tenants; nginx reverse-proxies hesperus.ciocandco.com to
+#      this loopback port instead of the container claiming the host's port 80)
 # ═══════════════════════════════════════════════════════════════════════════
 
 services:
+  # ── Override mosquitto ports ──────────────────────────
+  #  1883 (raw MQTT) stays public — the STM32 board connects directly, no
+  #  DNS/proxy involved (firmware has no DNS resolver, it dials a raw IP).
+  #  9001 (WebSocket) is rebound to loopback — the dashboard's browser code
+  #  never hits this port directly; it always goes through nginx's /mqtt
+  #  proxy path (see useMQTT.ts fallback), so 9001 doesn't need to be public.
+  mosquitto:
+    ports: !override
+      - "1883:1883"
+      - "127.0.0.1:9001:9001"
+
   # ── Override server to use GHCR image ────────────────
   server:
-    image: ${SERVER_IMAGE:-ghcr.io/whitehatd/thesis-server:latest}
+    image: ${SERVER_IMAGE:-ghcr.io/whitehatd/hesperus-server:latest}
     build: !reset null
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     volumes: !override
       - server_data:/app/data
       - firmware_data:/app/data/firmware
@@ -33,8 +49,12 @@ services:
 
   # ── Override dashboard to use GHCR image ─────────────
   dashboard:
-    image: ${DASHBOARD_IMAGE:-ghcr.io/whitehatd/thesis-dashboard:latest}
+    image: ${DASHBOARD_IMAGE:-ghcr.io/whitehatd/hesperus-dashboard:latest}
     build: !reset null
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    ports: !override
+      - "127.0.0.1:3002:3000"   # nginx on infra-core reverse-proxies hesperus.ciocandco.com here
 
   # ── Watchtower — Auto-update containers ──────────────
   #
@@ -43,12 +63,14 @@ services:
   #  This is the "git push → auto-deploy" mechanism.
   watchtower:
     image: nickfedor/watchtower:latest    # containrrr/watchtower is EOL; nickfedor fork supports Docker API ≥1.40
-    container_name: thesis-watchtower
+    container_name: hesperus-watchtower
     environment:
       - WATCHTOWER_POLL_INTERVAL=300       # Check every 5 minutes
       - WATCHTOWER_CLEANUP=true            # Remove old images
       - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_LABEL_ENABLE=false      # Watch ALL containers
+      - WATCHTOWER_LABEL_ENABLE=true       # Only containers with the watchtower.enable label
+                                            # (infra-core is a SHARED host — must not touch
+                                            # Forgejo/ntfy/Umami/oauth2-proxy containers)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${DOCKER_CONFIG:-~/.docker}/config.json:/config.json:ro

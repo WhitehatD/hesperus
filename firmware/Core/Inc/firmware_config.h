@@ -29,8 +29,13 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Server Configuration (FastAPI backend)
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* NOTE: mx_aton_r() below (wifi.c) parses a dotted-quad IP string directly —
+ * there is no DNS resolution anywhere in the firmware's network stack. This
+ * MUST stay a raw IP literal; "iot.ciocandco.com" would silently fail to
+ * parse and break every network path (upload, MQTT, OTA, time-sync). The
+ * DNS name still exists and resolves to this same IP for humans/docs. */
 #ifndef SERVER_HOST
-#define SERVER_HOST                 "89.167.11.147"
+#define SERVER_HOST                 "46.62.200.8"
 #endif
 #define SERVER_PORT                 8000
 #define SERVER_UPLOAD_PATH          "/api/upload"
