@@ -253,9 +253,10 @@ Bank 2: 0x08100000 – 0x081FFFFF  (inactive / OTA target)
 | ID | Finding | Severity | Remediation |
 |----|---------|----------|-------------|
 | SEC-01 | Hardcoded credentials | Critical | Build-time `-D` injection + flash storage |
-| SEC-02 | Unauthenticated MQTT | High | Username/password flags in CONNECT packet |
+| SEC-02 | Unauthenticated MQTT | High | Username/password flags in CONNECT packet — mechanism existed since inception but was never populated (mosquitto ran `allow_anonymous true`) until the infra-core redeploy (2026-08-18), which requires auth on both broker and client |
 | SEC-03 | MQTT remaining-length overflow | High | 4-byte limit per MQTT 3.1.1 §2.2.3 |
 | SEC-04 | Unvalidated RTC time fields | Medium | Range checks before register write |
+| SEC-05 | Unauthenticated image upload | High | `X-Upload-Token` header on the multipart POST (both the async and synchronous upload paths), checked server-side — found + fixed 2026-08-18 alongside SEC-02; `/api/upload` had no auth dependency at all before this |
 | SEC-06 | OTA firmware downgrade | High | Semantic version comparison |
 | SEC-07 | No hardware watchdog | High | 16s IWDG on dedicated LSI clock |
 | SEC-09 | Watchdog starvation during OTA | High | Non-blocking `MSG_DONTWAIT` SPI polling |

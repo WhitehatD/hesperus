@@ -453,12 +453,14 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
             "POST %s?task_id=%lu HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
+            "X-Upload-Token: %s\r\n"
             "Content-Type: multipart/form-data; boundary=%s\r\n"
             "Content-Length: %lu\r\n"
             "Connection: close\r\n"
             "\r\n",
             SERVER_UPLOAD_PATH, (unsigned long)task_id,
             SERVER_HOST, SERVER_PORT,
+            FIRMWARE_UPLOAD_TOKEN,
             MULTIPART_BOUNDARY,
             (unsigned long)body_length);
 

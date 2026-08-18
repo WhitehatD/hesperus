@@ -123,13 +123,19 @@ jobs:
 
       - name: Build Firmware
         working-directory: firmware
+        env:
+          MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+          FIRMWARE_UPLOAD_TOKEN: ${{ secrets.FIRMWARE_UPLOAD_TOKEN }}
         run: |
           # Pin the build epoch here so the binary and the upload share the exact
           # same timestamp — prevents version mismatch between embedded FW_VERSION
           # and the version string stored in firmware.json on the server.
           BUILD_EPOCH=$(date +%s)
           echo "BUILD_EPOCH=${BUILD_EPOCH}" >> $GITHUB_ENV
-          make -j8 BUILD_EPOCH=${BUILD_EPOCH}
+          make -j8 BUILD_EPOCH=${BUILD_EPOCH} \
+            MQTT_USERNAME="${MQTT_USERNAME}" MQTT_PASSWORD="${MQTT_PASSWORD}" \
+            FIRMWARE_UPLOAD_TOKEN="${FIRMWARE_UPLOAD_TOKEN}"
 
       - name: Upload Firmware to Server
         env:
@@ -262,10 +268,12 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: ANTHROPIC_API_KEY,FIRMWARE_UPLOAD_TOKEN,GEMINI_API_KEY,GHCR_TOKEN
+          envs: ANTHROPIC_API_KEY,FIRMWARE_UPLOAD_TOKEN,GEMINI_API_KEY,GHCR_TOKEN,MQTT_USERNAME,MQTT_PASSWORD
           script: echo "invoking Hesperus deploy (server enforces infra/deploy.sh via ForceCommand)"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FIRMWARE_UPLOAD_TOKEN: ${{ secrets.FIRMWARE_UPLOAD_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}

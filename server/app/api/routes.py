@@ -32,6 +32,25 @@ from app.benchmark.ids import next_task_id
 router = APIRouter()
 
 
+def verify_board_token(request: Request) -> None:
+    """
+    Shared auth check for board->server endpoints (image upload, erase-wifi).
+    Reuses settings.firmware_upload_token as a single shared secret between
+    the board firmware and this server — same value as X-Firmware-Token in
+    firmware_routes.py, just a separate header name (X-Upload-Token) that
+    predates this dependency and is kept for compatibility with the erase-wifi
+    endpoint's existing docstring/contract.
+
+    No-op (allows the request through) when the token is unconfigured, same
+    as every other token check in this codebase — that's a deliberate
+    dev-mode escape hatch, not a bug; production deployments MUST set
+    FIRMWARE_UPLOAD_TOKEN or every board-facing endpoint is unauthenticated.
+    """
+    token = request.headers.get("X-Upload-Token", "")
+    if settings.firmware_upload_token and token != settings.firmware_upload_token:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Upload-Token")
+
+
 @router.get("/time")
 async def get_server_time():
     """
@@ -99,8 +118,8 @@ async def ping_board():
         "command": "ping",
     }
 
-@router.post("/erase-wifi")
-async def erase_wifi(request: Request):
+@router.post("/erase-wifi", dependencies=[Depends(verify_board_token)])
+async def erase_wifi():
     """
     Send an immediate erase_wifi command to the STM32 board.
     Forces the board to erase flash credentials and reboot into the captive portal.
@@ -108,10 +127,6 @@ async def erase_wifi(request: Request):
     Requires X-Upload-Token header (same token used by firmware upload) when
     settings.firmware_upload_token is configured.
     """
-    token = request.headers.get("X-Upload-Token", "")
-    if settings.firmware_upload_token and token != settings.firmware_upload_token:
-        raise HTTPException(status_code=403, detail="Invalid or missing X-Upload-Token")
-
     command = {"type": "erase_wifi"}
     command_json = json.dumps(command)
     send_board_command(mqtt_client, settings.mqtt_topic_commands, command_json)
@@ -166,11 +181,15 @@ async def board_state():
     return get_board_snapshot()
 
 
-@router.post("/upload", response_model=UploadResponse)
+@router.post("/upload", response_model=UploadResponse, dependencies=[Depends(verify_board_token)])
 async def upload_image(task_id: int, file: UploadFile = File(...)):
     """
     Receive a captured image from the STM32 board.
     The board sends raw RGB565 pixel data — we convert to JPEG server-side.
+
+    Requires X-Upload-Token header when settings.firmware_upload_token is
+    configured (see verify_board_token) — previously unauthenticated, fixed
+    2026-08-18 ahead of the infra-core redeploy (shared host, real domain).
     """
     # Intercept board fallback task IDs (from unprompted/button captures) or 0
     if task_id == 0 or (10000 <= task_id <= 40000):

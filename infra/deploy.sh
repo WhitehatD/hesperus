@@ -32,6 +32,8 @@ printf '%s\n' \
   "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
   "FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN:-}" \
   "GEMINI_API_KEY=${GEMINI_API_KEY:-}" \
+  "MQTT_USERNAME=${MQTT_USERNAME:-}" \
+  "MQTT_PASSWORD=${MQTT_PASSWORD:-}" \
   > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
@@ -39,6 +41,20 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+# Regenerate mosquitto's password file from the current secrets. Idempotent
+# and harmless to run every deploy — docker compose only restarts a service
+# whose OWN compose-file config changed, not when a bind-mounted file's
+# CONTENTS change, so this does NOT restart mosquitto (see the "leave
+# mosquitto alone" note below — that guarantee still holds).
+if [ -n "${MQTT_USERNAME:-}" ] && [ -n "${MQTT_PASSWORD:-}" ]; then
+  docker run --rm -v "$DEPLOY_DIR/mosquitto:/mosquitto/config" eclipse-mosquitto:2 \
+    mosquitto_passwd -b -c /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD"
+  chmod 600 "$DEPLOY_DIR/mosquitto/passwd"
+else
+  echo "WARNING: MQTT_USERNAME/MQTT_PASSWORD not set — mosquitto.prod.conf" >&2
+  echo "  requires a passwd file to even start. Set both as GitHub Secrets." >&2
+fi
 
 # Authenticate with GHCR so docker compose pull can fetch private images.
 mkdir -p ~/.docker

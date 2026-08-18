@@ -133,8 +133,8 @@ mqtt_config = MQTTConfig(
     host=settings.mqtt_broker_host,
     port=settings.mqtt_broker_port,
     keepalive=60,
-    username=None,
-    password=None,
+    username=settings.mqtt_username or None,
+    password=settings.mqtt_password or None,
 )
 
 mqtt_client = FastMQTT(config=mqtt_config)

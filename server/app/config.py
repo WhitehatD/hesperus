@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # ── Firmware OTA ───────────────────────────────────
     firmware_upload_token: str = ""  # API key for CI firmware uploads (empty = no auth)
 
+    # ── MQTT Auth ───────────────────────────────────────
+    # Empty = anonymous (dev only — mosquitto.conf allows it). Production uses
+    # mosquitto.prod.conf (allow_anonymous false); these must be set to match
+    # the password_file generated at deploy time (see infra/deploy.sh).
+    mqtt_username: str = ""
+    mqtt_password: str = ""
+
     # ── WiFi Config Encryption ────────────────────────
     # Fernet key for encrypting WiFi passwords at rest.
     # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"

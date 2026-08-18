@@ -119,12 +119,14 @@ int Upload_Start(UploadCtx_t *ctx, uint32_t task_id,
     ctx->http_header_len = snprintf(ctx->http_header, sizeof(ctx->http_header),
         "POST %s?task_id=%lu HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Upload-Token: %s\r\n"
         "Content-Type: multipart/form-data; boundary=%s\r\n"
         "Content-Length: %lu\r\n"
         "Connection: close\r\n"
         "\r\n",
         SERVER_UPLOAD_PATH, (unsigned long)task_id,
         SERVER_HOST, SERVER_PORT,
+        FIRMWARE_UPLOAD_TOKEN,
         MULTIPART_BOUNDARY,
         (unsigned long)body_length);
 

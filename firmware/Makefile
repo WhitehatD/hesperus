@@ -96,10 +96,22 @@ GIT_HASH := $(shell git rev-parse --short HEAD)
 BUILD_EPOCH       ?= $(shell date +%s)
 FW_VER_STR        := 1.0.$(GIT_COMMIT_COUNT).$(BUILD_EPOCH)
 
+# MQTT broker credentials — overridable at build time ("make MQTT_USERNAME=...
+# MQTT_PASSWORD=..."), same mechanism as BUILD_EPOCH. Empty defaults match
+# firmware_config.h's own #ifndef fallback (anonymous/dev). NEVER hardcode a
+# real password here — CI passes it from GitHub Secrets, local dev builds
+# stay anonymous by default.
+MQTT_USERNAME        ?=
+MQTT_PASSWORD        ?=
+FIRMWARE_UPLOAD_TOKEN ?=
+
 C_DEFS = \
 -DSTM32U585xx \
 -DUSE_HAL_DRIVER \
--DFW_VERSION=\"$(FW_VER_STR)\"
+-DFW_VERSION=\"$(FW_VER_STR)\" \
+-DMQTT_USERNAME=\"$(MQTT_USERNAME)\" \
+-DMQTT_PASSWORD=\"$(MQTT_PASSWORD)\" \
+-DFIRMWARE_UPLOAD_TOKEN=\"$(FIRMWARE_UPLOAD_TOKEN)\"
 
 # Force rebuild when version changes (incremental builds miss -D flag changes)
 VERSION_FILE := $(BUILD_DIR)/.fw_version

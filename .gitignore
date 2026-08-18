@@ -17,6 +17,10 @@ firmware/workspace/
 firmware/ws/
 firmware/ws*/
 
+# mosquitto password file — generated at deploy time from GitHub Secrets
+# (MQTT_USERNAME/MQTT_PASSWORD via infra/deploy.sh), never committed.
+mosquitto/passwd
+
 # IAR / Keil (we only use STM32CubeIDE)
 firmware/EWARM/
 firmware/MDK-ARM/

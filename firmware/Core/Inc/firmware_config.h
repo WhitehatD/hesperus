@@ -43,6 +43,14 @@
 #define SERVER_TIME_PATH            "/api/time"
 #define HTTP_RESPONSE_TIMEOUT_MS   8000
 
+/* SEC-05: image-upload auth token, same pattern as SEC-01 (WiFi creds) —
+ * inject at build time, never commit a real value. Empty = unauthenticated
+ * (matches server's own escape hatch when FIRMWARE_UPLOAD_TOKEN is unset).
+ * Example: make FIRMWARE_UPLOAD_TOKEN='"secret-token"' */
+#ifndef FIRMWARE_UPLOAD_TOKEN
+#define FIRMWARE_UPLOAD_TOKEN       ""
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  MQTT Broker Configuration
  *

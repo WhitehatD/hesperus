@@ -24,6 +24,14 @@ services:
     ports: !override
       - "1883:1883"
       - "127.0.0.1:9001:9001"
+    volumes: !override
+      # mosquitto.prod.conf requires auth (allow_anonymous false); passwd is
+      # generated fresh from MQTT_USERNAME/MQTT_PASSWORD at deploy time by
+      # infra/deploy.sh — never committed to the repo.
+      - ./mosquitto/mosquitto.prod.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
 
   # ── Override server to use GHCR image ────────────────
   server:
@@ -37,6 +45,8 @@ services:
     environment:
       - MQTT_BROKER_HOST=mosquitto
       - MQTT_BROKER_PORT=1883
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
       - DATABASE_URL=sqlite+aiosqlite:///./data/thesis.db
       - VLLM_BASE_URL=http://host.docker.internal:8001/v1
       - FIRMWARE_DIR=/app/data/firmware

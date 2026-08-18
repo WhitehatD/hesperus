@@ -54,7 +54,7 @@ cat > "$SSHD_DROPIN" <<'EOF'
 # Hesperus restricted deploy user — added by infra/vps-provision.sh
 Match User hesperus-deploy
     ForceCommand /opt/hesperus/deploy.sh
-    AcceptEnv ANTHROPIC_API_KEY FIRMWARE_UPLOAD_TOKEN GEMINI_API_KEY GHCR_TOKEN
+    AcceptEnv ANTHROPIC_API_KEY FIRMWARE_UPLOAD_TOKEN GEMINI_API_KEY GHCR_TOKEN MQTT_USERNAME MQTT_PASSWORD
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding no
