@@ -56,13 +56,22 @@ echo "$DEPLOY_PUBKEY" > /home/hesperus-deploy/.ssh/authorized_keys
 chown hesperus-deploy:hesperus-deploy /home/hesperus-deploy/.ssh/authorized_keys
 chmod 600 /home/hesperus-deploy/.ssh/authorized_keys
 
-echo "== 3/6: sshd Match block — force deploy.sh, whitelist only the needed env vars =="
+echo "== 3/6: sshd Match block — force deploy.sh =="
 SSHD_DROPIN=/etc/ssh/sshd_config.d/hesperus-deploy.conf
 cat > "$SSHD_DROPIN" <<'EOF'
 # Hesperus restricted deploy user — added by infra/vps-provision.sh
+#
+# AcceptEnv is genuine OpenSSH protocol env-forwarding (SSH_MSG_CHANNEL_REQUEST
+# "env", negotiated before "exec" — it DOES survive ForceCommand per the SSH
+# protocol). It's listed here for defense-in-depth / future tooling, but is
+# currently INERT: appleboy/ssh-action (what ci.yml uses) does not send real
+# SendEnv requests for its `envs:` input — verified empirically 2026-08-18,
+# root-caused in infra/deploy.sh's header comment. Secrets flow via a
+# persistent file instead (infra/rotate-secrets.sh, run manually as root,
+# outside the CI hot path) — deploy.sh carries zero secrets over SSH.
 Match User hesperus-deploy
     ForceCommand /opt/hesperus/infra/deploy.sh
-    AcceptEnv ANTHROPIC_API_KEY FIRMWARE_UPLOAD_TOKEN GEMINI_API_KEY GHCR_TOKEN MQTT_USERNAME MQTT_PASSWORD
+    AcceptEnv ANTHROPIC_API_KEY FIRMWARE_UPLOAD_TOKEN GEMINI_API_KEY MQTT_USERNAME MQTT_PASSWORD
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding no

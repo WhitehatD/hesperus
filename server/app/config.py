@@ -1,5 +1,5 @@
 """
-Thesis IoT Server — Configuration
+Hesperus Server — Configuration
 Environment-based settings using pydantic-settings.
 """
 
@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # ── App ─────────────────────────────────────────────
-    app_name: str = "Thesis IoT Visual Monitoring"
+    app_name: str = "Hesperus — Autonomous IoT Visual Monitoring"
     debug: bool = True
 
     # ── MQTT ────────────────────────────────────────────
@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/thesis.db"
 
     # ── AI Backends ─────────────────────────────────────
+    # TODO(2026-08-18): migrating away from direct Anthropic/Gemini SDK calls
+    # to OpenRouter (one key, OpenAI-compatible API, provider-agnostic model
+    # routing) — decided during the infra-core redeploy. NOT done yet: this
+    # is a real code change (analysis/planning call sites), not just a config
+    # rename, and must not retroactively alter the frozen benchmark
+    # methodology already published in results/findings_v3.md (those numbers
+    # were measured against direct provider APIs — the historical record
+    # stays as-is; only the going-forward production system's wiring
+    # changes). anthropic_api_key/gemini_api_key below are kept for now so
+    # existing code keeps working; infra/rotate-secrets.sh no longer requires
+    # them to be set.
     anthropic_api_key: str = ""
     claude_sonnet_model: str = "claude-sonnet-4-6"
     claude_haiku_model: str = "claude-haiku-4-5-20251001"

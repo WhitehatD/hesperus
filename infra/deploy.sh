@@ -6,15 +6,34 @@
 #
 # Because it's a forced command, whatever "script" text the CI client sends is
 # IGNORED — this script always runs instead, regardless of what ci.yml's
-# `script:` field contains. Env vars still reach it via SSH's AcceptEnv
-# mechanism (see infra/vps-provision.sh's sshd Match block), independent of
-# the forced command.
+# `script:` field contains.
+#
+# SECRETS DO NOT FLOW THROUGH THIS PATH. Originally this script sourced
+# secrets from SSH env vars sent by ci.yml's `envs:`/`env:` (relying on
+# SSH's AcceptEnv/SendEnv). Empirically, appleboy/ssh-action's env passing
+# does not survive ForceCommand — verified 2026-08-18 on the actual first
+# deploy: MQTT_USERNAME/MQTT_PASSWORD arrived empty despite being set as
+# GitHub Secrets and listed in both `envs:` and the sshd AcceptEnv allowlist.
+# Root-caused to appleboy/ssh-action injecting envs into the CLIENT'S
+# requested command string (shell `export` prefix) rather than genuine SSH
+# protocol env-forwarding — and ForceCommand discards the client's entire
+# requested command, exports and all.
+#
+# Redesigned instead: /opt/hesperus/.env.prod is a PERSISTENT file, written
+# once by root (see infra/rotate-secrets.sh) whenever a secret actually
+# changes — not regenerated on every deploy. This is arguably better anyway:
+# the CI deploy key now carries zero secrets, so even a fully leaked
+# DEPLOY_SSH_KEY can't exfiltrate anything beyond "redeploy the current
+# images" — a strictly smaller blast radius than the original design.
+#
+# GHCR login was also removed: ghcr.io/whitehatd/hesperus-{server,dashboard}
+# are public packages, no auth needed to pull.
 #
 # Deliberately hard-scoped to /opt/hesperus — no `find` across the
 # filesystem, no clone-fallback, no touching anything outside this directory.
-# This is the guest-tenant-owns-its-own-infra-as-code design (see plan
-# discussion 2026-08-18): infra-core is a shared box, this script must never
-# be able to reach Forgejo/ntfy/Umami/oauth2-proxy/etc.
+# This is the guest-tenant-owns-its-own-infra-as-code design: infra-core is a
+# shared box, this script must never be able to reach
+# Forgejo/ntfy/Umami/oauth2-proxy/etc.
 
 set -euo pipefail
 
@@ -26,40 +45,24 @@ echo "== Hesperus deploy: $(date -u +%FT%TZ) =="
 git fetch origin main
 git reset --hard origin/main
 
-# Inject secrets into the persistent VPS env file (overwritten every deploy —
-# GitHub Secrets are the source of truth, never hand-edit .env.prod on the box).
 ENV_FILE="$DEPLOY_DIR/.env.prod"
-printf '%s\n' \
-  "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
-  "FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN:-}" \
-  "GEMINI_API_KEY=${GEMINI_API_KEY:-}" \
-  "MQTT_USERNAME=${MQTT_USERNAME:-}" \
-  "MQTT_PASSWORD=${MQTT_PASSWORD:-}" \
-  > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ERROR: $ENV_FILE does not exist. Run infra/rotate-secrets.sh as root" >&2
+  echo "  first (one-time secret provisioning, outside the CI hot path)." >&2
+  exit 1
+fi
+if [ ! -f "$DEPLOY_DIR/mosquitto/passwd" ]; then
+  echo "ERROR: $DEPLOY_DIR/mosquitto/passwd does not exist. Run" >&2
+  echo "  infra/rotate-secrets.sh as root first." >&2
+  exit 1
+fi
 
+# docker compose's ${VAR} substitution (docker-compose.prod.yml) reads from
+# this process's environment — source the persistent env file into it.
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-
-# Regenerate mosquitto's password file from the current secrets. Idempotent
-# and harmless to run every deploy — docker compose only restarts a service
-# whose OWN compose-file config changed, not when a bind-mounted file's
-# CONTENTS change, so this does NOT restart mosquitto (see the "leave
-# mosquitto alone" note below — that guarantee still holds).
-if [ -n "${MQTT_USERNAME:-}" ] && [ -n "${MQTT_PASSWORD:-}" ]; then
-  docker run --rm -v "$DEPLOY_DIR/mosquitto:/mosquitto/config" eclipse-mosquitto:2 \
-    mosquitto_passwd -b -c /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD"
-  chmod 600 "$DEPLOY_DIR/mosquitto/passwd"
-else
-  echo "WARNING: MQTT_USERNAME/MQTT_PASSWORD not set — mosquitto.prod.conf" >&2
-  echo "  requires a passwd file to even start. Set both as GitHub Secrets." >&2
-fi
-
-# Authenticate with GHCR so docker compose pull can fetch private images.
-mkdir -p ~/.docker
-echo "${GHCR_TOKEN:-}" | docker login ghcr.io -u github --password-stdin
 
 # Pull + recreate app services only — mosquitto is infrastructure and must
 # NOT be restarted on code-only deploys (it holds live MQTT session state;

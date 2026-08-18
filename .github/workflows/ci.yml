@@ -273,24 +273,24 @@ jobs:
     steps:
       - name: Execute Remote SSH Deployment
         # DEPLOY_USER's SSH key is a FORCED COMMAND (see infra/vps-provision.sh
-        # sshd Match block: ForceCommand /opt/hesperus/deploy.sh). Whatever this
-        # step sends as `script` is ignored server-side — the box always runs
-        # infra/deploy.sh instead, hard-scoped to /opt/hesperus. This is
-        # deliberate: infra-core is a shared host (Forgejo/ntfy/Umami/etc. also
-        # live there), so the deploy key must not be able to run arbitrary
-        # commands even if the secret ever leaked. Env vars still reach the
-        # forced command via SSH's AcceptEnv/SendEnv (independent of ForceCommand).
+        # sshd Match block: ForceCommand /opt/hesperus/infra/deploy.sh).
+        # Whatever this step sends as `script` is ignored server-side — the
+        # box always runs infra/deploy.sh instead, hard-scoped to
+        # /opt/hesperus. Deliberate: infra-core is a shared host
+        # (Forgejo/ntfy/Umami/etc. also live there), so the deploy key must
+        # not be able to run arbitrary commands even if the secret leaked.
+        #
+        # No secrets are passed here (no `envs:`, no `env:`). Empirically,
+        # appleboy/ssh-action's env-passing does not survive ForceCommand —
+        # verified 2026-08-18, root-caused in infra/deploy.sh's header. This
+        # key genuinely cannot exfiltrate any secret even if it leaks: the
+        # persistent .env.prod / mosquitto/passwd files it reads are written
+        # by infra/rotate-secrets.sh, run manually as root, never over this
+        # path. GHCR login is also unnecessary — the published images are
+        # public packages.
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: ANTHROPIC_API_KEY,FIRMWARE_UPLOAD_TOKEN,GEMINI_API_KEY,GHCR_TOKEN,MQTT_USERNAME,MQTT_PASSWORD
           script: echo "invoking Hesperus deploy (server enforces infra/deploy.sh via ForceCommand)"
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          FIRMWARE_UPLOAD_TOKEN: ${{ secrets.FIRMWARE_UPLOAD_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
-          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
