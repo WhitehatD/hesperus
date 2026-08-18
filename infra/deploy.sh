@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Hesperus deploy script — runs ON infra-core (46.62.200.8) as the restricted
-# `hesperus-deploy` system user, invoked via an SSH forced command
-# (authorized_keys: command="/opt/hesperus/deploy.sh" ssh-ed25519 AAAA...).
+# `hesperus-deploy` system user, invoked via an SSH forced command (sshd_config
+# Match block: ForceCommand /opt/hesperus/infra/deploy.sh — see
+# vps-provision.sh; not an authorized_keys command= prefix).
 #
 # Because it's a forced command, whatever "script" text the CI client sends is
 # IGNORED — this script always runs instead, regardless of what ci.yml's
