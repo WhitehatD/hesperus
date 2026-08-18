@@ -61,7 +61,13 @@ Match User hesperus-deploy
     AllowAgentForwarding no
 EOF
 sshd -t   # fail loudly before reloading if the config is broken
-systemctl reload sshd
+# Unit name differs by distro: ssh.service on Debian/Ubuntu, sshd.service on
+# RHEL/Fedora. infra-core is Ubuntu, but resolve it rather than assume.
+if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
+  systemctl reload ssh
+else
+  systemctl reload sshd
+fi
 
 echo "== 4/6: ufw — board ingress ports only =="
 ufw allow 8000/tcp comment 'hesperus-iot board ingress (HTTP upload)'
