@@ -121,6 +121,12 @@ jobs:
     # presumably already up from a prior deploy (steady state), so the
     # upload is still safe to attempt.
     needs: [changes, deploy-vps]
+    # 2026-08-19: without this, a hung `apt-get update` (mirror flake — seen
+    # live, no error, just sat in "Install ARM GCC Toolchain" indefinitely)
+    # occupies the runner for GitHub's default 6-hour job ceiling, silently
+    # blocking every firmware deploy behind it. 15 min is generous for
+    # checkout + apt + a `make -j8` of this codebase.
+    timeout-minutes: 15
     if: |
       always() &&
       github.ref == 'refs/heads/main' &&
@@ -134,6 +140,10 @@ jobs:
           fetch-depth: 0
 
       - name: Install ARM GCC Toolchain
+        # Bound each apt step individually too, so a mirror stall fails fast
+        # with a clear step name instead of silently eating the whole job
+        # budget on "Install ARM GCC Toolchain" with no error to point at.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi make
