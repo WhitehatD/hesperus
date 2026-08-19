@@ -32,8 +32,8 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 
 | Layer | Technology | Lines of Code | What It Does |
 |-------|-----------|---------------|--------------|
-| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
-| **Backend** | FastAPI, SQLAlchemy async, Python | ~5,000 | AI planning engine, multimodal LLM orchestration, MQTT broker bridge, image pipeline (RGB565 to JPEG), SSE streaming |
+| **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, on-board JPEG encoder, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, resumable chunked upload, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
+| **Backend** | FastAPI, SQLAlchemy async, Python | ~5,700 | AI planning engine, multimodal LLM orchestration (OpenRouter primary, Claude/Gemini for benchmarking), MQTT broker bridge, resumable chunked-upload endpoints, SSE streaming |
 | **Frontend** | Next.js 16, React 19, TypeScript | ~3,000 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
@@ -76,15 +76,15 @@ flowchart LR
         MQTT_RX["MQTT\nReceive"]
         RTC["RTC Alarm\nWake from STOP2"]
         CAM["OV5640\nCapture RGB565"]
-        Upload["HTTP POST\n614KB in 16KB chunks"]
-        MQTT_RX --> RTC --> CAM --> Upload
+        JPEG["On-board JPEG encode\n614KB → ~10-45KB"]
+        Upload["Resumable HTTP upload\n32KB chunks, deadline + retry"]
+        MQTT_RX --> RTC --> CAM --> JPEG --> Upload
     end
 
     subgraph Analysis ["Cloud — Vision Analysis"]
-        Convert["RGB565 → JPEG"]
-        LLM["Multimodal LLM\nClaude · Gemini 3 · Qwen3-VL"]
+        LLM["Multimodal LLM\nOpenRouter (Qwen3-VL) · Claude · Gemini 3"]
         Result["Findings +\nRecommendation"]
-        Convert --> LLM --> Result
+        LLM --> Result
     end
 
     subgraph Output
@@ -93,12 +93,12 @@ flowchart LR
 
     User --> Planner
     Schedule -- "MQTT command" --> MQTT_RX
-    Upload --> Convert
+    Upload --> LLM
     Result --> Dashboard
 ```
 
-Six analysis backends are compared for thesis evaluation (the Claude entries include a no-thinking control arm):
-- **Claude Sonnet 4.6 / Sonnet 4.6 (no-think) / Haiku 4.5** via Anthropic API — primary backend (planning + analysis + agent)
+Production runs on **OpenRouter** — `qwen/qwen3.7-flash` for planning/tool-calling and `qwen/qwen3-vl-30b-a3b-instruct` for image analysis, chosen for the cost/latency profile of a live agent chat. Additional backends are wired in for thesis benchmarking (the Claude entries include a no-thinking control arm):
+- **Claude Sonnet 4.6 / Sonnet 4.6 (no-think) / Haiku 4.5** via Anthropic API — benchmark comparison
 - **Qwen3-VL-30B-A3B** via llama.cpp — open-weight, self-hosted on an RTX 6000 Ada
 - **Qwen2.5-VL-3B** via llama.cpp — lightweight edge candidate
 - **Gemini 3 Flash** via API — commercial baseline
@@ -173,7 +173,7 @@ When no API key is configured, a **rule-based fallback dispatcher** maps keyword
 
 | Tool | Trigger Examples | What It Does |
 |------|-----------------|--------------|
-| `capture_now` | *"take a picture"*, *"what do you see"* | Sends `capture_now` MQTT command → board captures + uploads → server converts RGB565 → JPEG → multimodal LLM analyzes → findings streamed back with inline image thumbnail |
+| `capture_now` | *"take a picture"*, *"what do you see"* | Sends `capture_now` MQTT command → board captures, JPEG-encodes on-device, and uploads over a resumable chunked transfer → multimodal LLM analyzes → findings streamed back with inline image thumbnail |
 | `capture_sequence` | *"monitor for 30 seconds"*, *"burst of 5 shots"* | Creates a schedule in DB, sends `capture_sequence` with ms-precision delays to board, tracks per-image completion in real time |
 | `create_schedule` | *"monitor every 10 min for 2 hours"* | AI planner generates HH:MM task list → saved to DB → activated → MQTT command to board sets RTC alarms |
 | `activate_schedule` | *"activate schedule 3"*, *"resume monitoring"* | Activates an existing inactive schedule (deactivating all others first) without re-generating it |
@@ -230,8 +230,8 @@ User message → LLM picks create_schedule → AI planner generates tasks
   → MQTT: schedule command sent to board
   → Dashboard: schedules/updated (real-time UI update)
 
-Board wakes via RTC alarm → captures image → HTTP upload to server
-  → Server: RGB565→JPEG, marks task.completed_at, triggers AI analysis
+Board wakes via RTC alarm → captures image → JPEG-encodes on-device → resumable chunked upload to server
+  → Server: reassembles + validates (CRC32), marks task.completed_at, triggers AI analysis
   → MQTT: images/new + schedules/updated (task progress bar advances)
   → MQTT: analysis/new (AI findings overlay appears on image)
 
@@ -265,9 +265,9 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### Backend (FastAPI + AI)
 
 - **AI planning engine** — translates natural language monitoring requests into executable HH:MM task schedules with objectives. The planner is model-agnostic (Claude, Gemini, Qwen).
-- **Agentic chat with 14 tools** — the dashboard chat is backed by Claude with tool_use. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language.
+- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.7-flash`) with OpenAI-style tool calling, with an automatic Claude/vLLM fallback path if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
 - **Full capture pipeline with SSE streaming** — when the agent triggers a capture, the server streams real-time progress events (command sent, image received, per-image analysis, inline thumbnail URL) back to the dashboard. Heartbeat events every 5 s keep the SSE connection alive. For sequences, each image completion is a separate step.
-- **RGB565 to JPEG conversion** — the OV5640 outputs standard RGB565 (a byte-swap setting packs the bytes low-byte-first). The server extracts R[15:11] G[10:5] B[4:0], scales to 8-bit (guarding against uint8 overflow), and saves as JPEG.
+- **Resumable chunked image upload** — `/api/upload/chunk`, `/api/upload/resume`, `/api/upload/complete` let the board send an image as independent byte-ranged chunks over a degraded link, resuming from the server's confirmed offset instead of restarting after a stall, with a CRC32 check on reassembly. The board additionally JPEG-encodes on-device before sending, so a raw-RGB565 fallback (RGB565 → JPEG server-side, same R[15:11] G[10:5] B[4:0] unpacking) only runs if the on-board encoder can't fit a frame in its output buffer.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.
 - **Real-time schedule notifications** — every schedule state change (activate, deactivate, delete, task completion) publishes the full schedule list to `dashboard/schedules/updated` via MQTT, so the frontend updates instantly without polling.
 - **Dormancy-safe command delivery** — all board commands route through a single `send_board_command()` chokepoint. When the board reports `deep_dormant`, commands are queued in order and replayed automatically on the next wake, so commands issued during deep sleep are never lost (the board's MQTT is QoS 0, so the broker won't buffer them).
@@ -282,7 +282,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (74 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload.
+- **Full pipeline**: pytest (90 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
 - **CI-driven deploy** — on each push the CI job force-recreates the server and dashboard containers on the VPS over SSH; a `nickfedor/watchtower` service additionally polls GHCR every 5 minutes as a fallback.
 
 ---
