@@ -298,11 +298,22 @@ static void _put_bits(jpeg_writer_t *w, uint16_t code, uint8_t size)
     }
 }
 
-/** Pad the final partial byte with 1-bits (T.81 F.1.2.3). */
+/** Pad the final partial byte with 1-bits (T.81 F.1.2.3).
+ *
+ * Pad ONCE, by exactly the number of bits missing. The obvious
+ * `while (bitcnt > 0) _put_bits(w, 0x7F, 7);` is wrong: each call adds 7
+ * bits while the drain removes 8, so bitcnt falls by only 1 per iteration
+ * and the loop runs bitcnt times. Iterations after the first emit whole
+ * 0xFF bytes, each of which then trips the 0xFF byte-stuffing below and
+ * appends a 0x00 — up to 13 junk bytes between the last MCU and EOI
+ * (harmless to libjpeg/PIL, but wrong and wasteful).
+ *
+ * The low (8 - bitcnt) bits of 0x7F are all 1s, which is exactly the
+ * required pad, and it lands the buffer on a byte boundary in one step. */
 static void _flush_bits(jpeg_writer_t *w)
 {
-    while (w->bitcnt > 0)
-        _put_bits(w, 0x7F, 7);
+    if (w->bitcnt > 0)
+        _put_bits(w, 0x7F, (uint8_t)(8 - w->bitcnt));
     w->bitbuf = 0;
     w->bitcnt = 0;
 }

@@ -1302,7 +1302,19 @@ int main(void)
             }
 
             /* Within 30 seconds of the target time (handles late schedule arrival) */
-            if (diff <= 30 || diff >= 86370)
+            if ((diff <= 30 || diff >= 86370) && s_pending_upload_size != 0)
+            {
+                /* An earlier task's upload is still retrying and still owns
+                 * s_image_buffer — don't let a due schedule slot capture
+                 * over it. Only reachable if a retry cycle (up to 6
+                 * attempts) outlasts the interval to the next scheduled
+                 * task; skip this slot rather than corrupt the frame
+                 * already in flight. Left due so it's picked up again once
+                 * the retry resolves. */
+                LOG_WARN(TAG_SCHED, "Task %u deferred — task %lu still retrying its upload",
+                         next->task_id, (unsigned long)s_pending_upload_task_id);
+            }
+            else if (diff <= 30 || diff >= 86370)
             {
                 /* ── Time reached — execute this task ── */
                 LOG_INFO(TAG_SCHED, "Executing task %u: %02u:%02u:%02u '%s'",
@@ -1844,6 +1856,18 @@ static void _do_button_capture(void)
         return;
     }
 
+    if (s_pending_upload_size != 0)
+    {
+        /* A previous capture's upload is still queued for retry in
+         * s_image_buffer (post-JPEG the encoded length is content-
+         * dependent, so overwriting the frame mid-retry would desync the
+         * server's resume offset from what we'd actually re-send — see
+         * commit 8dd774b's verification notes). Refuse rather than race. */
+        LOG_WARN(TAG_BOOT, "Button capture deferred — upload for task %lu still retrying",
+                 (unsigned long)s_pending_upload_task_id);
+        return;
+    }
+
     char status_msg[256];
     snprintf(status_msg, sizeof(status_msg), "{\"status\":\"job_received\",\"task_id\":%lu}", (unsigned long)s_button_task_id);
     MQTT_PublishStatus(status_msg);
@@ -1972,6 +1996,16 @@ static void _do_capture_now(void)
     {
         LOG_WARN(TAG_BOOT, "Capture now aborted — OTA in progress");
         MQTT_PublishStatus("{\"status\":\"error\",\"reason\":\"ota_in_progress\"}");
+        return;
+    }
+
+    if (s_pending_upload_size != 0)
+    {
+        /* See the matching guard in _do_button_capture — s_image_buffer
+         * still holds a frame queued for retry; don't overwrite it. */
+        LOG_WARN(TAG_BOOT, "Capture now deferred — upload for task %lu still retrying",
+                 (unsigned long)s_pending_upload_task_id);
+        MQTT_PublishStatus("{\"status\":\"error\",\"reason\":\"upload_retry_in_progress\"}");
         return;
     }
 
@@ -2109,6 +2143,17 @@ static void _do_capture_sequence(void)
     {
         LOG_WARN(TAG_BOOT, "Capture sequence aborted — OTA in progress");
         MQTT_PublishStatus("{\"status\":\"error\",\"reason\":\"ota_in_progress\"}");
+        return;
+    }
+
+    if (s_pending_upload_size != 0)
+    {
+        /* See the matching guard in _do_button_capture — a sequence
+         * captures repeatedly into s_image_buffer, which would corrupt a
+         * frame still queued for retry. */
+        LOG_WARN(TAG_BOOT, "Capture sequence deferred — upload for task %lu still retrying",
+                 (unsigned long)s_pending_upload_task_id);
+        MQTT_PublishStatus("{\"status\":\"error\",\"reason\":\"upload_retry_in_progress\"}");
         return;
     }
 
