@@ -63,6 +63,13 @@ static char s_http_header[HTTP_HEADER_MAX];
  * only controls blast radius on failure, not wire behavior. A fresh
  * connection per chunk means a chunk that hit the module's internal
  * timeout-then-recover state isn't reused in a state we can't verify. */
+/* How long ONE socket may make zero progress before we abandon it and
+ * reconnect. Sized against the observed happy path, not worst-case fear:
+ * normal chunk round-trips complete well under a second, so 5s is far above
+ * ordinary cellular RTT chatter while being ~3x tighter than the old 14000.
+ * See the long note at the check itself for why waiting longer buys nothing. */
+#define SOCKET_STALL_MS              5000u
+
 #define UPLOAD_CHUNK_WIRE_SIZE       32768u
 #define UPLOAD_CHUNK_MAX_RETRIES     8
 #define UPLOAD_CHUNK_RETRY_BASE_MS   500
@@ -413,6 +420,34 @@ WiFiStatus_t WiFi_TestConnection(const char *ssid, const char *password, WiFiTes
  * @retval 0 on success, -1 on error or a stalled connection (caller should
  *         open a fresh socket and retry).
  */
+
+/**
+ * @brief  Wait, WITHOUT blocking the board from other work, by servicing
+ *         MQTT (so incoming commands — capture_now, erase_wifi, schedule
+ *         updates — are never stuck behind an upload retry) instead of a
+ *         bare HAL_Delay.
+ *
+ * 2026-08-19: the retry backoffs used to be a flat HAL_Delay(ms), during
+ * which the board could not act on anything arriving over MQTT — a command
+ * sent while an upload was mid-retry was simply not processed until the
+ * whole upload attempt finished or hit its deadline. MQTT_ProcessLoop()'s
+ * own recv is bounded to MQTT_RECV_TIMEOUT_MS=100ms (firmware_config.h),
+ * so slicing the wait into ~100ms calls costs nothing extra in the common
+ * case (no data waiting) while making commands land within ~100ms even
+ * during a retry backoff, instead of after it.
+ */
+static void _wait_servicing_mqtt(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
+    do
+    {
+        MQTT_ProcessLoop();
+#if WATCHDOG_ENABLED
+        IWDG->KR = 0x0000AAAAu;
+#endif
+    } while ((HAL_GetTick() - start) < ms);
+}
+
 static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
 {
     int32_t offset = 0;
@@ -430,8 +465,25 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
         /* Bail out of THIS socket (not the whole upload) if it's been
          * stuck too long — well under the 16s IWDG ceiling, and the
          * caller's per-chunk retry opens a fresh connection on -1 rather
-         * than looping here forever. */
-        if ((HAL_GetTick() - start_tick) > 14000)
+         * than looping here forever.
+         *
+         * 2026-08-19: was 14000ms, sized when payloads were 614KB and
+         * losing 14s to detect a stall was cheap against a multi-minute
+         * transfer. Now that JPEG encoding means almost every capture is
+         * ONE small chunk, that 14s dead-wait is often the entire cost of
+         * the upload — live example: a 7332-byte JPEG stalled 32 bytes
+         * from done, we correctly waited out the full 14s before
+         * reconnecting, and the remaining bytes then went through in
+         * under a second. The reconnect-and-resend recovery is identical
+         * regardless of how long we wait first, and it has proven
+         * reliable (that capture succeeded on the very next attempt) — so
+         * waiting longer buys nothing, it only taxes the common case.
+         * SOCKET_STALL_MS is intentionally still comfortably above the
+         * ~2-3s chatter we've observed on ordinary hiccups; the earlier
+         * ~10.1s tcpdump measurement was MX_WIFI_CMD_TIMEOUT firing on the
+         * OLD flags bug (see the historical note on that constant), not a
+         * recovery time this threshold needs to outlast. */
+        if ((HAL_GetTick() - start_tick) > SOCKET_STALL_MS)
         {
             /* Diagnostics, not decoration: which failure mode actually
              * wedged us? zero_sends = module reported "buffer full"
@@ -441,9 +493,9 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
              * API entirely (mx_wifi_spi.c:wait_flow_high). These three
              * numbers distinguish "slow uplink" from "module TX path
              * hung" — we were guessing between them for hours. */
-            LOG_WARN(TAG_HTTP, "Send stalled >14s at offset %ld/%ld "
+            LOG_WARN(TAG_HTTP, "Send stalled >%lums at offset %ld/%ld "
                      "[zero_sends=%lu neg_sends=%lu flow=%s] — fresh-connection retry",
-                     (long)offset, (long)len,
+                     (unsigned long)SOCKET_STALL_MS, (long)offset, (long)len,
                      (unsigned long)zero_sends, (unsigned long)neg_sends,
                      (HAL_GPIO_ReadPin(MX_WIFI_SPI_FLOW_PORT, MX_WIFI_SPI_FLOW_PIN)
                         == GPIO_PIN_RESET) ? "LOW(blocked)" : "HIGH(ready)");
@@ -936,7 +988,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         LOG_WARN(TAG_HTTP, "Chunk retry %lu/%d after %lums (offset %lu/%lu)...",
                  (unsigned long)consecutive_failures, UPLOAD_CHUNK_MAX_RETRIES,
                  (unsigned long)backoff_ms, (unsigned long)offset, (unsigned long)data_len);
-        HAL_Delay(backoff_ms);
+        _wait_servicing_mqtt(backoff_ms);
         backoff_ms = (backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS) ? UPLOAD_CHUNK_RETRY_MAX_MS : backoff_ms * 2;
         MQTT_SendPing();
     }
@@ -1057,7 +1109,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             _powersave_restore(ps_prev);
             return WIFI_ERROR_SEND;
         }
-        HAL_Delay(complete_backoff_ms);
+        _wait_servicing_mqtt(complete_backoff_ms);
         complete_backoff_ms = (complete_backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS)
                               ? UPLOAD_CHUNK_RETRY_MAX_MS : complete_backoff_ms * 2;
     }

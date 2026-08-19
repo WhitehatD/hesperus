@@ -33,3 +33,18 @@ topic read $SYS/#
 
 user hesperus-dashboard
 topic read device/stm32/#
+# 2026-08-19: the dashboard actually subscribes to FOUR "dashboard/*"
+# topics (dashboard/app/board/[id]/page.tsx useMQTT() call), not
+# device/stm32/# — that only covered raw board telemetry/logs. The gallery
+# never updated live because the server's "new image" publish
+# (routes.py: mqtt_topic_dashboard_images = "dashboard/images/new") was
+# being subscribed to by the browser but silently DENIED by this ACL — no
+# error surfaces client-side, mosquitto just drops the SUBSCRIBE, so it
+# looked like a frontend bug for hours before anyone thought to check here.
+# Board logs worked the whole time because device/stm32/# already covered
+# those, which is exactly what made this look like an isolated gallery bug
+# rather than an ACL gap affecting every dashboard/* feed.
+topic read dashboard/images/new
+topic read dashboard/analysis/new
+topic read dashboard/logs
+topic read dashboard/schedules/updated
