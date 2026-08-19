@@ -84,6 +84,24 @@ WiFiStatus_t WiFi_HttpGetTime(uint8_t *hour, uint8_t *minute, uint8_t *second,
 void WiFi_DeInit(void);
 
 /**
+ * @brief  Set the 802.11 station power-save state the ACTIVE power mode
+ *         wants (0 = off, 1 = on).
+ *
+ * Normal operation runs with this OFF: in power-save the station only
+ * transmits around DTIM beacon windows, which throttles sustained uploads
+ * to a trickle (measured ~1.3 KB/s on a phone hotspot where a laptop got
+ * ~1 MB/s) and pins the SPI FLOW line low because the module cannot drain
+ * its TX buffer. Small traffic (MQTT keepalives, HTTP headers) hides the
+ * problem by fitting inside a single window.
+ *
+ * The low-power modes (PS-REST/dormant) call this to turn power-save ON
+ * deliberately for energy savings. Image uploads temporarily force it off
+ * and then restore whatever was requested here, so the energy behaviour is
+ * preserved without crippling bulk transfers.
+ */
+void WiFi_SetPowerSave(uint8_t enable);
+
+/**
  * @brief  Open a TCP socket and connect to a host. (ARCH-02)
  * @param  host: Hostname or IP string.
  * @param  port: Target TCP port.

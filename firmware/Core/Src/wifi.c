@@ -39,6 +39,13 @@
 static volatile uint8_t s_connected    = 0;
 static volatile uint8_t s_initialized  = 0;
 
+/* What the ACTIVE power mode wants 802.11 power-save to be (0=off, 1=on).
+ * Uploads force it off for the duration of a transfer and then restore
+ * this, so PS-REST/dormant keep their energy behaviour while bulk TX
+ * still gets full throughput. Owned here so main.c's low-power code and
+ * the upload path can't disagree about the real module state. */
+static volatile uint8_t s_powersave_desired = 0;
+
 /* Reusable TX buffer for HTTP requests (header + body boundaries) */
 #define HTTP_HEADER_MAX  512
 static char s_http_header[HTTP_HEADER_MAX];
@@ -157,6 +164,27 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
         {
             s_connected = 1;
             LOG_INFO(TAG_WIFI, "Connected to '%s' (attempt %d)", ssid, attempt);
+
+            /* Establish a KNOWN power-save state for normal operation.
+             *
+             * 2026-08-19: bulk upload crawled at ~1.3 KB/s over a phone
+             * hotspot (18KB in 14s) while a laptop on the same AP did
+             * ~1 MB/s, with the SPI FLOW line pinned LOW — i.e. the module
+             * could not drain what we handed it. In 802.11 power-save the
+             * station only transmits around DTIM beacon windows, which
+             * throttles sustained TX to a trickle while leaving small
+             * sends (MQTT keepalives, HTTP headers) apparently fine.
+             * Nothing in this firmware ever disabled it outside the
+             * PS-REST feature, so whatever the module's boot default is,
+             * we inherited it for every upload.
+             *
+             * NOTE this deliberately does NOT fight the low-power modes:
+             * PS-REST still enables power-save via WiFi_SetPowerSave()
+             * when it wants to, and uploads force it off only for the
+             * duration of the transfer, restoring the mode's wish after
+             * (see WiFi_HttpPostImage). This call just makes "normal"
+             * mode mean what it says. */
+            WiFi_SetPowerSave(0);
 
             /* Wait for DHCP to assign an IP address.
              * iPhone hotspots can be very slow (10-30s) to respond to
@@ -470,6 +498,47 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
     return 0;
 }
 
+void WiFi_SetPowerSave(uint8_t enable)
+{
+    if (!s_initialized)
+        return;
+
+    s_powersave_desired = enable ? 1u : 0u;
+    MX_WIFI_station_powersave(wifi_obj_get(), (int32_t)s_powersave_desired);
+    LOG_DEBUG(TAG_WIFI, "802.11 power-save -> %s", s_powersave_desired ? "ON" : "OFF");
+}
+
+/**
+ * @brief  Force power-save off for a bulk transfer, returning the previous
+ *         desired state so the caller can restore it afterwards.
+ *
+ * In 802.11 power-save the station only transmits around DTIM windows,
+ * which collapses sustained upload throughput (measured ~1.3 KB/s vs
+ * ~1 MB/s for a laptop on the same AP) and leaves the SPI FLOW line low
+ * because the module cannot drain its TX buffer. Transfers must run with
+ * it off; the low-power modes get their setting back the moment we're done.
+ */
+static uint8_t _powersave_suspend_for_transfer(void)
+{
+    uint8_t previous = s_powersave_desired;
+    if (previous)
+    {
+        MX_WIFI_station_powersave(wifi_obj_get(), 0);
+        LOG_INFO(TAG_WIFI, "power-save suspended for transfer (will restore)");
+    }
+    return previous;
+}
+
+static void _powersave_restore(uint8_t previous)
+{
+    if (previous)
+    {
+        MX_WIFI_station_powersave(wifi_obj_get(), 1);
+        LOG_DEBUG(TAG_WIFI, "power-save restored");
+    }
+    s_powersave_desired = previous;
+}
+
 /**
  * @brief  Parse the HTTP status code from a raw response buffer's status
  *         line ("HTTP/1.1 200 OK..." → 200). Shared by every response
@@ -569,6 +638,10 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
 
     LOG_INFO(TAG_HTTP, "Chunked upload starting: %lu bytes, task %lu",
              (unsigned long)data_len, (unsigned long)task_id);
+
+    /* Bulk TX cannot share the link with 802.11 power-save — see
+     * _powersave_suspend_for_transfer(). Restored on EVERY exit path below. */
+    uint8_t ps_prev = _powersave_suspend_for_transfer();
 
     uint32_t resolved_task_id = task_id;
     uint32_t offset = 0;
@@ -723,6 +796,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                       (unsigned long)consecutive_failures, (unsigned long)offset,
                       (unsigned long)data_len);
             BSP_LED_Off(LED_GREEN);
+            _powersave_restore(ps_prev);
             return WIFI_ERROR_SEND;
         }
 
@@ -813,6 +887,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                      (unsigned long)data_len, (unsigned long)upload_ms,
                      (unsigned long)kbps, (unsigned long)resolved_task_id);
             BSP_LED_Off(LED_GREEN);
+            _powersave_restore(ps_prev);
             return WIFI_OK;
         }
 
@@ -827,6 +902,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             LOG_ERROR(TAG_HTTP, "Upload /complete failed %lu times — bytes are on the server "
                       "but finalization was never confirmed", (unsigned long)complete_failures);
             BSP_LED_Off(LED_GREEN);
+            _powersave_restore(ps_prev);
             return WIFI_ERROR_SEND;
         }
         HAL_Delay(complete_backoff_ms);

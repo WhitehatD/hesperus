@@ -2422,7 +2422,7 @@ static void EnterPSRest(void)
 
 #if WIFI_POWERSAVE_ENABLED
     /* 802.11 power-save: WiFi stays ASSOCIATED, EMW3080 DTIM-sleeps. */
-    MX_WIFI_station_powersave(wifi_obj_get(), 1);
+    WiFi_SetPowerSave(1);
 #endif
 
     /* Arm RTC Alarm A REST_POLL_S from now (keepalive/poll). STOP2 also wakes
@@ -2432,7 +2432,7 @@ static void EnterPSRest(void)
     {
         LOG_ERROR(TAG_PWR, "PS-REST: SetShortAlarm failed — active wait");
 #if WIFI_POWERSAVE_ENABLED
-        MX_WIFI_station_powersave(wifi_obj_get(), 0);
+        WiFi_SetPowerSave(0);
 #endif
         HAL_Delay(SCHEDULER_MQTT_POLL_MS);
         return;
@@ -2454,7 +2454,7 @@ static void EnterPSRest(void)
 
 #if WIFI_POWERSAVE_ENABLED
     /* Back to full power so MQTT_ProcessLoop services pending RX promptly */
-    MX_WIFI_station_powersave(wifi_obj_get(), 0);
+    WiFi_SetPowerSave(0);
 #endif
 
     /* B3 override: physical press during STOP2 exits PS-REST mode */
