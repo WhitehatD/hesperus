@@ -76,6 +76,87 @@ static void Boot_ReportResetReason(void)
 /* Image capture buffer — 32-byte aligned for DCMI DMA */
 static uint8_t s_image_buffer[CAMERA_FRAME_BUFFER_SIZE] __attribute__((aligned(32)));
 
+/* ── Pending upload retry ────────────────────────────────────────────────
+ * 2026-08-19: WiFi_HttpPostImage now abandons at a hard deadline instead of
+ * grinding forever, so the main loop always gets its turn back (OTA poll,
+ * MQTT commands, heartbeat). That only works if an abandoned upload is
+ * actually retried — otherwise we'd trade a hang for a lost image, since
+ * the failure path used to secure_erase() the frame immediately.
+ *
+ * The frame stays in s_image_buffer between attempts and the server keeps
+ * the partial upload (WiFi_HttpPostImage queries /api/upload/resume on
+ * entry), so each retry continues from the confirmed byte offset rather
+ * than restarting. Erase happens on success or once retries are spent. */
+static uint32_t s_pending_upload_task_id  = 0;
+static uint32_t s_pending_upload_size     = 0;
+static uint8_t  s_pending_upload_attempts = 0;
+static uint32_t s_pending_upload_next_tick = 0;
+
+#define PENDING_UPLOAD_MAX_ATTEMPTS   6
+#define PENDING_UPLOAD_RETRY_DELAY_MS 5000
+
+static void _register_pending_upload(uint32_t task_id, uint32_t size)
+{
+    s_pending_upload_task_id   = task_id;
+    s_pending_upload_size      = size;
+    s_pending_upload_attempts  = 0;
+    s_pending_upload_next_tick = HAL_GetTick() + PENDING_UPLOAD_RETRY_DELAY_MS;
+    LOG_WARN(TAG_HTTP, "Upload incomplete for task %lu — queued for retry "
+             "(resumes from server offset)", (unsigned long)task_id);
+}
+
+static void _clear_pending_upload(void)
+{
+    if (s_pending_upload_size > 0)
+        secure_erase(s_image_buffer, s_pending_upload_size);
+    s_pending_upload_task_id  = 0;
+    s_pending_upload_size     = 0;
+    s_pending_upload_attempts = 0;
+}
+
+/* Serviced from the main loop, so retries interleave with MQTT/OTA/heartbeat
+ * instead of monopolising the CPU the way the old unbounded upload did. */
+static void _service_pending_upload(void)
+{
+    if (s_pending_upload_size == 0)
+        return;
+    if ((int32_t)(HAL_GetTick() - s_pending_upload_next_tick) < 0)
+        return;
+
+    s_pending_upload_attempts++;
+    LOG_INFO(TAG_HTTP, "Retrying upload task %lu (attempt %u/%d)",
+             (unsigned long)s_pending_upload_task_id,
+             s_pending_upload_attempts, PENDING_UPLOAD_MAX_ATTEMPTS);
+
+    WiFiStatus_t ret = WiFi_HttpPostImage(SERVER_UPLOAD_URL,
+                                          s_pending_upload_task_id,
+                                          s_image_buffer,
+                                          s_pending_upload_size);
+
+    char msg[128];
+    if (ret == WIFI_OK)
+    {
+        LOG_INFO(TAG_HTTP, "Retry succeeded for task %lu", (unsigned long)s_pending_upload_task_id);
+        snprintf(msg, sizeof(msg), "{\"status\":\"uploaded\",\"task_id\":%lu,\"bytes\":%lu}",
+                 (unsigned long)s_pending_upload_task_id, (unsigned long)s_pending_upload_size);
+        MQTT_PublishStatus(msg);
+        _clear_pending_upload();
+    }
+    else if (s_pending_upload_attempts >= PENDING_UPLOAD_MAX_ATTEMPTS)
+    {
+        LOG_ERROR(TAG_HTTP, "Upload task %lu abandoned after %d attempts",
+                  (unsigned long)s_pending_upload_task_id, PENDING_UPLOAD_MAX_ATTEMPTS);
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"task_id\":%lu,\"reason\":\"upload_failed\"}",
+                 (unsigned long)s_pending_upload_task_id);
+        MQTT_PublishStatus(msg);
+        _clear_pending_upload();
+    }
+    else
+    {
+        s_pending_upload_next_tick = HAL_GetTick() + PENDING_UPLOAD_RETRY_DELAY_MS;
+    }
+}
+
 /* Active schedule */
 static Schedule_t s_schedule;
 
@@ -903,6 +984,11 @@ int main(void)
         HAL_IWDG_Refresh(&hiwdg);
 #endif
 
+        /* Resume any upload that hit its deadline. Runs here, in the loop,
+         * so retries interleave with MQTT commands, the OTA poll and the
+         * heartbeat instead of monopolising the CPU. */
+        _service_pending_upload();
+
         /* Send MQTT keepalive ping and online status every STATUS_HEARTBEAT_INTERVAL_MS (instant-feel dashboard) */
         if ((HAL_GetTick() - last_ping) > STATUS_HEARTBEAT_INTERVAL_MS)
         {
@@ -1280,17 +1366,27 @@ int main(void)
                         }
                         else
                         {
-                            LOG_ERROR(TAG_HTTP, "Task %u upload failed", next->task_id);
+                            /* Do NOT erase the frame here — the upload may
+                             * simply have hit its deadline with most bytes
+                             * already on the server. Queue it; the main
+                             * loop retries and WiFi_HttpPostImage resumes
+                             * from the server-confirmed offset. The buffer
+                             * is erased on success or once retries run out
+                             * (_clear_pending_upload). */
+                            _register_pending_upload(next->task_id, captured_size);
                             snprintf(status_msg, sizeof(status_msg),
-                                     "{\"status\":\"error\",\"task_id\":%u,\"reason\":\"upload_failed\"}",
+                                     "{\"status\":\"retrying\",\"task_id\":%u,\"reason\":\"upload_incomplete\"}",
                                      next->task_id);
                         }
 
                         /* Turn off RED LED when upload completes */
                         BSP_LED_Off(LED_RED);
-                        
-                        /* SEC-10: Cryptographic Sanitization of Image Buffer */
-                        secure_erase(s_image_buffer, captured_size);
+
+                        /* SEC-10: Cryptographic Sanitization of Image Buffer.
+                         * Only when nothing is queued for retry — otherwise
+                         * we'd wipe the very frame we still need to send. */
+                        if (s_pending_upload_size == 0)
+                            secure_erase(s_image_buffer, captured_size);
 
                         /* Re-establish MQTT only if connection was lost during upload */
                         if (!MQTT_IsConnected())

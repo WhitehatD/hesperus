@@ -68,6 +68,21 @@ static char s_http_header[HTTP_HEADER_MAX];
 #define UPLOAD_CHUNK_RETRY_BASE_MS   500
 #define UPLOAD_CHUNK_RETRY_MAX_MS    8000
 
+/* Hard ceiling on ONE WiFi_HttpPostImage call, spanning both phases.
+ *
+ * 2026-08-19: without this, a degraded link turned an upload into a
+ * hostage-taking — per-chunk retry counters reset on ANY progress, so a
+ * grinding-but-occasionally-advancing transfer held the synchronous main
+ * loop for 35+ minutes straight. While it grinds, the OTA poll, MQTT
+ * command processing and the status heartbeat ALL starve (they live in the
+ * same loop) — which meant the fix for the very problem causing the grind
+ * could not even be delivered. An upload must be a guest in the main loop,
+ * not a hostage-taker: abandon at the deadline, let the loop breathe
+ * (OTA/commands/heartbeat), and rely on server-side resume to continue
+ * from the confirmed offset on the next attempt instead of losing the
+ * progress. */
+#define UPLOAD_TOTAL_DEADLINE_MS     (3u * 60u * 1000u)
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Initialization
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -648,6 +663,75 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
     uint32_t consecutive_failures = 0;
     uint32_t backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
 
+    /* Resume: ask the server how far a PREVIOUS attempt for this task got.
+     * Without this, hitting the deadline (or a reboot mid-upload) would
+     * re-send bytes the server already has — which on a degraded link is
+     * exactly the progress we cannot afford to throw away. Best-effort: any
+     * failure here just means we start at 0, which is the old behaviour.
+     * Skipped for the fallback task-id markers, whose real id isn't
+     * assigned until the server sees chunk 0. */
+    if (task_id != 0 && !(task_id >= 10000 && task_id <= 40000))
+    {
+        int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
+            "GET %s/resume?task_id=%lu HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "X-Upload-Token: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id,
+            SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
+
+        int32_t rsock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+        if (rsock >= 0)
+        {
+            if (_socket_send_all(rsock, (uint8_t *)s_http_header, header_len) == 0)
+            {
+                uint8_t rbuf[512] = {0};
+                int32_t rlen = 0;
+                uint32_t rwait = HAL_GetTick();
+                while ((HAL_GetTick() - rwait) < HTTP_RESPONSE_TIMEOUT_MS)
+                {
+                    MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
+                    rlen = MX_WIFI_Socket_recv(wifi_obj_get(), rsock, rbuf, sizeof(rbuf) - 1, 0);
+                    if (rlen > 0)
+                        break;
+                }
+                if (rlen > 0)
+                {
+                    rbuf[rlen] = '\0';
+                    if (_parse_http_status(rbuf) == 200)
+                    {
+                        const char *body = _find_json_body(rbuf);
+                        if (body != NULL)
+                        {
+                            json_mem_reset();
+                            cJSON *root = cJSON_Parse(body);
+                            if (root != NULL)
+                            {
+                                cJSON *j_off = cJSON_GetObjectItem(root, "received_offset");
+                                if (cJSON_IsNumber(j_off))
+                                {
+                                    uint32_t srv = (uint32_t)j_off->valuedouble;
+                                    if (srv > 0 && srv < data_len)
+                                    {
+                                        offset = srv;
+                                        LOG_INFO(TAG_HTTP, "Resuming upload at %lu/%lu bytes",
+                                                 (unsigned long)offset, (unsigned long)data_len);
+                                    }
+                                }
+                                cJSON_Delete(root);
+                            }
+                        }
+                    }
+                }
+            }
+            MX_WIFI_Socket_close(wifi_obj_get(), rsock);
+        }
+    }
+
+    /* Persistent keep-alive socket, shared by every chunk. -1 = need one. */
+    int32_t sock = -1;
+
     /* ── Phase 1: send every chunk, resuming from the server's confirmed
      *            offset on any failure rather than restarting from 0 ── */
     while (offset < data_len)
@@ -655,6 +739,24 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
 #if WATCHDOG_ENABLED
         IWDG->KR = 0x0000AAAAu;
 #endif
+        /* Deadline: give the main loop its turn back. Progress is NOT lost —
+         * the server keeps the partial upload and its confirmed offset, so
+         * the next attempt resumes there (see the /api/upload/resume query
+         * on entry). This is what stops one bad link from starving OTA,
+         * MQTT commands and the heartbeat indefinitely. */
+        if ((HAL_GetTick() - upload_start_tick) > UPLOAD_TOTAL_DEADLINE_MS)
+        {
+            LOG_WARN(TAG_HTTP, "Upload deadline hit at %lu/%lu bytes (%lus) — yielding to "
+                     "main loop, will resume from server offset next attempt",
+                     (unsigned long)offset, (unsigned long)data_len,
+                     (unsigned long)((HAL_GetTick() - upload_start_tick) / 1000u));
+            if (sock >= 0)
+                MX_WIFI_Socket_close(wifi_obj_get(), sock);
+            BSP_LED_Off(LED_GREEN);
+            _powersave_restore(ps_prev);
+            return WIFI_ERROR_SEND;
+        }
+
         uint32_t remaining = data_len - offset;
         uint32_t chunk_len = (remaining < UPLOAD_CHUNK_WIRE_SIZE) ? remaining : UPLOAD_CHUNK_WIRE_SIZE;
 
@@ -664,7 +766,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             "X-Upload-Token: %s\r\n"
             "Content-Type: application/octet-stream\r\n"
             "Content-Length: %lu\r\n"
-            "Connection: close\r\n"
+            "Connection: keep-alive\r\n"
             "\r\n",
             SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id, (unsigned long)offset,
             (unsigned long)data_len, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN,
@@ -675,7 +777,27 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         uint32_t confirmed_task_id = resolved_task_id;
         bool restart_from_zero = false;
 
-        int32_t sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+        /* Reuse ONE keep-alive connection across chunks.
+         *
+         * 2026-08-19: opening a fresh socket per chunk (with
+         * "Connection: close") looked safer — a wedged socket can't be
+         * trusted, so start clean. On this module it is actively harmful:
+         * every closed TCP socket sits in TIME_WAIT holding buffer memory
+         * on a device with very little RAM, so churning one socket per
+         * 32KB chunk exhausts its pool. Symptom: chunk 1 lands fine, chunk
+         * 2 wedges partway (~46KB total), FLOW pinned LOW with the socket
+         * API reporting neither backpressure nor error — the module simply
+         * has nothing left to accept data into. The old single-connection
+         * upload got further precisely because it never churned sockets.
+         *
+         * So: connect once, keep it, and only rebuild it when a send
+         * actually fails (below), which is the case that genuinely needs a
+         * clean socket. */
+        if (sock < 0)
+        {
+            sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+        }
+
         if (sock < 0)
         {
             LOG_WARN(TAG_HTTP, "Chunk connect failed at offset %lu/%lu",
@@ -759,7 +881,16 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                 }
             }
 
-            MX_WIFI_Socket_close(wifi_obj_get(), sock);
+            /* Keep the socket ONLY while it's working. Any failure (send
+             * error, no response, bad status) means we can't trust its
+             * state — drop it so the next iteration builds a clean one.
+             * On success it stays open for the next chunk, which is the
+             * whole point: no TIME_WAIT churn on a RAM-starved module. */
+            if (!chunk_ok)
+            {
+                MX_WIFI_Socket_close(wifi_obj_get(), sock);
+                sock = -1;
+            }
         }
 
         if (restart_from_zero)
@@ -795,6 +926,8 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             LOG_ERROR(TAG_HTTP, "Chunk upload abandoned after %lu failures at offset %lu/%lu",
                       (unsigned long)consecutive_failures, (unsigned long)offset,
                       (unsigned long)data_len);
+            if (sock >= 0)
+                MX_WIFI_Socket_close(wifi_obj_get(), sock);
             BSP_LED_Off(LED_GREEN);
             _powersave_restore(ps_prev);
             return WIFI_ERROR_SEND;
@@ -806,6 +939,14 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         HAL_Delay(backoff_ms);
         backoff_ms = (backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS) ? UPLOAD_CHUNK_RETRY_MAX_MS : backoff_ms * 2;
         MQTT_SendPing();
+    }
+
+    /* Chunks are done — release the keep-alive socket before finalizing so
+     * the module reclaims it while /complete uses its own short-lived one. */
+    if (sock >= 0)
+    {
+        MX_WIFI_Socket_close(wifi_obj_get(), sock);
+        sock = -1;
     }
 
     /* ── Phase 2: every chunk confirmed by the server — finalize with a
@@ -820,6 +961,17 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
 #if WATCHDOG_ENABLED
         IWDG->KR = 0x0000AAAAu;
 #endif
+        /* Same deadline applies to finalization — every byte is already on
+         * the server here, so yielding costs only the final ack, which the
+         * next attempt re-sends cheaply (resume reports a full offset). */
+        if ((HAL_GetTick() - upload_start_tick) > UPLOAD_TOTAL_DEADLINE_MS)
+        {
+            LOG_WARN(TAG_HTTP, "Upload deadline hit during finalization — yielding to main loop");
+            BSP_LED_Off(LED_GREEN);
+            _powersave_restore(ps_prev);
+            return WIFI_ERROR_SEND;
+        }
+
         int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
             "POST %s/complete?task_id=%lu&total_size=%lu&crc32=%lu HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
