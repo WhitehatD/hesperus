@@ -212,10 +212,19 @@ static int _ota_send_all(int32_t sock, const uint8_t *data, int32_t len)
         if (chunk > OTA_DOWNLOAD_CHUNK_SIZE)
             chunk = OTA_DOWNLOAD_CHUNK_SIZE;
 
+        /* flags MUST be 0 — mx_wifi.h documents "flags: zero for MXOS".
+         * HTTP_RESPONSE_TIMEOUT_MS was being forwarded as wire-protocol
+         * flags to the module (mx_wifi.c: cp->flags = flags), not used as
+         * a timeout — the real per-command wait is the fixed
+         * MX_WIFI_CMD_TIMEOUT in mx_wifi_conf.h, unaffected by this value.
+         * Low practical impact here (OTA request bodies are small enough
+         * to rarely hit backpressure), but it's the same vendor-contract
+         * violation as the one that broke image upload — fixed for
+         * correctness, see wifi.c:_socket_send_all for the full story. */
         int32_t sent = MX_WIFI_Socket_send(
             wifi_obj_get(), sock,
             (uint8_t *)(data + offset), chunk,
-            HTTP_RESPONSE_TIMEOUT_MS);
+            0);
 
         if (sent > 0)
         {

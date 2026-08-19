@@ -326,46 +326,89 @@ WiFiStatus_t WiFi_TestConnection(const char *ssid, const char *password, WiFiTes
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief  Helper — send a buffer over a WiFi socket with retry on partial send.
- * @retval 0 on success, -1 on failure
+ * @brief  Send a buffer over a WiFi socket, retrying on backpressure with
+ *         proper driver servicing, giving up only on a genuine socket error.
+ *
+ * 2026-08-19 ROOT CAUSE (found live, on the actual 4G hotspot, after the
+ * chunked-upload rewrite still failed with "Send failed after 3 retries" at
+ * a partial chunk offset — the timeout bump alone did NOT fix this):
+ *
+ * TWO compounding bugs, not one:
+ *
+ * 1. flags was WRONG. mx_wifi.h documents MX_WIFI_Socket_send's flags param
+ *    as "zero for MXOS". This passed HTTP_RESPONSE_TIMEOUT_MS instead —
+ *    which mx_wifi.c forwards verbatim as wire-protocol cp->flags to the
+ *    module, NOT as a per-call timeout. The actual internal wait is the
+ *    FIXED MX_WIFI_CMD_TIMEOUT (mx_wifi_conf.h, 10000ms), completely
+ *    unaffected by whatever we passed here — so raising
+ *    HTTP_RESPONSE_TIMEOUT_MS from 8000 to 12000 earlier had ZERO effect on
+ *    this call. (This IS what the packet-capture-measured "10.1s recovery"
+ *    actually was: MX_WIFI_CMD_TIMEOUT, not a TCP RTO as first assumed.)
+ *
+ * 2. sent==0 was treated as a hard failure. MX_WIFI_Socket_send's contract
+ *    is "Number of bytes sent, return < 0 if failed" — 0 is neither: it's
+ *    the module reporting its own outbound buffer is full (normal
+ *    backpressure on a slow uplink, exactly like POSIX EWOULDBLOCK). The
+ *    old code counted it as a strike and gave up after 3, waiting only
+ *    HAL_Delay(50) between attempts — and HAL_Delay is a dead CPU spin.
+ *    MX_WIFI_USE_CMSIS_OS=0 (mx_wifi_conf.h) means this is bare-metal: NO
+ *    background thread services the SPI/MIPC layer. Only an explicit
+ *    MX_WIFI_IO_YIELD() call (-> mipc_poll() -> mx_wifi_hci_recv()) pumps
+ *    it. So the 50ms "backoff" serviced nothing, and 150ms total is far too
+ *    short for a module's outbound buffer to drain onto a congested 4G
+ *    uplink — the transfer was aborted while it was still recoverable.
+ *
+ * Fix: flags=0 (matches every other correct call site in this codebase —
+ * see mqtt_handler.c:225, captive_portal.c:367). Treat sent==0 as patient,
+ * properly-yielded backpressure with NO strike limit, bounded instead by a
+ * wall-clock ceiling on this one socket; treat sent<0 as a real error with
+ * a short bounded retry. Either bound handing back to the CALLER
+ * (WiFi_HttpPostImage's per-chunk loop), which opens a fresh connection and
+ * retries — a fresh socket is more likely to recover a truly wedged module
+ * state than continuing to hammer this one.
+ *
+ * @retval 0 on success, -1 on error or a stalled connection (caller should
+ *         open a fresh socket and retry).
  */
 static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
 {
     int32_t offset = 0;
-    int retries = 0;
+    int hard_errors = 0;
     uint32_t last_mqtt_tick = HAL_GetTick();
+    uint32_t start_tick = HAL_GetTick();
 
     while (offset < len)
     {
 #if WATCHDOG_ENABLED
-        IWDG->KR = 0x0000AAAAu; /* Prevent 16s watchdog reset during 37s uploads */
+        IWDG->KR = 0x0000AAAAu; /* Prevent 16s watchdog reset during long sends */
 #endif
-        /* Send in chunks to prevent EMW3080 SPI buffer flooding.
-         * Yield the SPI pipeline between chunks so the WiFi module
-         * can drain its internal TX buffers. */
+        /* Bail out of THIS socket (not the whole upload) if it's been
+         * stuck too long — well under the 16s IWDG ceiling, and the
+         * caller's per-chunk retry opens a fresh connection on -1 rather
+         * than looping here forever. */
+        if ((HAL_GetTick() - start_tick) > 14000)
+        {
+            LOG_WARN(TAG_HTTP, "Send stalled >14s at offset %ld/%ld — "
+                     "surfacing for a fresh-connection retry", (long)offset, (long)len);
+            return -1;
+        }
+
         int32_t chunk = len - offset;
         if (chunk > HTTP_UPLOAD_CHUNK_SIZE)
             chunk = HTTP_UPLOAD_CHUNK_SIZE;
 
+        /* flags MUST be 0 — see the root-cause note above. */
         int32_t sent = MX_WIFI_Socket_send(
-            wifi_obj_get(), sock,
-            (uint8_t *)(data + offset), chunk,
-            HTTP_RESPONSE_TIMEOUT_MS);
+            wifi_obj_get(), sock, (uint8_t *)(data + offset), chunk, 0);
 
         if (sent > 0)
         {
-            /* Toggle GREEN LED to indicate data transfer */
             BSP_LED_Toggle(LED_GREEN);
-
             offset += sent;
-            retries = 0;        /* Reset retry counter on progress */
+            hard_errors = 0;
 
-            /* Minimal SPI yield between chunks — 2ms is sufficient for
-             * the EMW3080 to drain its TX buffer at SPI clock speeds. */
             if (offset < len)
-            {
                 MX_WIFI_IO_YIELD(wifi_obj_get(), 2);
-            }
 
             /* Keep MQTT alive during long uploads.
              * Send PINGREQ every 5s to prevent broker keepalive timeout (60s).
@@ -380,16 +423,31 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
                 last_mqtt_tick = HAL_GetTick();
             }
         }
+        else if (sent == 0)
+        {
+            /* Backpressure, not failure — module's outbound buffer is full.
+             * Yield so the driver is actually SERVICED (bare-metal, nothing
+             * else pumps it), then retry the same bytes. No strike limit
+             * here on purpose: a link recovering in 2s shouldn't be treated
+             * the same as a dead one — the 14s wall-clock check above is
+             * the real bound. */
+            MX_WIFI_IO_YIELD(wifi_obj_get(), 20);
+        }
         else
         {
-            retries++;
-            if (retries >= 3)
+            /* sent < 0: a genuine module-reported error, not backpressure.
+             * Short bounded retry — if it keeps happening the socket is
+             * likely actually broken, and the wall-clock check (or this)
+             * hands it to the caller's fresh-connection retry, which can
+             * actually fix that. */
+            hard_errors++;
+            if (hard_errors >= 5)
             {
-                LOG_ERROR(TAG_HTTP, "Send failed after %d retries at offset %ld/%ld",
-                          retries, (long)offset, (long)len);
+                LOG_ERROR(TAG_HTTP, "Socket error at offset %ld/%ld (%d consecutive)",
+                          (long)offset, (long)len, hard_errors);
                 return -1;
             }
-            HAL_Delay(50);     /* Brief pause before retry */
+            MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
         }
     }
     return 0;
@@ -544,9 +602,24 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
 
             if (send_status == WIFI_OK)
             {
+                /* Poll with yields, not a single-shot recv — the EMW3080
+                 * delivers the response asynchronously over SPI, so it may
+                 * not have arrived at the exact instant the send finished.
+                 * A single-shot call here would misreport "no response" for
+                 * a chunk the server actually processed fine, forcing a
+                 * wasted fresh-connection retry. Matches the pre-existing
+                 * time-sync response reader below. */
                 uint8_t resp_buf[768] = {0};
-                int32_t resp_len = MX_WIFI_Socket_recv(
-                    wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                int32_t resp_len = 0;
+                uint32_t resp_wait_start = HAL_GetTick();
+                while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
+                {
+                    MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
+                    resp_len = MX_WIFI_Socket_recv(
+                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                    if (resp_len > 0)
+                        break;
+                }
 
                 if (resp_len > 0)
                 {
@@ -672,9 +745,19 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         {
             if (_socket_send_all(sock, (uint8_t *)s_http_header, header_len) == 0)
             {
+                /* Poll with yields — see the matching comment on the chunk
+                 * response reader above; same asynchronous-delivery reason. */
                 uint8_t resp_buf[512] = {0};
-                int32_t resp_len = MX_WIFI_Socket_recv(
-                    wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                int32_t resp_len = 0;
+                uint32_t resp_wait_start = HAL_GetTick();
+                while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
+                {
+                    MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
+                    resp_len = MX_WIFI_Socket_recv(
+                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                    if (resp_len > 0)
+                        break;
+                }
                 if (resp_len > 0)
                 {
                     resp_buf[resp_len] = '\0';
