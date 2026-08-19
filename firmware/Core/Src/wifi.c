@@ -374,6 +374,8 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
 {
     int32_t offset = 0;
     int hard_errors = 0;
+    uint32_t zero_sends = 0;   /* module said "buffer full" (backpressure) */
+    uint32_t neg_sends  = 0;   /* module reported an actual error */
     uint32_t last_mqtt_tick = HAL_GetTick();
     uint32_t start_tick = HAL_GetTick();
 
@@ -388,8 +390,20 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
          * than looping here forever. */
         if ((HAL_GetTick() - start_tick) > 14000)
         {
-            LOG_WARN(TAG_HTTP, "Send stalled >14s at offset %ld/%ld — "
-                     "surfacing for a fresh-connection retry", (long)offset, (long)len);
+            /* Diagnostics, not decoration: which failure mode actually
+             * wedged us? zero_sends = module reported "buffer full"
+             * (backpressure); neg_sends = module reported an error;
+             * FLOW low = the module is telling the SPI layer it cannot
+             * accept ANY more bytes, i.e. the wedge is below the socket
+             * API entirely (mx_wifi_spi.c:wait_flow_high). These three
+             * numbers distinguish "slow uplink" from "module TX path
+             * hung" — we were guessing between them for hours. */
+            LOG_WARN(TAG_HTTP, "Send stalled >14s at offset %ld/%ld "
+                     "[zero_sends=%lu neg_sends=%lu flow=%s] — fresh-connection retry",
+                     (long)offset, (long)len,
+                     (unsigned long)zero_sends, (unsigned long)neg_sends,
+                     (HAL_GPIO_ReadPin(MX_WIFI_SPI_FLOW_PORT, MX_WIFI_SPI_FLOW_PIN)
+                        == GPIO_PIN_RESET) ? "LOW(blocked)" : "HIGH(ready)");
             return -1;
         }
 
@@ -431,6 +445,7 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
              * here on purpose: a link recovering in 2s shouldn't be treated
              * the same as a dead one — the 14s wall-clock check above is
              * the real bound. */
+            zero_sends++;
             MX_WIFI_IO_YIELD(wifi_obj_get(), 20);
         }
         else
@@ -441,10 +456,12 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
              * hands it to the caller's fresh-connection retry, which can
              * actually fix that. */
             hard_errors++;
+            neg_sends++;
             if (hard_errors >= 5)
             {
-                LOG_ERROR(TAG_HTTP, "Socket error at offset %ld/%ld (%d consecutive)",
-                          (long)offset, (long)len, hard_errors);
+                LOG_ERROR(TAG_HTTP, "Socket error at offset %ld/%ld (rc=%ld, %d consecutive, "
+                          "zero_sends=%lu)", (long)offset, (long)len, (long)sent,
+                          hard_errors, (unsigned long)zero_sends);
                 return -1;
             }
             MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
