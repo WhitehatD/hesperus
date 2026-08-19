@@ -17,8 +17,8 @@ class PlanRequest(BaseModel):
         examples=["Monitor occupancy between 3-5 PM"],
     )
     model: str = Field(
-        default="claude-sonnet",
-        description="AI model backend: 'claude-sonnet', 'claude-haiku', 'qwen3-vl', 'qwen2.5-vl', or 'gemini-3'",
+        default="openrouter",
+        description="AI model backend: 'openrouter' (production default), 'claude-sonnet', 'claude-haiku', 'qwen3-vl', 'qwen2.5-vl', or 'gemini-3'",
     )
 
 

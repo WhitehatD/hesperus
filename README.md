@@ -156,9 +156,9 @@ The user types a natural language message in the chat (e.g., *"Monitor the hallw
 
 ### 2. LLM Tool Dispatch
 
-The server loads the conversation history from the database, appends the new message, and calls the selected vision LLM with `tool_use` enabled. The model is chosen via a dropdown in the chat UI (populated dynamically from `/api/agent/models` based on which API keys are configured). Default is **Claude Haiku**; Sonnet, Gemini 3 Flash, and Qwen3-VL are available when their keys are present. The system prompt defines the agent's personality (action-first, bias toward capturing fresh data) and routing rules that map user intents to specific tools.
+The server loads the conversation history from the database, appends the new message, and calls the planner model (OpenRouter, `qwen/qwen3.7-flash` by default) with tool-calling enabled — a single production backend, no model picker in the UI. The system prompt defines the agent's personality (action-first, bias toward capturing fresh data) and routing rules that map user intents to specific tools.
 
-Claude's response contains a mix of text blocks and `tool_use` blocks. Each `tool_use` block specifies which tool to call and with what parameters. The server processes these sequentially:
+The model's response contains a mix of text and tool calls. Each tool call specifies which tool to invoke and with what parameters. The server processes these sequentially:
 
 ```
 User: "Monitor for 30 seconds"
@@ -275,7 +275,7 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 ### Dashboard (Next.js 16 + React 19)
 
 - **Always-visible console** — board firmware logs stream via MQTT (`device/stm32/logs`) and are parsed with the firmware's `[ms] [LEVEL] [TAG] message` format, color-coded by level.
-- **Agent chat with tool streaming** — SSE events render as a step-by-step execution trace (thinking, tool calls, results, reply). Captured images appear as inline thumbnails in the chat immediately after analysis. Model selector dropdown populated dynamically from the server.
+- **Agent chat with tool streaming** — SSE events render as a step-by-step execution trace (thinking, tool calls, results, reply). Captured images appear as inline thumbnails in the chat immediately after analysis. Stop button aborts mid-generation, cancelling the in-flight OpenRouter call server-side too.
 - **Real-time telemetry** — board status, firmware version, uptime, WiFi RSSI, capture count, connection state (online/standby/offline) all update live via MQTT WebSocket.
 - **Multi-session chat persistence** — conversations are stored in the database and survive page reloads.
 

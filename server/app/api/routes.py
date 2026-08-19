@@ -23,6 +23,7 @@ from app.api.schemas import (
 )
 from app.analysis.engine import analyze_image
 from app.analysis.models import AnalysisResult
+from app.api.firmware_routes import _compute_crc32 as _compute_firmware_crc32
 from app.db.database import get_db, async_session
 from app.mqtt.client import mqtt_client, send_board_command
 from app.planning.engine import generate_plan
@@ -182,29 +183,18 @@ async def board_state():
     return get_board_snapshot()
 
 
-@router.post("/upload", response_model=UploadResponse, dependencies=[Depends(verify_board_token)])
-async def upload_image(task_id: int, file: UploadFile = File(...)):
+async def _process_uploaded_image(task_id: int, content: bytes) -> UploadResponse:
     """
-    Receive a captured image from the STM32 board.
-    The board sends raw RGB565 pixel data — we convert to JPEG server-side.
-
-    Requires X-Upload-Token header when settings.firmware_upload_token is
-    configured (see verify_board_token) — previously unauthenticated, fixed
-    2026-08-18 ahead of the infra-core redeploy (shared host, real domain).
+    Shared core: turn a fully-received image payload into a stored JPEG,
+    trigger analysis, and notify the dashboard. Used by both the legacy
+    single-POST /api/upload and the resumable /api/upload/chunk+/complete
+    path — both hand this function the exact same thing (a task_id and the
+    complete raw bytes), so there is exactly one place that does image
+    processing regardless of how the bytes got here.
     """
-    # Intercept board fallback task IDs (from unprompted/button captures) or 0
-    if task_id == 0 or (10000 <= task_id <= 40000):
-        task_id = next_task_id()
-
     import io
-    import struct
     import numpy as np
     from PIL import Image
-
-    try:
-        content = await file.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Failed to read upload payload")
 
     # ── Benchmark: upload received ────────────────────────────────────────────
     asyncio.create_task(
@@ -243,7 +233,13 @@ async def upload_image(task_id: int, file: UploadFile = File(...)):
 
             rgb = np.stack([r, g, b], axis=-1).reshape(height, width, 3)
             img = Image.fromarray(rgb, "RGB")
-            img.save(filepath, "JPEG", quality=85)
+            # quality=95 + no chroma subsampling: this encode happens AFTER the
+            # constrained board->server 4G hop (raw RGB565 already crossed the
+            # wire), so it costs nothing there. It does feed the VLM directly —
+            # JPEG blocking/ringing artifacts at lower quality can be misread as
+            # real texture by vision models, and 4:2:0 chroma subsampling blurs
+            # color detail. Optimize purely for analysis fidelity.
+            img.save(filepath, "JPEG", quality=95, subsampling=0)
         else:
             # Assume already JPEG or other image format — validate it's readable
             try:
@@ -327,6 +323,251 @@ async def upload_image(task_id: int, file: UploadFile = File(...)):
     )
 
 
+@router.post("/upload", response_model=UploadResponse, dependencies=[Depends(verify_board_token)])
+async def upload_image(task_id: int, file: UploadFile = File(...)):
+    """
+    Receive a captured image from the STM32 board in a single POST.
+    The board sends raw RGB565 pixel data — we convert to JPEG server-side.
+
+    Requires X-Upload-Token header when settings.firmware_upload_token is
+    configured (see verify_board_token) — previously unauthenticated, fixed
+    2026-08-18 ahead of the infra-core redeploy (shared host, real domain).
+
+    Kept alongside /api/upload/chunk (2026-08-19): this single-POST path is
+    fine on a healthy link and is what the test suite exercises. On a lossy
+    4G uplink a single stalled TCP connection loses the ENTIRE 614KB frame
+    with no way to resume — see /api/upload/chunk for the resilient path the
+    firmware actually uses in production.
+    """
+    # Intercept board fallback task IDs (from unprompted/button captures) or 0
+    if task_id == 0 or (10000 <= task_id <= 40000):
+        task_id = next_task_id()
+
+    try:
+        content = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Failed to read upload payload")
+
+    return await _process_uploaded_image(task_id, content)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Resumable Chunked Upload
+#
+#  2026-08-19: a single 614KB RGB565 frame over a 4G hotspot loses the whole
+#  transfer to one bad packet — packet capture showed the board's WiFi module
+#  needing ~10s to recover from a single loss event, with the previous 8s
+#  per-send timeout misreporting genuine (if slow) recovery as failure. Even
+#  with that timeout fixed (HTTP_RESPONSE_TIMEOUT_MS=12000), a single
+#  monolithic POST still throws away all progress on any connection that
+#  can't be salvaged and restarts from byte 0 into the same conditions.
+#
+#  This splits the transfer into independent ~32KB chunks, each its own
+#  short-lived POST. A wedged connection costs one chunk, not the whole
+#  frame — the firmware opens a fresh socket per chunk (a wedged EMW3080
+#  socket's internal state after a timeout is not something we can trust to
+#  reuse) and resumes from the last server-confirmed offset.
+#
+#  State is kept in two small sidecar files per in-flight upload, scoped to
+#  a single task_id:
+#    {upload_dir}/.incomplete/task_{id}.tmp     — sparse, preallocated to
+#                                                  total_size, chunks written
+#                                                  at their byte offset
+#    {upload_dir}/.incomplete/task_{id}.offset  — ASCII int: highest
+#                                                  contiguous byte offset
+#                                                  received so far
+#
+#  This assumes chunks arrive in strictly increasing offset order with only
+#  the current chunk retried (never re-sent out of order) — true of the
+#  firmware's send loop, and true because there is exactly one board. No
+#  cross-upload locking is implemented for the same reason: single producer.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_INCOMPLETE_TTL_S = 3600  # abandoned partial uploads older than this are swept
+
+
+def _incomplete_dir() -> str:
+    d = os.path.join(settings.upload_dir, ".incomplete")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _incomplete_paths(task_id: int) -> tuple[str, str]:
+    d = _incomplete_dir()
+    return (
+        os.path.join(d, f"task_{task_id}.tmp"),
+        os.path.join(d, f"task_{task_id}.offset"),
+    )
+
+
+def _sweep_stale_incomplete_uploads() -> None:
+    """Best-effort GC for uploads that were started and never completed
+    (board rebooted mid-transfer, capture abandoned, etc). Runs inline on
+    every new upload start rather than as a separate background task —
+    cheap (a single directory listing) and avoids adding scheduler
+    infrastructure for what is, at demo scale, a handful of small files."""
+    d = _incomplete_dir()
+    now = time.time()
+    try:
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if now - os.path.getmtime(path) > _INCOMPLETE_TTL_S:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _read_offset(offset_path: str) -> int:
+    try:
+        with open(offset_path, "r") as f:
+            return int(f.read().strip() or "0")
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def _write_offset(offset_path: str, value: int) -> None:
+    tmp = offset_path + ".new"
+    with open(tmp, "w") as f:
+        f.write(str(value))
+    os.replace(tmp, offset_path)
+
+
+@router.post("/upload/chunk", dependencies=[Depends(verify_board_token)])
+async def upload_chunk(request: Request, task_id: int, offset: int, total_size: int):
+    """
+    Receive one chunk of a resumable upload. The chunk body is the raw
+    bytes for [offset, offset+len) of the final `total_size`-byte payload —
+    no multipart wrapping, to keep the firmware-side request trivial.
+
+    task_id==0 or the 10000-40000 fallback range (unprompted/button
+    captures) is remapped to a real ID via next_task_id() — but ONLY on the
+    first chunk (offset==0), matching /api/upload's existing behavior. The
+    resolved task_id is returned in the response; the firmware MUST use
+    that value for every subsequent chunk of this same upload, exactly as
+    it would use whatever real ID a schedule task already carries.
+    """
+    if total_size <= 0 or total_size > 32 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="Invalid total_size")
+    if offset < 0 or offset >= total_size:
+        raise HTTPException(status_code=422, detail="Invalid offset")
+
+    if offset == 0:
+        _sweep_stale_incomplete_uploads()
+        if task_id == 0 or (10000 <= task_id <= 40000):
+            task_id = next_task_id()
+
+    chunk = await request.body()
+    if len(chunk) == 0:
+        raise HTTPException(status_code=422, detail="Empty chunk")
+    if offset + len(chunk) > total_size:
+        raise HTTPException(status_code=422, detail="Chunk exceeds declared total_size")
+
+    tmp_path, offset_path = _incomplete_paths(task_id)
+
+    if offset == 0:
+        # Fresh upload (or a full restart of a task_id that already had one
+        # in flight — overwrite, the old one is stale by definition).
+        with open(tmp_path, "wb") as f:
+            f.truncate(total_size)
+        _write_offset(offset_path, 0)
+    elif not os.path.exists(tmp_path):
+        # Continuation chunk (offset>0) for an upload the server has no
+        # record of (server restarted since, or the sidecar was swept as
+        # stale). Checked BEFORE the offset-mismatch comparison below —
+        # otherwise a missing file reads back as expected_offset=0, which
+        # would be indistinguishable from a genuine duplicate-of-chunk-0
+        # and silently ack a "resend from 0" instead of surfacing that
+        # there's nothing here to resume at all.
+        raise HTTPException(status_code=409, detail="Unknown upload — restart from offset 0")
+
+    expected_offset = _read_offset(offset_path)
+    if offset != expected_offset:
+        # Out-of-order / duplicate chunk (e.g. a retried chunk whose ack was
+        # lost, then the retry ALSO landed) — tell the board where we
+        # actually are rather than silently accepting a gap or a re-write
+        # that could race with a concurrent write at the true offset.
+        return {"task_id": task_id, "received_offset": expected_offset, "total_size": total_size}
+
+    with open(tmp_path, "r+b") as f:
+        f.seek(offset)
+        f.write(chunk)
+
+    new_offset = offset + len(chunk)
+    _write_offset(offset_path, new_offset)
+
+    return {"task_id": task_id, "received_offset": new_offset, "total_size": total_size}
+
+
+@router.get("/upload/resume")
+async def upload_resume(task_id: int):
+    """
+    Let the firmware ask "how far did I get?" after a reboot or a fresh
+    reconnect mid-upload, instead of blindly resuming from a locally-
+    remembered offset that may not match what the server actually has.
+    """
+    tmp_path, offset_path = _incomplete_paths(task_id)
+    if not os.path.exists(tmp_path):
+        return {"task_id": task_id, "exists": False, "received_offset": 0}
+    return {
+        "task_id": task_id,
+        "exists": True,
+        "received_offset": _read_offset(offset_path),
+    }
+
+
+@router.post("/upload/complete", response_model=UploadResponse, dependencies=[Depends(verify_board_token)])
+async def upload_complete(task_id: int, total_size: int, crc32: int):
+    """
+    Finalize a chunked upload: verify every byte arrived and the payload
+    is intact (TCP already guarantees per-chunk integrity, but this catches
+    a chunk landing at the wrong offset, a partial disk write, or a stale
+    task_id reused before the sweep caught it), then hand off to the exact
+    same processing path as the single-POST /api/upload.
+    """
+    tmp_path, offset_path = _incomplete_paths(task_id)
+
+    if not os.path.exists(tmp_path):
+        raise HTTPException(status_code=404, detail="No upload in progress for this task_id")
+
+    received = _read_offset(offset_path)
+    if received != total_size:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Upload incomplete: {received}/{total_size} bytes received",
+        )
+
+    with open(tmp_path, "rb") as f:
+        content = f.read()
+
+    # Reuse the OTA path's CRC helper — the firmware computes CRC32 with the
+    # MPEG-2 variant (poly 0x04C11DB7, MSB-first, no reflection, no final
+    # XOR) in ota_update.c:_crc32_update. That is NOT what zlib.crc32()
+    # computes (reflected in/out + final XOR), so using zlib here would mean
+    # the two sides could never agree. One CRC convention per codebase.
+    actual_crc = _compute_firmware_crc32(content)
+    if actual_crc != (crc32 & 0xFFFFFFFF):
+        # Keep the temp file — do NOT delete on integrity failure. The
+        # board can requery /upload/resume, and since resume always reports
+        # the sidecar's tracked offset (== total_size here) it will need to
+        # restart from 0 to get a clean file; deleting here would just lose
+        # the evidence of what happened.
+        raise HTTPException(
+            status_code=422,
+            detail=f"CRC32 mismatch: expected {crc32:08x}, got {actual_crc:08x}",
+        )
+
+    try:
+        os.remove(tmp_path)
+        os.remove(offset_path)
+    except OSError:
+        pass
+
+    return await _process_uploaded_image(task_id, content)
+
+
 async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: str):
     """Background task: analyze a captured image with the multimodal LLM."""
     try:
@@ -356,8 +597,10 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
 
         print(f"[AI] Analyzing task {task_id}: objective='{objective}'")
 
-        # Choose model — Claude → Gemini → vLLM (in order of preference)
-        if settings.anthropic_api_key:
+        # Choose model — OpenRouter (production default) → Claude → Gemini → vLLM
+        if settings.openrouter_api_key:
+            model_key = "openrouter"
+        elif settings.anthropic_api_key:
             model_key = "claude-sonnet"
         elif settings.gemini_api_key:
             model_key = "gemini-3"
@@ -412,7 +655,7 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
                     image_path=image_path,
                     objective="General visual inspection",
                     analysis=f"Analysis unavailable — backend error: {err_msg[:200]}",
-                    recommendation="Check AI backend configuration (ANTHROPIC_API_KEY, GEMINI_API_KEY, or vLLM endpoint).",
+                    recommendation="Check AI backend configuration (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or vLLM endpoint).",
                     model_used="error",
                     inference_time_ms=0,
                 )

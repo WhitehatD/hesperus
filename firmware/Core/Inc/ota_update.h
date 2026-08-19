@@ -61,6 +61,19 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief  CRC32 — MPEG-2 variant (poly 0x04C11DB7, MSB-first, no input/output
+ *         reflection, no final XOR). Matches the server's _compute_crc32()
+ *         in server/app/api/firmware_routes.py. Used for OTA binary
+ *         verification and by wifi.c's chunked image upload — one CRC
+ *         implementation for the whole firmware, not two that could drift.
+ * @param  crc   Running CRC state — pass 0xFFFFFFFF to start a new one.
+ * @param  data  Buffer to checksum.
+ * @param  len   Buffer length in bytes.
+ * @retval Updated CRC32 value.
+ */
+uint32_t Firmware_CRC32(uint32_t crc, const uint8_t *data, uint32_t len);
+
+/**
  * @brief  Validate boot integrity on startup.
  *         Increments boot counter in RTC backup register. If counter
  *         reaches OTA_MAX_BOOT_FAILURES, triggers automatic rollback

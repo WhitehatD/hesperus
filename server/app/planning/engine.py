@@ -85,6 +85,8 @@ async def generate_plan(prompt: str, model_key: str = "claude-sonnet") -> PlanRe
         schedule = await _plan_with_vllm(prompt, model_key)
     elif model_key == "gemini-3":
         schedule = await _plan_with_gemini(prompt)
+    elif model_key == "openrouter":
+        schedule = await _plan_with_openrouter(prompt)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -163,6 +165,30 @@ async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
 
     response = await client.chat.completions.create(
         model=model_name,
+        messages=[
+            {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        max_tokens=2048,
+    )
+
+    return _parse_schedule(response.choices[0].message.content)
+
+
+async def _plan_with_openrouter(prompt: str) -> list[ScheduledTask]:
+    """Generate schedule via OpenRouter. Production default as of 2026-08-19
+    — uses openrouter_planner_model (cheap, tools-capable, text-only; schedule
+    generation never reasons about images)."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url=settings.openrouter_base_url,
+        api_key=settings.openrouter_api_key,
+    )
+
+    response = await client.chat.completions.create(
+        model=settings.openrouter_planner_model,
         messages=[
             {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

@@ -412,6 +412,24 @@ AGENT_TOOLS = [
     },
 ]
 
+
+def _agent_tools_openai_format() -> list[dict]:
+    """Convert AGENT_TOOLS (Anthropic input_schema format, the single source
+    of truth) to OpenAI function-calling format for the OpenRouter chat
+    tool-use loop. Computed at call time — no parallel tool list to drift."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in AGENT_TOOLS
+    ]
+
+
 AGENT_SYSTEM_PROMPT = """You are the IoT Visual Monitoring Agent — an action-first operator controlling a physical STM32 camera board over MQTT. Be decisive, concise, and always prefer DOING over explaining.
 
 Personality: You are a proactive field operator. When the user asks anything that could involve the camera, TAKE THE SHOT. When in doubt between looking at old data vs capturing fresh data, always capture fresh. Never say "I can't" — find the closest tool that achieves the intent.
@@ -467,39 +485,15 @@ def _sse_event(event: str, data: dict) -> str:
     return f"data: {json.dumps({'event': event, **data})}\n\n"
 
 
-@router.get("/models")
-async def list_models():
-    """Return AI backends available based on configured API keys."""
-    models = []
-    if settings.anthropic_api_key:
-        models.append({"key": "claude-haiku", "label": "Haiku (fast)"})
-        models.append({"key": "claude-sonnet", "label": "Sonnet"})
-    if settings.gemini_api_key:
-        models.append({"key": "gemini-3", "label": "Gemini Flash"})
-    if getattr(settings, "vllm_base_url", None):
-        models.append({"key": "qwen3-vl", "label": "Qwen3-VL (local)"})
-    # Always return at least the claude defaults so the UI isn't empty
-    if not models:
-        models = [
-            {"key": "claude-haiku", "label": "Haiku (fast)"},
-            {"key": "claude-sonnet", "label": "Sonnet"},
-        ]
-    return models
-
-
 @router.post("/chat")
 async def agent_chat(request: Request):
     body = await request.json()
     message = body.get("message", "").strip()
     session_id = body.get("sessionId")  # DB integer ID
-    model_key = body.get("model", "claude-haiku")
 
-    # Agent reasoning always uses Claude; Gemini/vLLM keys are only for image analysis
-    CLAUDE_MODEL_MAP = {
-        "claude-haiku": settings.claude_haiku_model,
-        "claude-sonnet": settings.claude_sonnet_model,
-    }
-    resolved_model = CLAUDE_MODEL_MAP.get(model_key) or settings.claude_haiku_model
+    # Single production model now — no client-selectable model, see
+    # dashboard AgentChat.tsx (model picker removed 2026-08-19).
+    model_key = "openrouter"
 
     if not message:
         return StreamingResponse(
@@ -532,18 +526,28 @@ async def agent_chat(request: Request):
             _bench_run_id = _timing.new_run_id()
             _bench_task_id = next_task_id()
 
-            # ── Call Claude with tools ──
-            if not settings.anthropic_api_key:
+            # ── Call OpenRouter (OpenAI-compatible tool-calling) ──
+            # Degraded keyword-matching path when no key is configured at all —
+            # still routes captures through _capture_pipeline (see
+            # _fallback_dispatch), so images always stream back correctly.
+            if not settings.openrouter_api_key:
                 async for ev in _fallback_dispatch(message, session_id):
                     yield ev
                 yield _sse_event("done", {})
                 return
 
-            client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(
+                base_url=settings.openrouter_base_url,
+                api_key=settings.openrouter_api_key,
+                timeout=30.0,
+            )
+            tools_schema = _agent_tools_openai_format()
 
             # ── Multi-turn agentic loop ───────────────────────────────────────
             MAX_AGENT_TURNS = 8
-            messages_list = list(history)  # mutable copy; history already has user message appended
+            messages_list = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + list(history)
             loop_count = 0
             final_reply_parts: list[str] = []
             _t_plan_start = time.time()
@@ -551,14 +555,18 @@ async def agent_chat(request: Request):
             while loop_count < MAX_AGENT_TURNS:
                 loop_count += 1
 
-                response = await client.messages.create(
-                    model=resolved_model,
+                # Stop mid-generation: client disconnect (Stop button on the
+                # dashboard aborts its fetch) breaks the loop before the next
+                # OpenRouter call or tool dispatch.
+                if await request.is_disconnected():
+                    return
+
+                response = await client.chat.completions.create(
+                    model=settings.openrouter_planner_model,
                     max_tokens=1024,
-                    system=AGENT_SYSTEM_PROMPT,
-                    tools=AGENT_TOOLS,
                     messages=messages_list,
+                    tools=tools_schema,
                     temperature=0.1,
-                    timeout=30.0,
                 )
 
                 if loop_count == 1:
@@ -572,88 +580,103 @@ async def agent_chat(request: Request):
                         model_key=model_key,
                     )
 
-                # Collect tool results to feed back for next turn
-                tool_results: list[dict] = []
+                choice = response.choices[0]
+                reply_msg = choice.message
+                tool_calls = reply_msg.tool_calls or []
 
-                for block in response.content:
-                    if block.type == "text" and block.text.strip():
-                        final_reply_parts.append(block.text)
-                        yield _sse_event("reply", {"text": block.text})
+                if reply_msg.content and reply_msg.content.strip():
+                    final_reply_parts.append(reply_msg.content)
+                    yield _sse_event("reply", {"text": reply_msg.content})
 
-                    elif block.type == "tool_use":
-                        tool_name = block.name
-                        tool_input = block.input if isinstance(block.input, dict) else {}
+                if not tool_calls:
+                    break  # No more tool calls — final turn
 
-                        if tool_name == "capture_now":
-                            pipeline_reply = ""
-                            async for ev in _capture_pipeline(
-                                tool_input, model_key,
-                                bench_task_id=_bench_task_id, bench_run_id=_bench_run_id,
-                            ):
-                                yield ev
-                                if '"event": "reply"' in ev:
-                                    try:
-                                        ev_data = json.loads(ev.split("data: ", 1)[1].strip())
-                                        pipeline_reply = ev_data.get("text", "")
-                                    except Exception as _e:
-                                        print(f"[WARN] SSE reply-parse error: {_e}")
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": pipeline_reply or "Capture pipeline completed.",
-                            })
+                messages_list.append({
+                    "role": "assistant",
+                    "content": reply_msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                })
 
-                        elif tool_name == "capture_sequence":
-                            pipeline_reply = ""
-                            async for ev in _capture_sequence_pipeline(
-                                tool_input,
-                                bench_run_id=_bench_run_id,
-                                model_key=model_key,
-                            ):
-                                yield ev
-                                if '"event": "reply"' in ev:
-                                    try:
-                                        ev_data = json.loads(ev.split("data: ", 1)[1].strip())
-                                        pipeline_reply = ev_data.get("text", "")
-                                    except Exception as _e:
-                                        print(f"[WARN] SSE reply-parse error: {_e}")
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": pipeline_reply or "Sequence pipeline completed.",
-                            })
+                for tc in tool_calls:
+                    if await request.is_disconnected():
+                        return
 
-                        else:
-                            yield _sse_event("tool_call", {
-                                "id": block.id,
-                                "label": _tool_label(tool_name, tool_input),
-                            })
+                    tool_name = tc.function.name
+                    try:
+                        tool_input = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except (json.JSONDecodeError, TypeError):
+                        tool_input = {}
+                    if not isinstance(tool_input, dict):
+                        tool_input = {}
 
-                            result = await _execute_tool(tool_name, tool_input, session_id, model_key=model_key)
+                    if tool_name == "capture_now":
+                        pipeline_reply = ""
+                        async for ev in _capture_pipeline(
+                            tool_input, model_key,
+                            bench_task_id=_bench_task_id, bench_run_id=_bench_run_id,
+                        ):
+                            yield ev
+                            if '"event": "reply"' in ev:
+                                try:
+                                    ev_data = json.loads(ev.split("data: ", 1)[1].strip())
+                                    pipeline_reply = ev_data.get("text", "")
+                                except Exception as _e:
+                                    print(f"[WARN] SSE reply-parse error: {_e}")
+                        messages_list.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": pipeline_reply or "Capture pipeline completed.",
+                        })
 
-                            yield _sse_event("tool_result", {
-                                "id": block.id,
-                                "success": result["success"],
-                                "summary": result["summary"],
-                            })
+                    elif tool_name == "capture_sequence":
+                        pipeline_reply = ""
+                        async for ev in _capture_sequence_pipeline(
+                            tool_input,
+                            bench_run_id=_bench_run_id,
+                            model_key=model_key,
+                        ):
+                            yield ev
+                            if '"event": "reply"' in ev:
+                                try:
+                                    ev_data = json.loads(ev.split("data: ", 1)[1].strip())
+                                    pipeline_reply = ev_data.get("text", "")
+                                except Exception as _e:
+                                    print(f"[WARN] SSE reply-parse error: {_e}")
+                        messages_list.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": pipeline_reply or "Sequence pipeline completed.",
+                        })
 
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": json.dumps(result),
-                            })
+                    else:
+                        yield _sse_event("tool_call", {
+                            "id": tc.id,
+                            "label": _tool_label(tool_name, tool_input),
+                        })
 
-                # ── Loop control ──────────────────────────────────────────────
-                if response.stop_reason == "end_turn":
-                    break
+                        result = await _execute_tool(tool_name, tool_input, session_id, model_key=model_key)
 
-                if response.stop_reason == "tool_use" and tool_results:
-                    # Feed tool results back — Claude will reason about them next turn
-                    messages_list.append({"role": "assistant", "content": response.content})
-                    messages_list.append({"role": "user", "content": tool_results})
-                    # Continue loop
-                else:
-                    break  # Unexpected stop_reason — exit safely
+                        yield _sse_event("tool_result", {
+                            "id": tc.id,
+                            "success": result["success"],
+                            "summary": result["summary"],
+                        })
+
+                        messages_list.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(result),
+                        })
 
             # ── Persist final reply (only once, after loop completes) ─────────
             full_reply = "\n\n".join(p for p in final_reply_parts if p)
@@ -662,8 +685,6 @@ async def agent_chat(request: Request):
 
             yield _sse_event("done", {})
 
-        except anthropic.APIError as e:
-            yield _sse_event("error", {"text": f"Claude API error: {e.message}"})
         except Exception as e:
             yield _sse_event("error", {"text": str(e)})
 
@@ -810,7 +831,7 @@ async def _capture_pipeline(
             _analysis_error = f"{type(exc).__name__}: {exc}"
             analysis_result = {
                 "findings": f"Analysis error: {_analysis_error}",
-                "recommendation": "Check AI backend configuration (ANTHROPIC_API_KEY, GEMINI_API_KEY, or vLLM).",
+                "recommendation": "Check AI backend configuration (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or vLLM).",
                 "description": "",
                 "model_used": model_key,
                 "inference_time_ms": 0,
@@ -1096,7 +1117,11 @@ async def _tool_create_schedule(inp: dict) -> dict:
     from app.scheduler.service import create_schedule, activate_schedule, list_schedules
 
     prompt = inp.get("prompt", "")
-    model_key = "claude-sonnet" if settings.anthropic_api_key else "qwen3-vl"
+    model_key = (
+        "openrouter" if settings.openrouter_api_key
+        else "claude-sonnet" if settings.anthropic_api_key
+        else "qwen3-vl"
+    )
 
     # Enrich prompt with current time so the planner avoids past times
     now = datetime.now()
@@ -1260,7 +1285,11 @@ async def _tool_modify_schedule(inp: dict) -> dict:
         f"Current time: {now.strftime('%H:%M')} on {now.strftime('%Y-%m-%d')}. "
         f"Request: {prompt}"
     )
-    model_key = "claude-sonnet" if settings.anthropic_api_key else "qwen3-vl"
+    model_key = (
+        "openrouter" if settings.openrouter_api_key
+        else "claude-sonnet" if settings.anthropic_api_key
+        else "qwen3-vl"
+    )
     try:
         plan = await generate_plan(enriched_prompt, model_key)
     except Exception as e:
@@ -1479,14 +1508,9 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
             "detail": "No image analyses found. Capture some images first.",
         }
 
-    # Build a synthesis using Claude
-    if settings.anthropic_api_key:
-        CLAUDE_MODEL_MAP = {
-            "claude-haiku": settings.claude_haiku_model,
-            "claude-sonnet": settings.claude_sonnet_model,
-        }
-        resolved_synthesis_model = CLAUDE_MODEL_MAP.get(model_key) or settings.claude_haiku_model
-
+    # Build a synthesis — OpenRouter (production default) preferred, Claude
+    # kept for benchmark/manual model_key selection, plain aggregation last.
+    if settings.openrouter_api_key or settings.anthropic_api_key:
         entries = []
         for a in reversed(analyses):  # chronological order
             entries.append(
@@ -1507,14 +1531,34 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
             "Be concise and specific."
         )
 
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        response = await client.messages.create(
-            model=resolved_synthesis_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": synthesis_prompt}],
-            temperature=0.2,
-        )
-        synthesis = response.content[0].text
+        if settings.openrouter_api_key:
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(
+                base_url=settings.openrouter_base_url,
+                api_key=settings.openrouter_api_key,
+            )
+            response = await client.chat.completions.create(
+                model=settings.openrouter_planner_model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": synthesis_prompt}],
+                temperature=0.2,
+            )
+            synthesis = response.choices[0].message.content
+        else:
+            CLAUDE_MODEL_MAP = {
+                "claude-haiku": settings.claude_haiku_model,
+                "claude-sonnet": settings.claude_sonnet_model,
+            }
+            resolved_synthesis_model = CLAUDE_MODEL_MAP.get(model_key) or settings.claude_haiku_model
+            client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            response = await client.messages.create(
+                model=resolved_synthesis_model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": synthesis_prompt}],
+                temperature=0.2,
+            )
+            synthesis = response.content[0].text
     else:
         # Fallback: simple aggregation
         synthesis = "**Observations:**\n\n"
@@ -1610,21 +1654,64 @@ async def _tool_delete_image(inp: dict) -> dict:
 
 # ── Fallback: rule-based dispatch when no API key ────────
 
+def _fallback_model_key() -> str:
+    """Best available analysis backend when the chat planner itself is
+    degraded (no openrouter_api_key). Mirrors the resolution used elsewhere
+    in this file (agent_chat's schedule-planning call sites)."""
+    if settings.openrouter_api_key:
+        return "openrouter"
+    if settings.anthropic_api_key:
+        return "claude-sonnet"
+    return "qwen3-vl"
+
+
 async def _fallback_dispatch(message: str, session_id: str):
-    """Simple keyword matching when Claude API is not available."""
+    """Simple keyword matching when no chat-planning model is configured.
+
+    Capture intents route through _capture_pipeline/_capture_sequence_pipeline
+    (not the bare _tool_capture_now/_tool_capture_sequence helpers) so images
+    still stream back to the dashboard as inline thumbnails — see the
+    2026-08-19 fix: _tool_capture_now fires the MQTT command and returns
+    immediately with no image_url, which is why captures triggered via chat
+    never appeared in the UI even though they physically uploaded fine.
+    """
     msg = message.lower()
 
-    if any(w in msg for w in ["take a picture", "capture now", "snap", "photo now"]):
-        result = await _tool_capture_now()
-    elif any(w in msg for w in ["burst", "sequence", "multiple", "several pictures"]):
-        count = 3
-        for m in re.findall(r"(\d+)", message):
-            count = int(m)
-            break
-        result = await _tool_capture_sequence({"count": count, "interval_ms": 2000})
-    elif any(w in msg for w in ["what do you see", "what does", "look at", "check on", "what's there"]):
-        result = await _tool_capture_now()
-    elif any(w in msg for w in ["analyze", "latest image", "last capture", "previous analysis", "last analysis"]):
+    is_single_capture = any(
+        w in msg for w in [
+            "take a picture", "capture now", "snap", "photo now",
+            "what do you see", "what does", "look at", "check on", "what's there",
+        ]
+    )
+    is_sequence_capture = any(
+        w in msg for w in ["burst", "sequence", "multiple", "several pictures"]
+    )
+
+    if is_single_capture or is_sequence_capture:
+        model_key = _fallback_model_key()
+        bench_run_id = _timing.new_run_id()
+        bench_task_id = next_task_id()
+
+        if is_sequence_capture:
+            count = 3
+            for m in re.findall(r"(\d+)", message):
+                count = int(m)
+                break
+            async for ev in _capture_sequence_pipeline(
+                {"count": count, "interval_ms": 2000},
+                bench_run_id=bench_run_id,
+                model_key=model_key,
+            ):
+                yield ev
+        else:
+            async for ev in _capture_pipeline(
+                {}, model_key,
+                bench_task_id=bench_task_id, bench_run_id=bench_run_id,
+            ):
+                yield ev
+        return
+
+    if any(w in msg for w in ["analyze", "latest image", "last capture", "previous analysis", "last analysis"]):
         result = await _tool_analyze_latest()
     elif any(w in msg for w in ["ping", "alive", "responsive"]):
         result = await _tool_ping()

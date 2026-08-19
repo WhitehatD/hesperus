@@ -20,6 +20,7 @@
 #include "firmware_config.h"
 #include "debug_log.h"
 #include "main.h"
+#include "ota_update.h"  /* Firmware_CRC32 — shared with the chunked upload finalizer */
 
 #include "mx_wifi.h"
 #include "mx_wifi_io.h"
@@ -42,8 +43,23 @@ static volatile uint8_t s_initialized  = 0;
 #define HTTP_HEADER_MAX  512
 static char s_http_header[HTTP_HEADER_MAX];
 
-/* MIME boundary for multipart upload */
-#define MULTIPART_BOUNDARY  "----ThesisIoTBoundary2026"
+/* ── Resumable chunked upload tuning ──────────────────────────────────────
+ * 2026-08-19: replaced the old single-POST multipart upload. A 614KB frame
+ * over a lossy 4G uplink loses the WHOLE transfer to one bad packet with no
+ * way to resume. Splitting into independent chunks bounds that to one
+ * chunk, not the whole frame — see the design note above WiFi_HttpPostImage.
+ *
+ * 32KB chunk size + a fresh TCP connection per chunk, per the empirical
+ * finding that the EMW3080's own MIPC layer already fragments every
+ * Socket_send() to <=2482 bytes internally regardless of what we pass
+ * (mx_wifi.c:1465, MX_WIFI_IPC_PAYLOAD_SIZE-12) — so app-level chunk size
+ * only controls blast radius on failure, not wire behavior. A fresh
+ * connection per chunk means a chunk that hit the module's internal
+ * timeout-then-recover state isn't reused in a state we can't verify. */
+#define UPLOAD_CHUNK_WIRE_SIZE       32768u
+#define UPLOAD_CHUNK_MAX_RETRIES     8
+#define UPLOAD_CHUNK_RETRY_BASE_MS   500
+#define UPLOAD_CHUNK_RETRY_MAX_MS    8000
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Initialization
@@ -380,21 +396,83 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
 }
 
 /**
- * Build and send an HTTP POST multipart/form-data request containing
- * the captured image to the FastAPI server's /api/upload endpoint.
+ * @brief  Parse the HTTP status code from a raw response buffer's status
+ *         line ("HTTP/1.1 200 OK..." → 200). Shared by every response
+ *         parser in this file (was previously duplicated inline).
+ * @retval Status code, or 0 if the line couldn't be parsed.
+ */
+static int _parse_http_status(const uint8_t *resp_buf)
+{
+    int http_code = 0;
+    const char *space = strchr((const char *)resp_buf, ' ');
+    if (space != NULL)
+    {
+        char *endptr = NULL;
+        long parsed = strtol(space + 1, &endptr, 10);
+        if (endptr != space + 1 && parsed >= 100 && parsed <= 599)
+            http_code = (int)parsed;
+    }
+    return http_code;
+}
+
+/**
+ * @brief  Locate the JSON body within a raw HTTP response, skipping past
+ *         headers exactly the way the time-sync parser already does
+ *         (uvicorn may add chunked-transfer-encoding size lines before the
+ *         actual JSON — skip to \r\n\r\n, then find the first '{').
+ * @retval Pointer to the opening '{', or NULL if none found.
+ */
+static const char *_find_json_body(const uint8_t *resp_buf)
+{
+    const char *hdr_end = strstr((const char *)resp_buf, "\r\n\r\n");
+    if (hdr_end == NULL)
+        return NULL;
+    return strchr(hdr_end + 4, '{');
+}
+
+/**
+ * Resumable chunked image upload to the FastAPI server.
  *
- * Wire format:
- *   POST /api/upload?task_id=N HTTP/1.1\r\n
+ * 2026-08-19: replaced the old single-POST multipart upload. Packet capture
+ * during a real 4G-hotspot failure showed the board's TCP stack recovering
+ * from a single lost packet in ~10.1s — longer than the previous 8s
+ * per-send timeout, so genuine (if slow) recovery was misreported as
+ * failure. Even with that timeout fixed (HTTP_RESPONSE_TIMEOUT_MS), one
+ * monolithic 614KB POST still threw away ALL progress on any connection
+ * that couldn't be salvaged and restarted from byte 0 into the same
+ * conditions — on a sustained-loss link that never converges.
+ *
+ * This sends the image as independent ~32KB chunks (UPLOAD_CHUNK_WIRE_SIZE),
+ * each its own short-lived POST to /api/upload/chunk carrying its byte
+ * offset — see server/app/api/routes.py's matching endpoint. A stalled
+ * connection costs one chunk, not the whole frame: on failure we retry
+ * the SAME chunk (never advancing offset) with exponential backoff, over a
+ * FRESH TCP connection each attempt (a wedged EMW3080 socket's internal
+ * state after a timeout is not something we trust to reuse — see the
+ * per-send MIPC fragmentation note above UPLOAD_CHUNK_WIRE_SIZE).
+ *
+ * Wire format per chunk (raw bytes, no multipart — the server addresses
+ * chunks by byte offset, so there's nothing multipart framing would add):
+ *   POST /api/upload/chunk?task_id=N&offset=O&total_size=T HTTP/1.1\r\n
  *   Host: <server>\r\n
- *   Content-Type: multipart/form-data; boundary=<boundary>\r\n
- *   Content-Length: <total>\r\n
+ *   X-Upload-Token: <token>\r\n
+ *   Content-Type: application/octet-stream\r\n
+ *   Content-Length: <chunk_len>\r\n
+ *   Connection: close\r\n
  *   \r\n
- *   --<boundary>\r\n
- *   Content-Disposition: form-data; name="file"; filename="capture.jpg"\r\n
- *   Content-Type: image/jpeg\r\n
- *   \r\n
- *   <binary image data>\r\n
- *   --<boundary>--\r\n
+ *   <raw chunk bytes>
+ *
+ * The server responds with {"task_id":N,"received_offset":O2,"total_size":T}
+ * — we trust ITS reported offset (not just "the send succeeded") before
+ * advancing, and adopt its task_id (handles the fallback-ID remap that
+ * happens server-side for unprompted/button captures, exactly once, on the
+ * very first chunk — see /api/upload/chunk's docstring).
+ *
+ * After every chunk is confirmed, POST /api/upload/complete with a CRC32
+ * of the full buffer (Firmware_CRC32, the same MPEG-2 variant already used
+ * for OTA — one CRC convention, not two that could drift) so the server
+ * can catch a chunk landing at the wrong offset or a partial write before
+ * treating the frame as valid image data.
  */
 WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                                  const uint8_t *data, uint32_t data_len)
@@ -414,157 +492,247 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         return WIFI_ERROR_SEND;
     }
 
-    /* ── Enterprise: retry loop around the full POST sequence ── */
-    WiFiStatus_t final_status = WIFI_ERROR_SEND;
-    uint32_t retry_delay = HTTP_UPLOAD_RETRY_DELAY_MS;
+    LOG_INFO(TAG_HTTP, "Chunked upload starting: %lu bytes, task %lu",
+             (unsigned long)data_len, (unsigned long)task_id);
 
-    for (int attempt = 0; attempt <= HTTP_UPLOAD_MAX_RETRIES; attempt++)
+    uint32_t resolved_task_id = task_id;
+    uint32_t offset = 0;
+    uint32_t consecutive_failures = 0;
+    uint32_t backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+
+    /* ── Phase 1: send every chunk, resuming from the server's confirmed
+     *            offset on any failure rather than restarting from 0 ── */
+    while (offset < data_len)
     {
-        if (attempt > 0)
-        {
-            LOG_WARN(TAG_HTTP, "Retry %d/%d after %lums...",
-                     attempt, HTTP_UPLOAD_MAX_RETRIES,
-                     (unsigned long)retry_delay);
-            HAL_Delay(retry_delay);
-            retry_delay *= 2;  /* Exponential backoff */
-        }
-
-        LOG_INFO(TAG_HTTP, "Uploading image (%lu bytes) for task %u (attempt %d)...",
-                 (unsigned long)data_len, task_id, attempt + 1);
-
-        /* ── 1. Build multipart body parts ──────────────────── */
-
-        char part_header[256];
-        int part_header_len = snprintf(part_header, sizeof(part_header),
-            "--%s\r\n"
-            "Content-Disposition: form-data; name=\"file\"; filename=\"capture_%lu.jpg\"\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "\r\n",
-            MULTIPART_BOUNDARY, (unsigned long)task_id);
-
-        char part_footer[64];
-        int part_footer_len = snprintf(part_footer, sizeof(part_footer),
-            "\r\n--%s--\r\n", MULTIPART_BOUNDARY);
-
-        uint32_t body_length = (uint32_t)part_header_len + data_len + (uint32_t)part_footer_len;
-
-        /* ── 2. Build HTTP request header ───────────────────── */
+#if WATCHDOG_ENABLED
+        IWDG->KR = 0x0000AAAAu;
+#endif
+        uint32_t remaining = data_len - offset;
+        uint32_t chunk_len = (remaining < UPLOAD_CHUNK_WIRE_SIZE) ? remaining : UPLOAD_CHUNK_WIRE_SIZE;
 
         int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
-            "POST %s?task_id=%lu HTTP/1.1\r\n"
+            "POST %s/chunk?task_id=%lu&offset=%lu&total_size=%lu HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
             "X-Upload-Token: %s\r\n"
-            "Content-Type: multipart/form-data; boundary=%s\r\n"
+            "Content-Type: application/octet-stream\r\n"
             "Content-Length: %lu\r\n"
             "Connection: close\r\n"
             "\r\n",
-            SERVER_UPLOAD_PATH, (unsigned long)task_id,
-            SERVER_HOST, SERVER_PORT,
-            FIRMWARE_UPLOAD_TOKEN,
-            MULTIPART_BOUNDARY,
-            (unsigned long)body_length);
+            SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id, (unsigned long)offset,
+            (unsigned long)data_len, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN,
+            (unsigned long)chunk_len);
 
-        /* ── 3. Open TCP socket ─────────────────────────────── */
+        bool chunk_ok = false;
+        uint32_t confirmed_offset = offset;
+        uint32_t confirmed_task_id = resolved_task_id;
+        bool restart_from_zero = false;
 
         int32_t sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
         if (sock < 0)
         {
-            LOG_ERROR(TAG_HTTP, "Socket connect to %s:%d failed",
-                      SERVER_HOST, SERVER_PORT);
-            continue;  /* Retry */
+            LOG_WARN(TAG_HTTP, "Chunk connect failed at offset %lu/%lu",
+                     (unsigned long)offset, (unsigned long)data_len);
         }
-
-        LOG_DEBUG(TAG_HTTP, "TCP connected to %s:%d", SERVER_HOST, SERVER_PORT);
-
-        /* ── 4. Send data: header → part_header → image → footer ── */
-
-        WiFiStatus_t status = WIFI_OK;
-
-        if (_socket_send_all(sock, (uint8_t *)s_http_header, header_len) != 0)
+        else
         {
-            LOG_ERROR(TAG_HTTP, "Failed to send HTTP header");
-            status = WIFI_ERROR_SEND;
-        }
+            WiFiStatus_t send_status = WIFI_OK;
+            if (_socket_send_all(sock, (uint8_t *)s_http_header, header_len) != 0)
+                send_status = WIFI_ERROR_SEND;
+            if (send_status == WIFI_OK &&
+                _socket_send_all(sock, data + offset, (int32_t)chunk_len) != 0)
+                send_status = WIFI_ERROR_SEND;
 
-        if (status == WIFI_OK &&
-            _socket_send_all(sock, (uint8_t *)part_header, part_header_len) != 0)
-        {
-            LOG_ERROR(TAG_HTTP, "Failed to send part header");
-            status = WIFI_ERROR_SEND;
-        }
-
-        if (status == WIFI_OK &&
-            _socket_send_all(sock, data, (int32_t)data_len) != 0)
-        {
-            LOG_ERROR(TAG_HTTP, "Failed to send image data");
-            status = WIFI_ERROR_SEND;
-        }
-
-        if (status == WIFI_OK &&
-            _socket_send_all(sock, (uint8_t *)part_footer, part_footer_len) != 0)
-        {
-            LOG_ERROR(TAG_HTTP, "Failed to send part footer");
-            status = WIFI_ERROR_SEND;
-        }
-
-        /* ── 5. Read response ──────────────────────────────── */
-
-        if (status == WIFI_OK)
-        {
-            uint8_t resp_buf[256] = {0};
-            int32_t resp_len = MX_WIFI_Socket_recv(
-                wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
-
-            if (resp_len > 0)
+            if (send_status == WIFI_OK)
             {
-                resp_buf[resp_len] = '\0';
-                int http_code = 0;
-                const char *space = strchr((char *)resp_buf, ' ');
-                if (space != NULL)
-                {
-                    char *endptr = NULL;
-                    long parsed = strtol(space + 1, &endptr, 10);
-                    if (endptr != space + 1 && parsed >= 100 && parsed <= 599)
-                        http_code = (int)parsed;
-                }
+                uint8_t resp_buf[768] = {0};
+                int32_t resp_len = MX_WIFI_Socket_recv(
+                    wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
 
-                if (http_code >= 200 && http_code < 300)
+                if (resp_len > 0)
                 {
-                    LOG_INFO(TAG_HTTP, "Upload successful (HTTP %d)", http_code);
+                    resp_buf[resp_len] = '\0';
+                    int http_code = _parse_http_status(resp_buf);
+
+                    if (http_code >= 200 && http_code < 300)
+                    {
+                        const char *body = _find_json_body(resp_buf);
+                        if (body != NULL)
+                        {
+                            json_mem_reset();
+                            cJSON *root = cJSON_Parse(body);
+                            if (root != NULL)
+                            {
+                                cJSON *j_tid = cJSON_GetObjectItem(root, "task_id");
+                                cJSON *j_off = cJSON_GetObjectItem(root, "received_offset");
+                                if (cJSON_IsNumber(j_tid))
+                                    confirmed_task_id = (uint32_t)j_tid->valuedouble;
+                                if (cJSON_IsNumber(j_off))
+                                {
+                                    confirmed_offset = (uint32_t)j_off->valuedouble;
+                                    chunk_ok = true;
+                                }
+                                cJSON_Delete(root);
+                            }
+                        }
+                    }
+                    else if (http_code == 409)
+                    {
+                        /* Server has no record of this upload (restarted
+                         * since, or its stale-upload sweep already claimed
+                         * it) — nothing to resume, start a fresh session
+                         * under the same task_id from byte 0. */
+                        LOG_WARN(TAG_HTTP, "Server lost upload state (409) — restarting from offset 0");
+                        restart_from_zero = true;
+                    }
+                    else
+                    {
+                        LOG_WARN(TAG_HTTP, "Chunk POST returned HTTP %d", http_code);
+                    }
                 }
                 else
                 {
-                    LOG_WARN(TAG_HTTP, "Server returned HTTP %d: %.80s",
-                             http_code, (char *)resp_buf);
+                    LOG_WARN(TAG_HTTP, "No response to chunk at offset %lu (timeout or closed)",
+                             (unsigned long)offset);
+                }
+            }
+
+            MX_WIFI_Socket_close(wifi_obj_get(), sock);
+        }
+
+        if (restart_from_zero)
+        {
+            offset = 0;
+            consecutive_failures = 0;
+            backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+            continue;
+        }
+
+        if (chunk_ok && confirmed_offset > offset)
+        {
+            resolved_task_id = confirmed_task_id;
+            offset = confirmed_offset;
+            consecutive_failures = 0;
+            backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+            BSP_LED_Toggle(LED_GREEN);
+
+            /* Keep MQTT alive during a long upload — same reasoning as
+             * before: ProcessLoop's 1s recv timeout would stall chunk
+             * sends, so ping only, don't run the full loop here. */
+            MQTT_SendPing();
+            continue;
+        }
+
+        /* Chunk failed (connect, send, timeout, bad status, or a
+         * duplicate ack that didn't advance the offset) — back off and
+         * retry the SAME chunk. offset never advances on failure, so a
+         * retry re-sends exactly the bytes the server is still missing. */
+        consecutive_failures++;
+        if (consecutive_failures > UPLOAD_CHUNK_MAX_RETRIES)
+        {
+            LOG_ERROR(TAG_HTTP, "Chunk upload abandoned after %lu failures at offset %lu/%lu",
+                      (unsigned long)consecutive_failures, (unsigned long)offset,
+                      (unsigned long)data_len);
+            BSP_LED_Off(LED_GREEN);
+            return WIFI_ERROR_SEND;
+        }
+
+        LOG_WARN(TAG_HTTP, "Chunk retry %lu/%d after %lums (offset %lu/%lu)...",
+                 (unsigned long)consecutive_failures, UPLOAD_CHUNK_MAX_RETRIES,
+                 (unsigned long)backoff_ms, (unsigned long)offset, (unsigned long)data_len);
+        HAL_Delay(backoff_ms);
+        backoff_ms = (backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS) ? UPLOAD_CHUNK_RETRY_MAX_MS : backoff_ms * 2;
+        MQTT_SendPing();
+    }
+
+    /* ── Phase 2: every chunk confirmed by the server — finalize with a
+     *            whole-payload CRC32 so it can catch a chunk landing at
+     *            the wrong offset before treating the frame as valid ── */
+    uint32_t crc = Firmware_CRC32(0xFFFFFFFF, data, data_len);
+    uint32_t complete_failures = 0;
+    uint32_t complete_backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+
+    for (;;)
+    {
+#if WATCHDOG_ENABLED
+        IWDG->KR = 0x0000AAAAu;
+#endif
+        int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
+            "POST %s/complete?task_id=%lu&total_size=%lu&crc32=%lu HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "X-Upload-Token: %s\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id, (unsigned long)data_len,
+            (unsigned long)crc, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
+
+        bool done_ok = false;
+        int32_t sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+        if (sock >= 0)
+        {
+            if (_socket_send_all(sock, (uint8_t *)s_http_header, header_len) == 0)
+            {
+                uint8_t resp_buf[512] = {0};
+                int32_t resp_len = MX_WIFI_Socket_recv(
+                    wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                if (resp_len > 0)
+                {
+                    resp_buf[resp_len] = '\0';
+                    int http_code = _parse_http_status(resp_buf);
+                    if (http_code >= 200 && http_code < 300)
+                    {
+                        done_ok = true;
+                    }
+                    else
+                    {
+                        LOG_WARN(TAG_HTTP, "Upload complete returned HTTP %d: %.80s",
+                                 http_code, (char *)resp_buf);
+                    }
+                }
+                else
+                {
+                    LOG_WARN(TAG_HTTP, "No response to /complete (timeout or closed)");
                 }
             }
             else
             {
-                LOG_WARN(TAG_HTTP, "No response from server (timeout or closed)");
+                LOG_WARN(TAG_HTTP, "Failed to send /complete request");
             }
+            MX_WIFI_Socket_close(wifi_obj_get(), sock);
+        }
+        else
+        {
+            LOG_WARN(TAG_HTTP, "Connect failed for /complete");
         }
 
-        MX_WIFI_Socket_close(wifi_obj_get(), sock);
-
-        if (status == WIFI_OK)
+        if (done_ok)
         {
-            /* ── PERF: Log upload throughput ── */
             uint32_t upload_ms = HAL_GetTick() - upload_start_tick;
             uint32_t kbps = (upload_ms > 0) ? (data_len / upload_ms) : 0;
-            (void)kbps;
-            LOG_INFO(TAG_HTTP, "[PERF] Upload: %lu bytes in %lums (%lu KB/s)",
+            LOG_INFO(TAG_HTTP, "[PERF] Chunked upload: %lu bytes in %lums (%lu KB/s), task %lu",
                      (unsigned long)data_len, (unsigned long)upload_ms,
-                     (unsigned long)kbps);
-
-            final_status = WIFI_OK;
-            break;  /* Success — no more retries */
+                     (unsigned long)kbps, (unsigned long)resolved_task_id);
+            BSP_LED_Off(LED_GREEN);
+            return WIFI_OK;
         }
 
-        /* Send failed — will retry if attempts remain */
+        complete_failures++;
+        if (complete_failures > UPLOAD_CHUNK_MAX_RETRIES)
+        {
+            /* Every byte IS on the server at this point — only the final
+             * ack was lost. Report failure so the caller's own retry logic
+             * runs, but this is a much narrower failure mode than losing
+             * the whole frame: a retried /complete against already-
+             * up-to-date sidecar state just re-validates and re-processes. */
+            LOG_ERROR(TAG_HTTP, "Upload /complete failed %lu times — bytes are on the server "
+                      "but finalization was never confirmed", (unsigned long)complete_failures);
+            BSP_LED_Off(LED_GREEN);
+            return WIFI_ERROR_SEND;
+        }
+        HAL_Delay(complete_backoff_ms);
+        complete_backoff_ms = (complete_backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS)
+                              ? UPLOAD_CHUNK_RETRY_MAX_MS : complete_backoff_ms * 2;
     }
-
-    BSP_LED_Off(LED_GREEN);
-    return final_status;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

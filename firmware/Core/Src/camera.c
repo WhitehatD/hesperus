@@ -243,20 +243,72 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
      */
     uint8_t val;
 
-    /* 1. Raise AEC Gain Ceiling to maximum 64x (default was 15.5x) */
-    val = 0x03;
+    /* ── 0. ENABLE BINNING — the single biggest image-quality win ────────
+     *
+     * ST's BSP common table (Drivers/BSP/Components/ov5640/ov5640.c:180-183)
+     * programs:
+     *     0x3814 X_INC = 0x31   → 2:1 horizontal subsample
+     *     0x3815 Y_INC = 0x31   → 2:1 vertical subsample
+     *     0x3820 TC_REG20 = 0x06  → bit[0] vertical binning   = 0 (OFF)
+     *     0x3821 TC_REG21 = 0x00  → bit[0] horizontal binning = 0 (OFF)
+     *
+     * Per the OV5640 datasheet: "When the binning function is ON, voltage
+     * levels of adjacent pixels are averaged before being sent to the ADC.
+     * If the binning function is OFF, the pixels which are not output are
+     * merely skipped."
+     *
+     * So with 2:1 subsampling and binning OFF we were SKIPPING — discarding
+     * 3 of every 4 photons and point-sampling a sparse grid with no
+     * anti-alias prefilter. Result: aliasing/moiré, false colour, and ~half
+     * the SNR the sensor is capable of. ST's OV5640_SetResolution() only
+     * writes 0x3808-0x380B (output size) and never touches these, so the
+     * defect is invisible from the BSP API — it must be overridden here.
+     *
+     * Enabling binning averages the 2x2 pixel groups instead. Because
+     * 0x3814/0x3815 are left unchanged, the ISP input pixel count, HTS, VTS
+     * and PCLK are all identical — only the analog combining changes. This
+     * is timing-neutral and costs zero extra bytes on the wire.
+     *
+     * NOTE: 0x3820 keeps ST's existing bit[1] (vflip) so orientation is
+     * unchanged; we only OR in bit[0]. For 0x3821 we set bit[0] ONLY —
+     * Linux's 0x07 would also set bits[2:1] which enable mirror. */
+    val = 0x07;  /* 0x06 | bit0 — vertical binning ON, orientation preserved */
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3820, &val, 1);
+    val = 0x01;  /* bit0 only — horizontal binning ON, no mirror */
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3821, &val, 1);
+
+    /* 1. AEC Gain Ceiling — 4x, NOT 64x.
+     *
+     * Previously 0x3A18/0x3A19 = 0x03/0xFF = a 64x gain ceiling. For a
+     * STATIC monitoring scene that's actively harmful: the AEC loop raises
+     * exposure toward max_expo FIRST and only reaches for gain once that's
+     * maxed, so a high ceiling just licenses the ISP to multiply noise.
+     * Analog gain is pure noise amplification; a static scene can afford
+     * long exposure instead, which is nearly free.
+     *
+     * With VTS=0x07D0 (83ms base) and night mode extending 4x (~333ms), a
+     * 4x gain ceiling is ample. Raise to 0x78 (7.5x) only if real scenes
+     * come out underexposed. (Linux's general-purpose VGA default is
+     * 0x3A19=0xF8 = 15.5x — still 4x below what we had.) */
+    val = 0x00;
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A18, &val, 1);
-    val = 0xFF;
+    val = 0x40;  /* 0x040/16 = 4x ceiling (was 0xFF = 64x) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A19, &val, 1);
 
-    /* 2. Raise AEC target brightness registers */
-    val = 0x78;  /* Stable-in high (default 0x30) */
+    /* 2. AEC target brightness — narrowed stable band.
+     *
+     * Previous values (0x78/0x68/0xD0/0x78) were aggressive vs OmniVision
+     * defaults (0x30/0x28/0x30/0x26), and the stable-out band was very wide
+     * (0x3A1B=0xD0 vs 0x3A1E=0x78) — AEC could settle far from target and
+     * stay there, giving inconsistent exposure across a monitoring series.
+     * Narrowed so it converges closer to target and holds it. */
+    val = 0x50;  /* Stable-in high (was 0x78) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A0F, &val, 1);
-    val = 0x68;  /* Stable-in low  (default 0x28) */
+    val = 0x40;  /* Stable-in low  (was 0x68) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A10, &val, 1);
-    val = 0xD0;  /* Fast-zone high (default 0x30) */
+    val = 0x58;  /* Stable-out high (was 0xD0) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A1B, &val, 1);
-    val = 0x78;  /* Fast-zone low  (default 0x26) */
+    val = 0x38;  /* Stable-out low  (was 0x78) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A1E, &val, 1);
     val = 0x80;  /* Max gain for stable range (default 0x60) */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A11, &val, 1);
@@ -298,8 +350,65 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
     val = 0x02;
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3824, &val, 1);
 
+    /* 8. Sharpen/denoise trim — optimize for genuine detail, not for a
+     *    punchy consumer look. ST's CIP block sharpens with thresholds
+     *    (0x5300=0x08, 0x5301=0x30, 0x5302=0x10, 0x5303=0x00) but ships NO
+     *    denoise override (0x5304-0x5307 sit at silicon defaults).
+     *
+     *    Oversharpening creates halo/ringing artifacts around edges that a
+     *    vision-LLM can misread as real texture or structure — the opposite
+     *    of what we want for scene analysis. Halve the sharpen offset and
+     *    add mild denoise (kept mild, not disabled: at a 4x gain ceiling
+     *    there's little noise to begin with, and killing denoise entirely
+     *    lets chroma speckle straight through the JPEG encode). */
+    val = 0x08;  /* Sharpen offset1 (was implicit default via CIP enable) */
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5302, &val, 1);
+    val = 0x00;
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5303, &val, 1);
+    val = 0x08;  /* Denoise threshold (mild) */
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5306, &val, 1);
+    val = 0x16;
+    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5307, &val, 1);
+
     /* ── Adaptive AEC convergence (replaces fixed 2s delay) ── */
     _wait_aec_converge();
+
+    /* 9. Lock AWB after convergence.
+     *
+     *    For a monitoring SERIES, frame-to-frame colour drift is worse than
+     *    a small constant colour error — it makes consecutive captures of
+     *    the same static scene look like different lighting to the VLM.
+     *    _wait_aec_converge() already waits for AEC (luma) to settle; AWB
+     *    needs longer (~10-20 frames from cold vs ~5-10 for AEC), so read
+     *    back the converged gains AFTER waiting and freeze them by writing
+     *    them back with the manual-AWB bit set. Read-modify-write (not a
+     *    fixed table) because correct gains are scene- and light-dependent
+     *    and there is no calibrated reference to hardcode. */
+    {
+        uint8_t awb_gain[6];
+        int32_t rd_ok = BSP_ERROR_NONE;
+        for (int i = 0; i < 6; i++)
+        {
+            if (BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, (uint16_t)(0x3400 + i),
+                                    &awb_gain[i], 1) != BSP_ERROR_NONE)
+            {
+                rd_ok = BSP_ERROR_COMPONENT_FAILURE;
+                break;
+            }
+        }
+        if (rd_ok == BSP_ERROR_NONE)
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, (uint16_t)(0x3400 + i),
+                                     &awb_gain[i], 1);
+            }
+            val = 0x01;  /* 0x3406 bit0 = manual AWB (use frozen gains above) */
+            BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3406, &val, 1);
+        }
+        /* If the read failed, leave AWB in auto mode rather than lock a
+         * garbage/partial gain set. */
+    }
 
 #if CAMERA_JPEG_MODE
     /* ── Enable OV5640 JPEG output + DCMI JPEG mode ──────────────────────

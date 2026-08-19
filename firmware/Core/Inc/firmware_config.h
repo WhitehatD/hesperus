@@ -41,7 +41,20 @@
 #define SERVER_UPLOAD_PATH          "/api/upload"
 #define SERVER_UPLOAD_URL           "http://" SERVER_HOST ":" "8000" SERVER_UPLOAD_PATH
 #define SERVER_TIME_PATH            "/api/time"
-#define HTTP_RESPONSE_TIMEOUT_MS   8000
+/* 2026-08-19: measured via tcpdump on the server during a live 4G-hotspot
+ * upload — a single lost packet took the EMW3080's onboard TCP stack 10.1s
+ * to recover (board resumed sending only after that gap; server had ACKed
+ * an earlier offset the whole time, no RST/FIN, healthy receive window).
+ * At the previous 8000ms this was misreported as a send FAILURE before the
+ * module's own retransmit had a chance to succeed — the transfer was
+ * actually recovering, we just weren't waiting long enough to see it.
+ * 12000ms clears the observed 10.1s recovery with margin, while staying
+ * safely under the 16s IWDG ceiling (WATCHDOG_TIMEOUT_S) since every send
+ * loop that uses this refreshes the watchdog per iteration. Do not raise
+ * this above ~14s without also raising WATCHDOG_TIMEOUT_S (max ~16s on
+ * IWDG/256) or a stalled first send could reset the board before its own
+ * timeout even fires. */
+#define HTTP_RESPONSE_TIMEOUT_MS   12000
 
 /* SEC-05: image-upload auth token, same pattern as SEC-01 (WiFi creds) —
  * inject at build time, never commit a real value. Empty = unauthenticated

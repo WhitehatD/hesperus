@@ -26,20 +26,34 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/thesis.db"
 
     # ── AI Backends ─────────────────────────────────────
-    # TODO(2026-08-18): migrating away from direct Anthropic/Gemini SDK calls
-    # to OpenRouter (one key, OpenAI-compatible API, provider-agnostic model
-    # routing) — decided during the infra-core redeploy. NOT done yet: this
-    # is a real code change (analysis/planning call sites), not just a config
-    # rename, and must not retroactively alter the frozen benchmark
-    # methodology already published in results/findings_v3.md (those numbers
-    # were measured against direct provider APIs — the historical record
-    # stays as-is; only the going-forward production system's wiring
-    # changes). anthropic_api_key/gemini_api_key below are kept for now so
-    # existing code keeps working; infra/rotate-secrets.sh no longer requires
-    # them to be set.
+    # OpenRouter is the PRODUCTION default as of 2026-08-19 (one key,
+    # OpenAI-compatible API, provider-agnostic model routing) — chat
+    # planning/tool-use, schedule generation, and image analysis all prefer
+    # it when openrouter_api_key is set. Hybrid routing: a cheap
+    # tools-capable model for chat/schedule planning (never sees images),
+    # a vision-capable model for image analysis — see planner/analysis
+    # model settings below. Does NOT alter the frozen benchmark methodology
+    # already published in results/findings_v3.md — those numbers were
+    # measured against direct provider APIs and are historical; the
+    # anthropic_api_key/gemini_api_key/vllm_* settings below stay in place
+    # for scripts/run_benchmark.py and manual model_key selection. Only the
+    # going-forward production system's default wiring changed.
     anthropic_api_key: str = ""
     claude_sonnet_model: str = "claude-sonnet-4-6"
     claude_haiku_model: str = "claude-haiku-4-5-20251001"
+
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Used for the chat tool-use loop + schedule generation — text-only in
+    # practice (this role never reasons about images), so the selection
+    # criterion is cost + tool-calling reliability, not vision capability.
+    # Cheapest tools-capable model on OpenRouter as of 2026-08-19 per live
+    # pricing check (it happens to also support vision, unused here).
+    openrouter_planner_model: str = "qwen/qwen3.7-flash"
+    # Vision model for image analysis. Same model family already benchmarked
+    # in results/findings_v3.md (self-hosted Qwen3-VL-30B-A3B) — known T1
+    # quality tier — via OpenRouter instead of the VPN-gated Ernis tunnel.
+    openrouter_analysis_model: str = "qwen/qwen3-vl-30b-a3b-instruct"
 
     # Alternate vision backends (thesis multi-backend benchmark)
     # Each open-weight model runs on its own llama-server instance — the

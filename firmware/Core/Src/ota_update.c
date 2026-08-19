@@ -60,9 +60,15 @@
  *  We use software CRC32 instead of the STM32 hardware CRC peripheral
  *  because the HW CRC uses a non-standard polynomial and would require
  *  the server to match it. Standard CRC32 is universally supported.
+ *
+ *  Exposed via ota_update.h (was file-local) so wifi.c's chunked image
+ *  upload can compute a payload CRC using the SAME algorithm the server's
+ *  _compute_crc32() (server/app/api/firmware_routes.py) already matches for
+ *  OTA — one CRC convention for the whole codebase instead of two
+ *  implementations that could silently drift apart.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static uint32_t _crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
+uint32_t Firmware_CRC32(uint32_t crc, const uint8_t *data, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++)
     {
@@ -814,7 +820,7 @@ OTAStatus_t OTA_DownloadAndFlash(const OTAVersionInfo_t *info,
              (unsigned long)total_downloaded);
 
     /* ── CRC32 verification on RAM buffer (before touching flash) ── */
-    uint32_t crc = _crc32_update(0xFFFFFFFF, ram_buffer, total_downloaded);
+    uint32_t crc = Firmware_CRC32(0xFFFFFFFF, ram_buffer, total_downloaded);
 
     if (info->crc32 != 0)
     {

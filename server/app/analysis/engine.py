@@ -80,6 +80,8 @@ async def analyze_image(
         result = await _analyze_with_vllm(image_path, objective, model_key)
     elif model_key == "gemini-3":
         result = await _analyze_with_gemini(image_path, objective)
+    elif model_key == "openrouter":
+        result = await _analyze_with_openrouter(image_path, objective)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -193,6 +195,51 @@ async def _analyze_with_vllm(
 
     response = await client.chat.completions.create(
         model=model_name,
+        messages=[
+            {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"Monitoring objective: {objective}",
+                    },
+                ],
+            },
+        ],
+        temperature=0.1,
+        max_tokens=1024,
+    )
+
+    parsed = _parse_analysis(response.choices[0].message.content)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        parsed["input_tokens"] = getattr(usage, "prompt_tokens", None)
+        parsed["output_tokens"] = getattr(usage, "completion_tokens", None)
+    return parsed
+
+
+async def _analyze_with_openrouter(image_path: str, objective: str) -> dict:
+    """Analyze image via OpenRouter (OpenAI-compatible API, single key,
+    provider-agnostic). Production default as of 2026-08-19 — see config.py
+    for the model choice rationale (hybrid routing: this uses
+    openrouter_analysis_model, a vision-capable model)."""
+    from openai import AsyncOpenAI
+
+    image_b64 = _load_image_b64(image_path)
+
+    client = AsyncOpenAI(
+        base_url=settings.openrouter_base_url,
+        api_key=settings.openrouter_api_key,
+        timeout=httpx.Timeout(60.0),
+    )
+
+    response = await client.chat.completions.create(
+        model=settings.openrouter_analysis_model,
         messages=[
             {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
             {

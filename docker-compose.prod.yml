@@ -64,6 +64,7 @@ services:
       - VLLM_BASE_URL=http://host.docker.internal:8001/v1
       - FIRMWARE_DIR=/app/data/firmware
       - FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - CLAUDE_SONNET_MODEL=${CLAUDE_SONNET_MODEL:-claude-sonnet-4-6}

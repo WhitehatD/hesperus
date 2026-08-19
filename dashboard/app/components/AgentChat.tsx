@@ -54,36 +54,16 @@ export default function AgentChat({
 	const [activeId, setActiveId] = useState<number | null>(null);
 	const [messages, setMessages] = useState<Message[]>([]);
 	const [input, setInput] = useState("");
-	const [selectedModel, setSelectedModel] = useState("claude-haiku");
-	const [availableModels, setAvailableModels] = useState<
-		{ key: string; label: string }[]
-	>([
-		{ key: "claude-haiku", label: "Haiku (fast)" },
-		{ key: "claude-sonnet", label: "Sonnet" },
-	]);
 	const [isStreaming, setIsStreaming] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const messagesEndRef = useRef<HTMLDivElement>(null);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const abortControllerRef = useRef<AbortController | null>(null);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: load sessions on mount and board change only
 	useEffect(() => {
 		fetchSessions();
 	}, [boardId]);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch available AI models once on mount
-	useEffect(() => {
-		fetch(`${apiBase}/api/agent/models`)
-			.then((r) => r.json())
-			.then((data: { key: string; label: string }[]) => {
-				if (Array.isArray(data) && data.length > 0) {
-					setAvailableModels(data);
-				}
-			})
-			.catch(() => {
-				/* keep defaults */
-			});
-	}, [apiBase]);
 
 	const fetchSessions = async () => {
 		try {
@@ -239,6 +219,9 @@ export default function AgentChat({
 	const sendMessage = async (msg: string, sessionId: number) => {
 		setIsStreaming(true);
 
+		const controller = new AbortController();
+		abortControllerRef.current = controller;
+
 		const userMsg: Message = { role: "user", text: msg, blocks: [] };
 		const botMsg: Message = {
 			role: "assistant",
@@ -254,8 +237,8 @@ export default function AgentChat({
 				body: JSON.stringify({
 					message: msg,
 					sessionId: sessionId,
-					model: selectedModel,
 				}),
+				signal: controller.signal,
 			});
 
 			if (!res.ok || !res.body) {
@@ -381,19 +364,22 @@ export default function AgentChat({
 				return updated;
 			});
 		} catch (err) {
+			const aborted = err instanceof DOMException && err.name === "AbortError";
 			setMessages((prev) => {
 				const updated = [...prev];
 				const bot = updated[updated.length - 1];
 				if (bot) {
 					updated[updated.length - 1] = {
 						...bot,
-						blocks: [
-							...bot.blocks,
-							{
-								type: "error",
-								text: `${err instanceof Error ? err.message : err}`,
-							},
-						],
+						blocks: aborted
+							? bot.blocks
+							: [
+									...bot.blocks,
+									{
+										type: "error",
+										text: `${err instanceof Error ? err.message : err}`,
+									},
+								],
 						streaming: false,
 					};
 				}
@@ -401,7 +387,12 @@ export default function AgentChat({
 			});
 		} finally {
 			setIsStreaming(false);
+			abortControllerRef.current = null;
 		}
+	};
+
+	const stopStreaming = () => {
+		abortControllerRef.current?.abort();
 	};
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -508,33 +499,13 @@ export default function AgentChat({
 					rows={1}
 					disabled={isStreaming}
 				/>
-				<select
-					value={selectedModel}
-					onChange={(e) => setSelectedModel(e.target.value)}
-					disabled={isStreaming}
-					style={{
-						padding: "0 6px",
-						fontSize: "0.75rem",
-						height: "32px",
-						border: "1px solid #333",
-						borderRadius: "4px",
-						background: "#1a1a1a",
-						color: "#ccc",
-						cursor: "pointer",
-					}}
-				>
-					{availableModels.map((m) => (
-						<option key={m.key} value={m.key}>
-							{m.label}
-						</option>
-					))}
-				</select>
 				<button
 					className="agent-send-btn"
-					onClick={() => handleSend()}
-					disabled={isStreaming || !input.trim()}
+					onClick={() => (isStreaming ? stopStreaming() : handleSend())}
+					disabled={!isStreaming && !input.trim()}
+					title={isStreaming ? "Stop" : "Send"}
 				>
-					{isStreaming ? "\u23F3" : "\u2191"}
+					{isStreaming ? "\u25A0" : "\u2191"}
 				</button>
 			</div>
 		</div>

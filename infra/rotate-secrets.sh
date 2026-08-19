@@ -12,10 +12,14 @@
 # radius anyway: DEPLOY_SSH_KEY (the CI-facing key) carries zero secrets.
 #
 # Usage (as root on infra-core):
-#   ANTHROPIC_API_KEY=... FIRMWARE_UPLOAD_TOKEN=... GEMINI_API_KEY=... \
+#   OPENROUTER_API_KEY=... FIRMWARE_UPLOAD_TOKEN=... \
 #   MQTT_USERNAME=hesperus-board MQTT_PASSWORD=... \
 #   DASHBOARD_MQTT_USERNAME=hesperus-dashboard DASHBOARD_MQTT_PASSWORD=... \
 #   bash infra/rotate-secrets.sh
+#
+# ANTHROPIC_API_KEY/GEMINI_API_KEY are optional passthrough, kept only for
+# manual model_key testing — OPENROUTER_API_KEY is REQUIRED and is what the
+# production chat/planning/analysis paths actually use as of 2026-08-19.
 #
 # DASHBOARD_MQTT_* is a SEPARATE, read-only identity (mosquitto/acl) for the
 # browser client — never reuse MQTT_USERNAME/PASSWORD (the board's readwrite
@@ -27,16 +31,17 @@ set -euo pipefail
 DEPLOY_DIR="/opt/hesperus"
 ENV_FILE="$DEPLOY_DIR/.env.prod"
 
+: "${OPENROUTER_API_KEY:?required}"
 : "${FIRMWARE_UPLOAD_TOKEN:?required}"
 : "${MQTT_USERNAME:?required}"
 : "${MQTT_PASSWORD:?required}"
-# ANTHROPIC_API_KEY / GEMINI_API_KEY are deliberately NOT required (2026-08-18
-# decision: moving to OpenRouter — see TODO in server/app/config.py). Left
-# empty here means AI analysis won't work until that migration lands, but
-# infra (containers, MQTT auth, upload auth, dashboard reachability) is
-# independently verifiable without them.
+# ANTHROPIC_API_KEY / GEMINI_API_KEY are deliberately NOT required (2026-08-19:
+# OpenRouter migration landed — see server/app/config.py). They're optional
+# passthrough kept only for manual model_key testing; production chat,
+# schedule planning, and image analysis all use OPENROUTER_API_KEY.
 
 printf '%s\n' \
+  "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
   "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
   "FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN}" \
   "GEMINI_API_KEY=${GEMINI_API_KEY:-}" \
