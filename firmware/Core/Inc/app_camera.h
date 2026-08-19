@@ -71,4 +71,32 @@ CameraStatus_t Camera_WarmCapture(uint8_t *buffer, uint32_t buffer_size,
  */
 CameraStatus_t Camera_DeInit(void);
 
+/**
+ * @brief  Prepare a captured frame for upload, compressing it if possible.
+ *
+ * A VGA RGB565 frame (exactly 640*480*2 bytes) is JPEG-encoded into a static
+ * buffer inside camera.c, cutting ~614 KB down to a few tens of KB on the
+ * wire. Any other size (QVGA, hardware-JPEG mode, short capture) or an encode
+ * failure falls back to the ORIGINAL raw buffer — the server auto-detects raw
+ * RGB565 by exact payload size, so the raw path keeps working untouched.
+ *
+ * The encode is deterministic: calling this again with the same raw frame
+ * yields byte-identical output, which is what makes the pending-upload retry
+ * path safe (it re-encodes rather than caching a second copy).
+ *
+ * @param  frame     Captured frame buffer.
+ * @param  frame_len Captured length in bytes.
+ * @param  out_data  Output — pointer to the bytes to upload (never NULL on
+ *                   return unless @p frame was NULL).
+ * @param  out_len   Output — number of bytes to upload.
+ */
+void Camera_PrepareUpload(uint8_t *frame, uint32_t frame_len,
+                          const uint8_t **out_data, uint32_t *out_len);
+
+/**
+ * @brief  Wipe the static JPEG upload buffer (hygiene, mirrors secure_erase
+ *         of the raw frame buffer once an upload is finished).
+ */
+void Camera_ClearUploadBuffer(void);
+
 #endif /* __APP_CAMERA_H */

@@ -24,6 +24,7 @@
 #include "app_camera.h"
 #include "firmware_config.h"
 #include "debug_log.h"
+#include "jpeg_encode.h"
 #include "stm32u5xx_ll_dcache.h"
 #include "main.h"
 
@@ -975,4 +976,62 @@ CameraStatus_t Camera_DeInit(void)
     
     s_initialized = 0;
     return CAMERA_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Upload Preparation — software JPEG compression
+ *
+ *  A VGA RGB565 frame is 614,400 bytes on the wire. Over the 4G uplink that
+ *  is the single dominant cost of a capture (and the reason the chunked
+ *  resumable upload path exists at all). Compressing it on-board to a few
+ *  tens of KB with a baseline JPEG encoder cuts the transfer by ~10-60x.
+ *
+ *  RAM: one static output buffer, sized so that a frame that would not
+ *  compress well (sensor noise, pathological texture) simply fails the
+ *  encode and falls back to the raw path rather than growing the buffer.
+ *  The server distinguishes the two by exact payload size — 614400 (or
+ *  153600 for QVGA) means raw RGB565, anything else is treated as an
+ *  already-encoded image — so the fallback needs no server change.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define JPEG_OUT_BUF_SIZE       (56 * 1024)
+#define CAMERA_RGB565_VGA_SIZE  (640u * 480u * 2u)   /* 614400 — the server's raw marker */
+
+static uint8_t s_jpeg_buf[JPEG_OUT_BUF_SIZE];
+
+void Camera_PrepareUpload(uint8_t *frame, uint32_t frame_len,
+                          const uint8_t **out_data, uint32_t *out_len)
+{
+    if (out_data == NULL || out_len == NULL)
+        return;
+
+    /* Default: raw passthrough. Every early return below leaves this in
+     * place, so a failed encode can never lose the image. */
+    *out_data = frame;
+    *out_len  = frame_len;
+
+    if (frame == NULL || frame_len != CAMERA_RGB565_VGA_SIZE)
+        return;   /* QVGA, hardware-JPEG mode or a short capture — send as-is */
+
+    uint32_t jpeg_len = JPEG_EncodeRGB565(frame, 640, 480,
+                                          s_jpeg_buf, JPEG_OUT_BUF_SIZE);
+    if (jpeg_len == 0)
+    {
+        LOG_WARN(TAG_CAM, "JPEG encode failed or exceeded %d bytes — "
+                 "uploading raw RGB565 (%lu bytes)",
+                 (int)JPEG_OUT_BUF_SIZE, (unsigned long)frame_len);
+        return;
+    }
+
+    LOG_INFO(TAG_CAM, "JPEG encoded: %lu -> %lu bytes (q%d)",
+             (unsigned long)frame_len, (unsigned long)jpeg_len,
+             (int)JPEG_ENCODE_QUALITY);
+
+    *out_data = s_jpeg_buf;
+    *out_len  = jpeg_len;
+}
+
+void Camera_ClearUploadBuffer(void)
+{
+    secure_erase(s_jpeg_buf, sizeof(s_jpeg_buf));
 }

@@ -109,6 +109,7 @@ static void _clear_pending_upload(void)
 {
     if (s_pending_upload_size > 0)
         secure_erase(s_image_buffer, s_pending_upload_size);
+    Camera_ClearUploadBuffer();
     s_pending_upload_task_id  = 0;
     s_pending_upload_size     = 0;
     s_pending_upload_attempts = 0;
@@ -128,17 +129,28 @@ static void _service_pending_upload(void)
              (unsigned long)s_pending_upload_task_id,
              s_pending_upload_attempts, PENDING_UPLOAD_MAX_ATTEMPTS);
 
+    /* s_pending_upload_size is always the RAW frame size — the encoded bytes
+     * are NOT cached across retries (there is no RAM for a second copy).
+     * Re-encoding the untouched raw frame is deterministic, so every retry
+     * uploads byte-identical content and the server-side resume offset stays
+     * valid. If the encode fails we simply retry with the raw frame, exactly
+     * as the pre-JPEG firmware did. */
+    const uint8_t *upload_data = s_image_buffer;
+    uint32_t       upload_len  = s_pending_upload_size;
+    Camera_PrepareUpload(s_image_buffer, s_pending_upload_size,
+                         &upload_data, &upload_len);
+
     WiFiStatus_t ret = WiFi_HttpPostImage(SERVER_UPLOAD_URL,
                                           s_pending_upload_task_id,
-                                          s_image_buffer,
-                                          s_pending_upload_size);
+                                          upload_data,
+                                          upload_len);
 
     char msg[128];
     if (ret == WIFI_OK)
     {
         LOG_INFO(TAG_HTTP, "Retry succeeded for task %lu", (unsigned long)s_pending_upload_task_id);
         snprintf(msg, sizeof(msg), "{\"status\":\"uploaded\",\"task_id\":%lu,\"bytes\":%lu}",
-                 (unsigned long)s_pending_upload_task_id, (unsigned long)s_pending_upload_size);
+                 (unsigned long)s_pending_upload_task_id, (unsigned long)upload_len);
         MQTT_PublishStatus(msg);
         _clear_pending_upload();
     }
@@ -1352,17 +1364,25 @@ int main(void)
                                  next->task_id);
                         MQTT_PublishStatus(status_msg);
 
+                        /* Compress before sending; falls back to the raw frame
+                         * if the encode fails. captured_size (RAW size) is what
+                         * gets queued for retry — see _service_pending_upload. */
+                        const uint8_t *upload_data = s_image_buffer;
+                        uint32_t       upload_len  = captured_size;
+                        Camera_PrepareUpload(s_image_buffer, captured_size,
+                                             &upload_data, &upload_len);
+
                         WiFiStatus_t upload_ret = WiFi_HttpPostImage(
                             SERVER_UPLOAD_URL, next->task_id,
-                            s_image_buffer, captured_size);
+                            upload_data, upload_len);
 
                         if (upload_ret == WIFI_OK)
                         {
                             LOG_INFO(TAG_HTTP, "Task %u upload OK (%lu bytes)",
-                                     next->task_id, (unsigned long)captured_size);
+                                     next->task_id, (unsigned long)upload_len);
                             snprintf(status_msg, sizeof(status_msg),
                                      "{\"status\":\"uploaded\",\"task_id\":%u,\"bytes\":%lu}",
-                                     next->task_id, (unsigned long)captured_size);
+                                     next->task_id, (unsigned long)upload_len);
                         }
                         else
                         {
@@ -1386,7 +1406,10 @@ int main(void)
                          * Only when nothing is queued for retry — otherwise
                          * we'd wipe the very frame we still need to send. */
                         if (s_pending_upload_size == 0)
+                        {
                             secure_erase(s_image_buffer, captured_size);
+                            Camera_ClearUploadBuffer();
+                        }
 
                         /* Re-establish MQTT only if connection was lost during upload */
                         if (!MQTT_IsConnected())
@@ -1890,10 +1913,15 @@ static void _do_button_capture(void)
     snprintf(status_msg, sizeof(status_msg), "{\"status\":\"uploading\",\"task_id\":%lu}", (unsigned long)s_button_task_id);
     MQTT_PublishStatus(status_msg);
 
+    /* Compress (falls back to the raw frame on any encode failure) */
+    const uint8_t *upload_data = s_image_buffer;
+    uint32_t       upload_len  = captured_size;
+    Camera_PrepareUpload(s_image_buffer, captured_size, &upload_data, &upload_len);
+
     /* Upload via HTTP POST */
     WiFiStatus_t wifi_ret = WiFi_HttpPostImage(
         SERVER_UPLOAD_URL, s_button_task_id,
-        s_image_buffer, captured_size);
+        upload_data, upload_len);
 
     uint32_t total_ms = HAL_GetTick() - perf_start;
 
@@ -1902,7 +1930,7 @@ static void _do_button_capture(void)
         snprintf(status_msg, sizeof(status_msg),
                  "{\"status\":\"captured\",\"task_id\":%lu,\"size\":%lu,\"trigger\":\"button\",\"latency_ms\":%lu}",
                  (unsigned long)s_button_task_id,
-                 (unsigned long)captured_size,
+                 (unsigned long)upload_len,
                  (unsigned long)total_ms);
         LOG_INFO(TAG_BOOT, "[PERF] Button capture complete: %lums total",
                  (unsigned long)total_ms);
@@ -1922,6 +1950,7 @@ static void _do_button_capture(void)
 
     /* SEC-10: Cryptographic Sanitization */
     secure_erase(s_image_buffer, captured_size);
+    Camera_ClearUploadBuffer();
 
 #if STACK_WATERMARK_ENABLED
     RAM_CheckStackHighWater();
@@ -2019,11 +2048,16 @@ static void _do_capture_now(void)
              (unsigned long)task_id, (unsigned long)captured_size);
     MQTT_PublishStatus(status_msg);
 
+    /* Compress (falls back to the raw frame on any encode failure) */
+    const uint8_t *upload_data = s_image_buffer;
+    uint32_t       upload_len  = captured_size;
+    Camera_PrepareUpload(s_image_buffer, captured_size, &upload_data, &upload_len);
+
     /* Upload via HTTP POST (blocking, but _socket_send_all now
      * calls MQTT_ProcessLoop every 2s to keep the broker alive) */
     WiFiStatus_t wifi_ret = WiFi_HttpPostImage(
         SERVER_UPLOAD_URL, task_id,
-        s_image_buffer, captured_size);
+        upload_data, upload_len);
 
     uint32_t total_ms = HAL_GetTick() - perf_start;
 
@@ -2031,7 +2065,7 @@ static void _do_capture_now(void)
     {
         snprintf(status_msg, sizeof(status_msg),
                  "{\"status\":\"captured\",\"task_id\":%lu,\"size\":%lu,\"latency_ms\":%lu,\"trigger\":\"mqtt_capture_now\"}",
-                 (unsigned long)task_id, (unsigned long)captured_size, (unsigned long)total_ms);
+                 (unsigned long)task_id, (unsigned long)upload_len, (unsigned long)total_ms);
         LOG_INFO(TAG_BOOT, "[PERF] Capture+upload: %lums", (unsigned long)total_ms);
     }
     else
@@ -2045,6 +2079,7 @@ static void _do_capture_now(void)
     MQTT_PublishStatus(status_msg);
     BSP_LED_Off(LED_RED);
     secure_erase(s_image_buffer, captured_size);
+    Camera_ClearUploadBuffer();
 
 #if STACK_WATERMARK_ENABLED
     RAM_CheckStackHighWater();
@@ -2160,17 +2195,22 @@ static void _do_capture_sequence(void)
         snprintf(status_msg, sizeof(status_msg), "{\"status\":\"uploading\",\"task_id\":%lu}", (unsigned long)task_id);
         MQTT_PublishStatus(status_msg);
 
+        /* Compress (falls back to the raw frame on any encode failure) */
+        const uint8_t *upload_data = s_image_buffer;
+        uint32_t       upload_len  = captured_size;
+        Camera_PrepareUpload(s_image_buffer, captured_size, &upload_data, &upload_len);
+
         /* Upload immediately */
         WiFiStatus_t wifi_ret = WiFi_HttpPostImage(
             SERVER_UPLOAD_URL, task_id,
-            s_image_buffer, captured_size);
+            upload_data, upload_len);
 
         snprintf(status_msg, sizeof(status_msg),
                  "{\"status\":\"captured\",\"task_id\":%lu,\"size\":%lu,"
                  "\"trigger\":\"sequence\",\"seq_index\":%lu,\"seq_total\":%lu,"
                  "\"actual_offset_ms\":%lu,\"target_offset_ms\":%lu}",
                  (unsigned long)task_id,
-                 (unsigned long)captured_size,
+                 (unsigned long)upload_len,
                  (unsigned long)i,
                  (unsigned long)count,
                  (unsigned long)capture_tick,
@@ -2191,6 +2231,7 @@ static void _do_capture_sequence(void)
     
     /* SEC-10: Cryptographic Sanitization */
     secure_erase(s_image_buffer, CAMERA_FRAME_BUFFER_SIZE);
+    Camera_ClearUploadBuffer();
 
     LOG_INFO(TAG_BOOT, "[PERF] Sequence complete — %lu captures in %lums",
              (unsigned long)count,

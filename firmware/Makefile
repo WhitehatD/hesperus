@@ -37,6 +37,7 @@ Core/Src/main.c \
 Core/Src/debug_log.c \
 Core/Src/wifi.c \
 Core/Src/camera.c \
+Core/Src/jpeg_encode.c \
 Core/Src/mqtt_handler.c \
 Core/Src/scheduler.c \
 Core/Src/ota_update.c \
