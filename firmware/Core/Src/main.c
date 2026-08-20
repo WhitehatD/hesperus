@@ -848,16 +848,34 @@ int main(void)
                 else
                 {
                     creds_suspect_strikes++;
-                    LOG_WARN(TAG_BOOT, "AP present but connect failed (%lu/%d credentials-suspect strikes)",
-                             (unsigned long)creds_suspect_strikes, WIFI_CREDS_SUSPECT_STRIKES);
+                    LOG_WARN(TAG_BOOT, "AP present but connect failed (%lu consecutive credentials-suspect "
+                             "signals — auto-portal is disabled, retrying forever, see note below)",
+                             (unsigned long)creds_suspect_strikes);
 
-                    if (creds_suspect_strikes >= WIFI_CREDS_SUSPECT_STRIKES)
-                    {
-                        LOG_WARN(TAG_BOOT, "Stored credentials look wrong (AP reachable, repeated "
-                                 "auth/DHCP failure) — opening portal automatically");
-                        CaptivePortal_Start(PORTAL_REASON_CREDS_SUSPECT);
-                        /* Never returns */
-                    }
+                    /* AUTO-PORTAL-ON-CREDS-SUSPECT DISABLED (2026-08-20, live incident):
+                     * this counter and WIFI_CREDS_SUSPECT_STRIKES are kept for
+                     * visibility/telemetry, but no longer trigger
+                     * CaptivePortal_Start(PORTAL_REASON_CREDS_SUSPECT).
+                     *
+                     * On real hardware, a genuinely correct password against a
+                     * genuinely present AP produced 14+ consecutive
+                     * WIFI_ERROR_CONNECT results in a row (confirmed via serial
+                     * log + a controlled A/B test that reflashed the exact
+                     * pre-incident firmware and reproduced the same failures) —
+                     * the AP was transiently not completing handshakes for
+                     * reasons that had nothing to do with the password. Simply
+                     * continuing to retry is what actually worked; the board
+                     * connected on a later attempt with unchanged credentials.
+                     * A "3 strikes and open the portal" heuristic on top of a
+                     * failure mode that can legitimately run into double digits
+                     * is not a safe way to decide to disrupt a working
+                     * configuration. Retry-forever (above) plus the manual
+                     * button-hold portal entry (main.c's button gesture
+                     * handling) fully covers recovering from an actually wrong
+                     * password — it just requires the operator to notice and
+                     * act, instead of the firmware guessing wrong. Re-enable
+                     * only with a much stronger signal than connect-failure
+                     * counting, verified against real hardware first. */
                 }
 
                 /* Full module reset only after several consecutive

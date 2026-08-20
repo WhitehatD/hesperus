@@ -556,7 +556,6 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
     int hard_errors = 0;
     uint32_t zero_sends = 0;   /* module said "buffer full" (backpressure) */
     uint32_t neg_sends  = 0;   /* module reported an actual error */
-    uint32_t last_mqtt_tick = HAL_GetTick();
     uint32_t start_tick = HAL_GetTick();
 
     while (offset < len)
@@ -621,18 +620,28 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
             if (offset < len)
                 MX_WIFI_IO_YIELD(wifi_obj_get(), 2);
 
-            /* Keep MQTT alive during long uploads.
-             * Send PINGREQ every 5s to prevent broker keepalive timeout (60s).
-             * We intentionally do NOT call MQTT_ProcessLoop() here — its 1s
-             * recv timeout stalls the upload, and the SPI bus contention during
-             * heavy HTTP traffic causes incoming MQTT messages to be dropped
-             * by the EMW3080's limited buffer. Commands are processed naturally
-             * after the upload completes. */
-            if ((HAL_GetTick() - last_mqtt_tick) > 5000)
-            {
-                MQTT_SendPing();
-                last_mqtt_tick = HAL_GetTick();
-            }
+            /* No MQTT ping from inside this loop (removed 2026-08-20 — see
+             * post-mortem below). The module has ONE physical SPI/IPC
+             * channel shared by every socket, HTTP and MQTT alike — firing
+             * an unrelated MQTT keepalive send here means the busiest
+             * possible moment for the channel (mid-payload, byte-pump
+             * loop) is also the moment we ask it to squeeze in unrelated
+             * traffic. It's unproven whether that alone explains any given
+             * stall, but it's a real, avoidable coupling between two
+             * independent protocols on a single shared bus, and it no
+             * longer earns its keep: this call existed because a 614KB
+             * pre-JPEG-compression upload could take minutes, risking the
+             * MQTT_KEEPALIVE_SECONDS=60 broker timeout. Payloads are now
+             * 7-56KB (jpeg_encode.c), chunked at UPLOAD_CHUNK_WIRE_SIZE
+             * (32KB) — even at the pessimistic ~1.3KB/s throughput once
+             * measured on a degraded link (a separate, since-fixed
+             * power-save bug), one chunk is ~25s, comfortably inside the
+             * 60s budget with margin. The outer chunk loop already pings
+             * correctly at clean boundaries (after each chunk succeeds,
+             * and after each full retry backoff — see the two
+             * MQTT_SendPing() calls in WiFi_HttpPostImage()), which is
+             * where keepalive responsibility belongs: never nested inside
+             * another protocol's own tight send loop. */
         }
         else if (sent == 0)
         {

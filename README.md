@@ -258,9 +258,46 @@ Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). E
 - **Adaptive AEC convergence** — polls the OV5640's luminance register at 50ms intervals. In well-lit scenes, captures in ~300ms. In dark scenes, detects AEC saturation (stable readings) and exits early instead of wasting the full timeout. Night mode extends exposure to 4x VTS (~300ms) automatically.
 - **Over-the-air updates** — board polls for new firmware, downloads to RAM in 2KB chunks (avoiding SPI/flash contention), CRC32-verifies, erases inactive flash bank, writes, and performs atomic bank swap. Automatic rollback on boot failure.
 - **Adaptive low-power sleep (agent-selectable via `low_power_mode`)** — *WIFI_PS_REST*: WiFi stays associated in 802.11 power-save while the MCU sleeps in STOP2, waking from STOP2 on a 3-second poll cycle to check for commands (command latency measured 0.1–2.6 s on hardware) — low-power *and* agent-responsive. *DEEP_DORMANT* (`sleep_mode`): WiFi off, ~2µA STOP2 until the next scheduled capture or a B3 button press. The IWDG watchdog is frozen in STOP via its option byte so it never resets the board mid-sleep, yet still guards the active phases and recovers a wake-time hang. (STOP2 wake required two STM32U5 silicon-config fixes — the `IWDG_STOP` option-byte freeze and the Smart-Run-Domain `SRDAMR.RTCAPBAMEN` RTC clock — both verified on-device.)
-- **Captive portal WiFi provisioning** — no hardcoded credentials. Board starts a SoftAP (`IoT-Setup-XXXX`, password `setup123`) with DNS redirect for automatic captive portal detection on iOS/Android/Windows. Three entry paths: (1) first boot with no stored credentials, (2) stored credentials fail to connect after 3 retries, (3) **hold the B3 USER button for 3 seconds** — RED LED lights at 1s to signal "keep holding", 5x GREEN blinks confirm portal entry. Short press (<3s) triggers an instant capture.
+- **Retry-forever WiFi policy** — stored credentials are retried indefinitely with capped exponential backoff (2s→30s); a temporarily unreachable AP (hotspot toggled off, out of range) never destroys working provisioning and never opens the portal on its own. An active `MX_WIFI_Scan()` for the stored SSID runs before each attempt but is purely advisory (logged, never gates the actual connect attempt) — real-hardware testing showed it can miss a genuinely-present AP, so a negative scan result must never block a real connection attempt. A full module reset (~5s hardware delay) only happens after 5 consecutive failures of any kind, not on every retry. **Automatic "credentials look wrong, open the portal" detection is deliberately disabled** (2026-08-20 incident): on real hardware a correct password against a genuinely present AP produced 14+ consecutive connect failures in a row before succeeding — a low-digit failure-count heuristic is not a safe trigger for something as disruptive as force-opening the portal. Recovering from an actually wrong password is the manual button-hold path below; the firmware no longer guesses.
+- **Captive portal WiFi provisioning** — no hardcoded credentials. Board starts a SoftAP (`IoT-Setup-XXXX`, password `setup123`) with DNS redirect for automatic captive portal detection on iOS/Android/Windows. Two entry paths: (1) first boot with no stored credentials, (2) operator holds the B3 button for 3s (see [Status LEDs & Physical Controls](#status-leds--physical-controls) below).
 - **Phone hotspot compatible** — EMW3080 uses `MX_WIFI_SEC_AUTO` (WPA/WPA2 PSK only; the module firmware does not support SAE/dragonfly handshake), 2.4GHz only. Explicit 30-second DHCP patience for iPhone hotspot latency. Server addressed by raw IP — no DNS dependency. Does **not** support WPA2-Enterprise (802.1X/RADIUS), which is why university WiFi networks are incompatible.
 - **11 MQTT command types**: capture_now, capture_sequence, schedule, delete_schedule, firmware_update, sleep_mode, low_power_mode, ping, set_wifi, start_portal, erase_wifi.
+
+### Status LEDs & Physical Controls
+
+The B-U585I-IOT02A has exactly two on-board LEDs (RED, GREEN — both mono-color, no display) and two physical buttons. `board_status.c` is the single owner of both LEDs for every connectivity/portal/OTA/idle state — no other module toggles them directly.
+
+**Two-tier LED model** — this matters for reading the board correctly:
+- **Phase** (what the board is routinely *doing* — transitions freely in either direction): booting, connecting, searching, online, reconnecting, asleep.
+- **Override** (something that must stay visible until it's explicitly resolved, and takes priority over whatever phase is happening underneath): portal open, OTA in progress, factory-reset warning, fatal error.
+
+| State | RED | GREEN | Meaning |
+|---|---|---|---|
+| Booting | solid | solid | Cold boot, subsystems not up yet |
+| WiFi connecting | off | fast blink (~5 Hz) | SSID confirmed present via scan, actively attempting the handshake |
+| WiFi searching | off | short blip every ~3 s | SSID *not* seen in the last scan — AP presumed absent, retrying forever in the background. **Not an error** — this is the "still on hotspot" state; it clears itself the moment the AP reappears |
+| MQTT reconnecting | slow blink (1 Hz) | off | WiFi is up but the broker isn't reachable |
+| Online / idle | off | brief blip every 3 s | Connected, MQTT up, nothing pending — the heartbeat |
+| Asleep (PS-REST / deep-dormant) | off | off | STOP2 sleep — LEDs off deliberately, waking them would defeat the energy saving |
+| Portal active (fresh device or button-triggered) | slow blink (1 Hz) | off | SoftAP + setup page is up, waiting for a client |
+| Portal — credentials suspect | **solid** | slow pulse (0.5 Hz) | Auto-opened because the AP was confirmed present but the stored password kept failing. The solid RED + separate GREEN pulse is deliberately different from a plain portal-active blink: it signals "I've stopped trying to connect on purpose, come reconfigure me" |
+| OTA in progress | alternating with GREEN (~4 Hz) | alternating with RED (~4 Hz) | Firmware download/flash in progress |
+| Factory-reset warning | fast alternating with GREEN (~3 Hz) | fast alternating with RED (~3 Hz) | B3 has been held past 8 s — **nothing has been erased yet**, release now to cancel |
+| Fatal error | fast blink (~5 Hz) | off | Unrecoverable init failure |
+
+A brief GREEN flash overlays whichever state is showing above whenever a photo is captured — this is just an activity pulse, it doesn't change the underlying state.
+
+**B3 (USER button, software-controlled)** — the only physical button the firmware can read:
+
+| Hold duration | Result |
+|---|---|
+| Short press, released < 3 s | Capture a photo now |
+| Held ≥ 3 s, released before 8 s | Force-enter the setup portal — **credentials are not touched**, the board keeps retrying them in the background even while the portal is open |
+| Held ≥ 8 s | Factory-reset warning LED appears — nothing destroyed yet |
+| Released between 8 s and 10 s | Aborts cleanly — falls back to the "force portal" outcome above, credentials intact |
+| Held continuously to 10 s | Commits: erases stored WiFi credentials and reboots into a fresh first-boot portal |
+
+**B2 (RESET button)** is wired directly to the STM32's NRST pin — it is a hardware reset line, not something firmware can read. It cannot run any gesture, cannot be combined with B3, and **cannot erase anything**, because the whole MCU (including all button-handling code) is held in reset the instant it's pressed. It is always safe: if the board ever looks stuck, pressing RESET just reboots it cleanly with credentials untouched. All destructive logic in this firmware therefore lives behind the staged B3 gesture above, and only there.
 
 ### Backend (FastAPI + AI)
 
@@ -297,8 +334,9 @@ hesperus/
       camera.c            OV5640 driver, AEC tuning, DCMI/DMA capture
       mqtt_handler.c      Hand-rolled MQTT 3.1.1 client
       ota_update.c        Dual-bank OTA with CRC32 + rollback
-      wifi.c              EMW3080 TCP/HTTP, NTP, socket management
+      wifi.c              EMW3080 TCP/HTTP, NTP, socket management, scan-based retry policy
       captive_portal.c    SoftAP WiFi provisioning web server
+      board_status.c      Two-LED status state machine (owns all connectivity/portal/OTA LEDs)
     Core/Inc/
       firmware_config.h   All tuneable parameters in one file
     Drivers/              ST BSP + OV5640 + EMW3080 drivers
@@ -366,16 +404,23 @@ docker compose up -d                 # Mosquitto + FastAPI + Dashboard
 
 Dashboard at `http://localhost:3000`, API at `http://localhost:8000/docs`.
 
-### Firmware (first flash only)
+### Firmware (first flash, or local debugging)
 
 ```bash
 cd firmware
-make -j8                                              # Cross-compile
-make flash                                            # STLink (one time)
+./flash-local.sh              # fetch creds from the VPS, build, flash via SWD, verify
+./flash-local.sh --monitor    # ...then tail the live debug UART
 # All subsequent updates deploy via OTA through CI/CD
 ```
 
-Configure `firmware/Core/Inc/firmware_config.h` for your WiFi SSID and server IP. Or use the captive portal — the board broadcasts a setup network on first boot.
+`flash-local.sh` is the one standardized way to flash this board locally — it exists because three separate things silently produced a "successfully flashed" board that wasn't actually running the new firmware during a 2026-08-20 incident:
+1. **Credentials are compile-time.** `make flash` re-triggers a build; if `MQTT_USERNAME`/`MQTT_PASSWORD`/`FIRMWARE_UPLOAD_TOKEN` aren't passed on the *same* invocation, the board silently gets flashed without them and joins WiFi fine but gets rejected by the broker. The script always fetches them from the VPS and always passes them.
+2. **SWAP_BANK silently defeats a flash.** Any board that has ever taken an OTA update has the dual-bank `SWAP_BANK` option byte set — so a raw `-w 0x08000000` write and what the CPU actually boots can disagree. The programmer reports "Download verified successfully" while the board keeps running the *old* firmware. The script checks and clears this first.
+3. **Drag-and-drop onto the `DIS_U585AI` mass-storage drive does not work** on this board — it fails with `Flash algorithm write command FAILURE`. Use SWD via `STM32_Programmer_CLI` (what the script does), not the MSD interface.
+
+For quick A/B hardware testing against a specific commit: `./flash-local.sh --baseline <git-ref>`.
+
+Configure `firmware/Core/Inc/firmware_config.h` for your WiFi SSID and server IP, or use the captive portal — the board broadcasts a setup network on first boot.
 
 ### CI/CD (automatic after setup)
 
