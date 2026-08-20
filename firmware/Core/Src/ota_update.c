@@ -776,12 +776,13 @@ OTAStatus_t OTA_DownloadAndFlash(const OTAVersionInfo_t *info,
                 snprintf(progress_msg, sizeof(progress_msg),
                     "{\"status\":\"ota_progress\","
                     "\"downloaded\":%lu,\"total\":%lu,"
-                    "\"percent\":%lu,\"throughput_kbps\":%lu,"
+                    "\"percent\":%lu,\"throughput_kbps\":%lu.%lu,"
                     "\"elapsed_ms\":%lu,\"attempt\":%d}",
                     (unsigned long)total_downloaded,
                     (unsigned long)info->size,
                     (unsigned long)pct,
-                    (unsigned long)kbps,
+                    (unsigned long)(kbps_x10 / 10u),
+                    (unsigned long)(kbps_x10 % 10u),
                     (unsigned long)elapsed_ms,
                     dl_attempt + 1);
                 if (MQTT_IsConnected())
