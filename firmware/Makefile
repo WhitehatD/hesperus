@@ -44,6 +44,7 @@ Core/Src/ota_update.c \
 Core/Src/wifi_credentials.c \
 Core/Src/board_settings.c \
 Core/Src/captive_portal.c \
+Core/Src/board_status.c \
 Core/Src/upload_async.c \
 Core/Src/cJSON.c \
 Core/Src/mx_wifi_hw.c \

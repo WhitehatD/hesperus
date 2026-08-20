@@ -20,9 +20,13 @@
 typedef enum {
     WIFI_OK = 0,
     WIFI_ERROR_INIT,
-    WIFI_ERROR_CONNECT,
+    WIFI_ERROR_CONNECT,      /* AP was seen (or scan itself failed/unclear) but auth/DHCP failed —
+                               * counts toward the creds-suspect strike threshold in the caller. */
     WIFI_ERROR_TIMEOUT,
     WIFI_ERROR_SEND,
+    WIFI_ERROR_AP_NOT_FOUND, /* Active scan did NOT see this SSID broadcasting — the AP is
+                               * genuinely absent/out of range right now. NOT a credentials
+                               * signal: callers should retry forever, never auto-portal on this. */
 } WiFiStatus_t;
 
 /**
@@ -32,7 +36,21 @@ typedef enum {
 WiFiStatus_t WiFi_Init(void);
 
 /**
- * @brief  Connect to the configured Wi-Fi network.
+ * @brief  Make ONE bounded connection attempt to the given network.
+ *
+ * Enterprise retry policy (2026-08-20): this function does exactly one
+ * attempt and returns — it does NOT loop internally. Before attempting
+ * the handshake it does an active scan for `ssid` so the return value can
+ * tell the caller WHY it failed:
+ *   - WIFI_ERROR_AP_NOT_FOUND : SSID not seen — AP is absent right now.
+ *     The caller should keep retrying forever with backoff; this is never
+ *     a reason to distrust the stored credentials.
+ *   - WIFI_ERROR_CONNECT      : SSID WAS seen, but auth/DHCP still failed.
+ *     The caller should count this as a "credentials suspect" strike.
+ * Callers own the retry loop, backoff timing, and strike counting (see
+ * main.c's boot connect sequence and MQTT/WiFi reconnect block) — this
+ * keeps the mechanism (wifi.c) separate from the policy (main.c).
+ *
  * @param  ssid: Network SSID.
  * @param  password: Network password.
  * @retval WIFI_OK on success.

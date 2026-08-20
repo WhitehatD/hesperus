@@ -34,6 +34,7 @@
 #include "wifi_credentials.h"
 #include "board_settings.h"
 #include "captive_portal.h"
+#include "board_status.h"
 #include "upload_async.h"
 #include "mx_wifi.h"
 
@@ -175,11 +176,12 @@ static Schedule_t s_schedule;
 /* Flag: set when a new schedule is received via MQTT */
 static volatile uint8_t s_schedule_received = 0;
 
-/* B3 USER button — short press = capture, long press (≥3s) = portal mode.
- * ISR records press timestamp; main loop polls pin to detect release. */
+/* B3 USER button — short press = capture, hold 3s = portal, hold 8s =
+ * factory-reset warning, hold 10s = commit (erase credentials). ISR
+ * records press timestamp; _button_poll_gesture() (below) resolves the
+ * gesture non-blocking from any polling context — see its doc comment. */
 static volatile uint32_t s_button_press_tick = 0;
 static volatile uint8_t  s_button_held = 0;       /* 1 = button currently held */
-static uint8_t           s_button_led_on = 0;      /* Tracks LED feedback state */
 static uint32_t s_button_task_id = 10000;  /* Start at high IDs to avoid schedule collision */
 
 /* ── Capture Now Queue (MQTT command) ────────────────────── */
@@ -275,6 +277,21 @@ static void _do_wifi_reconfig(void);
 static void _do_ping_sequence(void);
 static void _do_start_portal(void);
 static void EnterPSRest(void);
+
+/* ── Button gesture state machine (2026-08-20) — shared by the boot-time
+ * WiFi retry loop AND the main while(1) loop so behavior/thresholds can
+ * never drift between the two call sites. See firmware_config.h's
+ * BUTTON_LONG_PRESS_MS / BUTTON_FACTORY_RESET_WARN_MS / _COMMIT_MS. */
+typedef enum {
+    BUTTON_GESTURE_NONE = 0,
+    BUTTON_GESTURE_SHORT_CAPTURE,  /* Released before BUTTON_LONG_PRESS_MS */
+    BUTTON_GESTURE_PORTAL,         /* Released between BUTTON_LONG_PRESS_MS and the commit
+                                     * threshold (or the warning window was aborted early) */
+    BUTTON_GESTURE_FACTORY_RESET,  /* Held continuously to BUTTON_FACTORY_RESET_COMMIT_MS —
+                                     * only path in the whole firmware that erases credentials */
+} ButtonGesture_t;
+static ButtonGesture_t _button_poll_gesture(void);
+static ButtonGesture_t _boot_wait_with_button_poll(uint32_t wait_ms);
 
 /* SEC-07: Watchdog initialization */
 #if WATCHDOG_ENABLED
@@ -716,11 +733,14 @@ int main(void)
     LOG_INFO(TAG_BOOT, "  Board: B-U585I-IOT02A               ");
     LOG_INFO(TAG_BOOT, "========================================");
 
-    /* Status LED */
+    /* Status LEDs — BoardStatus owns all connectivity/portal/OTA/idle
+     * signalling from here on (board_status.c); both solid ON here is the
+     * one deliberate exception, showing BOOTING before BoardStatus_Init(). */
     BSP_LED_Init(LED_GREEN);
     BSP_LED_Init(LED_RED);
     BSP_LED_On(LED_GREEN);
     BSP_LED_On(LED_RED);
+    BoardStatus_Init();
 
     /* RTC for scheduled wake-ups */
     RTC_Init();
@@ -749,72 +769,130 @@ int main(void)
 
     /* ── Phase 2: Connectivity ──────────────────────── */
 
-    /* Wi-Fi — Enterprise credential chain:
-     *   1. Try flash-stored credentials (with retries)
-     *   2. If all fail → start captive portal (blocks until user configures) */
+    /* Wi-Fi — Enterprise credential chain (2026-08-20 redesign):
+     *   1. No stored credentials at all -> portal (PORTAL_REASON_FRESH).
+     *   2. Stored credentials exist -> retry FOREVER with capped backoff.
+     *      An AP that's merely absent right now (hotspot off, out of
+     *      range) must NEVER destroy provisioning — see the "Enterprise
+     *      WiFi Retry Policy" note in firmware_config.h and the SSID-scan
+     *      based diagnosis in wifi.c's WiFi_Connect(). Only
+     *      WIFI_CREDS_SUSPECT_STRIKES consecutive attempts where the AP
+     *      was CONFIRMED present (SSID seen in scan) but auth/DHCP still
+     *      failed will auto-open the portal (PORTAL_REASON_CREDS_SUSPECT).
+     *   3. The USER button remains a manual override throughout this loop
+     *      — 3s=force portal, 8s=factory-reset warning, 10s=commit — via
+     *      _boot_wait_with_button_poll(), so a stuck board never requires
+     *      waiting out the full retry policy to be reconfigured. */
     {
-        uint8_t wifi_connected = 0;
-
-        /* ── Step 1: Try flash-stored credentials ── */
         WiFiCredentials_t flash_creds;
         if (WiFiCred_Load(&flash_creds) == WIFI_CRED_OK)
         {
             LOG_INFO(TAG_BOOT, "Found stored WiFi credentials: SSID='%s'", flash_creds.ssid);
 
-            int wifi_retries = 0;
-            while (wifi_retries < WIFI_CONNECT_RETRIES)
+            if (WiFi_Init() != WIFI_OK)
             {
-                /* Re-init WiFi module if first attempt failed */
-                if (wifi_retries > 0)
-                {
-                    WiFi_DeInit();
-                    HAL_Delay(1000);
-                    if (WiFi_Init() != WIFI_OK)
-                    {
-                        wifi_retries++;
-                        continue;
-                    }
-                }
-                else if (WiFi_Init() != WIFI_OK)
-                {
-                    wifi_retries++;
-                    continue;
-                }
+                LOG_ERROR(TAG_BOOT, "WiFi module init failed at boot — starting portal as last resort");
+                CaptivePortal_Start(PORTAL_REASON_FRESH);
+                /* Never returns */
+            }
 
-                if (WiFi_Connect(flash_creds.ssid, flash_creds.password) == WIFI_OK)
-                {
-                    wifi_connected = 1;
-                    LOG_INFO(TAG_BOOT, "Connected using stored credentials");
+            /* Populate runtime creds up front for automatic reconnects
+             * (e.g. sleep wake-up) even while still trying to connect. */
+            strncpy(s_runtime_ssid, flash_creds.ssid, sizeof(s_runtime_ssid) - 1);
+            s_runtime_ssid[sizeof(s_runtime_ssid) - 1] = '\0';
+            strncpy(s_runtime_password, flash_creds.password, sizeof(s_runtime_password) - 1);
+            s_runtime_password[sizeof(s_runtime_password) - 1] = '\0';
+            s_has_runtime_wifi = 1;
 
-                    /* Populate runtime creds for automatic reconnects (e.g. sleep wake-up) */
-                    strncpy(s_runtime_ssid, flash_creds.ssid, sizeof(s_runtime_ssid) - 1);
-                    s_runtime_ssid[sizeof(s_runtime_ssid) - 1] = '\0';
-                    strncpy(s_runtime_password, flash_creds.password, sizeof(s_runtime_password) - 1);
-                    s_runtime_password[sizeof(s_runtime_password) - 1] = '\0';
-                    s_has_runtime_wifi = 1;
-                    break;
-                }
+            uint32_t consecutive_failures = 0;
+            uint32_t creds_suspect_strikes = 0;
+            uint32_t backoff_ms = WIFI_RETRY_BACKOFF_INITIAL_MS;
 
-                LOG_WARN(TAG_BOOT, "Wi-Fi connect failed, retrying... (%d/%d)",
-                         wifi_retries + 1, WIFI_CONNECT_RETRIES);
-                HAL_Delay(2000);
-                wifi_retries++;
+            for (;;)
+            {
+                WiFiStatus_t ret = WiFi_Connect(flash_creds.ssid, flash_creds.password);
 #if WATCHDOG_ENABLED
                 HAL_IWDG_Refresh(&hiwdg);
 #endif
+
+                if (ret == WIFI_OK)
+                {
+                    LOG_INFO(TAG_BOOT, "Connected using stored credentials");
+                    break;
+                }
+
+                consecutive_failures++;
+
+                if (ret == WIFI_ERROR_AP_NOT_FOUND || ret == WIFI_ERROR_INIT)
+                {
+                    /* Neither is evidence of bad credentials:
+                     *  - AP_NOT_FOUND = the AP simply isn't broadcasting now.
+                     *  - INIT        = our own radio module is unhealthy; the
+                     *    stored password has nothing to do with it, and
+                     *    dumping the operator into a "your password looks
+                     *    wrong" portal for a dead module would be a lie.
+                     * Reset the counter so alternating failure kinds can't
+                     * accumulate toward the creds-suspect threshold either. */
+                    creds_suspect_strikes = 0;
+                }
+                else
+                {
+                    creds_suspect_strikes++;
+                    LOG_WARN(TAG_BOOT, "AP present but connect failed (%lu/%d credentials-suspect strikes)",
+                             (unsigned long)creds_suspect_strikes, WIFI_CREDS_SUSPECT_STRIKES);
+
+                    if (creds_suspect_strikes >= WIFI_CREDS_SUSPECT_STRIKES)
+                    {
+                        LOG_WARN(TAG_BOOT, "Stored credentials look wrong (AP reachable, repeated "
+                                 "auth/DHCP failure) — opening portal automatically");
+                        CaptivePortal_Start(PORTAL_REASON_CREDS_SUSPECT);
+                        /* Never returns */
+                    }
+                }
+
+                /* Full module reset only after several consecutive
+                 * failures of ANY kind — avoids paying the ~5s hardware
+                 * reset delay (WiFi_Init) on every single retry when the
+                 * module itself is still perfectly healthy. */
+                if (consecutive_failures >= WIFI_REINIT_AFTER_ATTEMPTS)
+                {
+                    LOG_WARN(TAG_BOOT, "%lu consecutive failures — re-initializing WiFi module",
+                             (unsigned long)consecutive_failures);
+                    WiFi_DeInit();
+                    HAL_Delay(500);
+                    WiFi_Init();
+                    consecutive_failures = 0;
+                }
+
+                ButtonGesture_t gesture = _boot_wait_with_button_poll(backoff_ms);
+                if (gesture == BUTTON_GESTURE_PORTAL)
+                {
+                    LOG_INFO(TAG_BOOT, "Button held during background retry — manual portal");
+                    CaptivePortal_Start(PORTAL_REASON_MANUAL);
+                    /* Never returns */
+                }
+                else if (gesture == BUTTON_GESTURE_FACTORY_RESET)
+                {
+                    LOG_WARN(TAG_BOOT, "Factory-reset gesture during boot — erasing credentials");
+                    WiFiCred_Erase();
+                    HAL_Delay(200);
+                    NVIC_SystemReset();
+                    /* Never returns */
+                }
+
+                backoff_ms = (backoff_ms * 2 < WIFI_RETRY_BACKOFF_MAX_MS)
+                             ? backoff_ms * 2 : WIFI_RETRY_BACKOFF_MAX_MS;
             }
         }
         else
         {
-            LOG_INFO(TAG_BOOT, "No stored WiFi credentials found in flash.");
-        }
-
-        /* ── Step 2: All failed → start captive portal ── */
-        if (!wifi_connected)
-        {
-            LOG_WARN(TAG_BOOT, "All WiFi connection attempts failed — starting captive portal");
-            CaptivePortal_Start();  /* Blocks until user configures WiFi + auto-reboots */
-            /* CaptivePortal_Start calls NVIC_SystemReset — we never reach here */
+            LOG_INFO(TAG_BOOT, "No stored WiFi credentials found in flash — starting portal");
+            if (WiFi_Init() != WIFI_OK)
+            {
+                LOG_ERROR(TAG_BOOT, "FATAL: WiFi module init failed with no stored creds");
+            }
+            CaptivePortal_Start(PORTAL_REASON_FRESH);  /* Blocks until configured + auto-reboots */
+            /* Never returns */
         }
     }
 
@@ -995,6 +1073,7 @@ int main(void)
 #if WATCHDOG_ENABLED
         HAL_IWDG_Refresh(&hiwdg);
 #endif
+        BoardStatus_Tick();
 
         /* Resume any upload that hit its deadline. Runs here, in the loop,
          * so retries interleave with MQTT commands, the OTA poll and the
@@ -1042,6 +1121,7 @@ int main(void)
             {
                 LOG_WARN(TAG_MQTT, "MQTT offline, attempting reconnect...");
                 s_telemetry.mqtt_reconnects++;
+                BoardStatus_Set(BOARD_STATUS_MQTT_RECONNECTING);
                 /* WiFi L2 reconnect: the EMW3080 in powersave mode does not
                  * auto-reassociate after a prolonged AP outage. Without this,
                  * MQTT_Init() fails immediately every 5 s and the board spins
@@ -1052,9 +1132,20 @@ int main(void)
                     LOG_WARN(TAG_WIFI, "WiFi L2 lost -- reconnecting before MQTT");
                     s_telemetry.wifi_reconnects++;
                     Watchdog_Refresh();
-                    WiFi_DeInit();
-                    WiFi_Init();
-                    WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                    /* One quick attempt first (WiFi_Connect now does its own
+                     * SSID-scan diagnosis + BoardStatus signalling — see
+                     * wifi.c) — only pay the ~5s full module reset if that
+                     * didn't even get a link, instead of unconditionally
+                     * DeInit+Init'ing on every single offline heartbeat. */
+                    if (WiFi_Connect(s_runtime_ssid, s_runtime_password) != WIFI_OK
+                        && MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
+                    {
+                        LOG_WARN(TAG_WIFI, "Quick reconnect failed — re-initializing module");
+                        WiFi_DeInit();
+                        HAL_Delay(500);
+                        WiFi_Init();
+                        WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                    }
                     Watchdog_Refresh();
                 }
                 MQTT_Init(&mqtt_cfg);
@@ -1102,21 +1193,22 @@ int main(void)
             }
         }
 
-        /* Idle heartbeat: IDLE_BLINK_ON_MS GREEN blip every IDLE_BLINK_PERIOD_MS to prove we are alive */
-        static uint32_t last_idle_blink = 0;
-        static uint8_t idle_led_on = 0;
-        
-        if (!idle_led_on && (HAL_GetTick() - last_idle_blink) >= IDLE_BLINK_PERIOD_MS)
+        /* Idle heartbeat: IDLE_BLINK_ON_MS GREEN blip every IDLE_BLINK_PERIOD_MS
+         * to prove we are alive. Now owned by BoardStatus (board_status.c
+         * renders the identical pattern).
+         *
+         * IMPORTANT (fixed 2026-08-20 verification round 2): ONLINE_IDLE is
+         * a tier-1 "phase" state — under the two-tier board_status design
+         * tier-1 Set() calls apply UNCONDITIONALLY, unlike the old flat
+         * priority ratchet where this call used to lose to
+         * MQTT_RECONNECTING/WIFI_SEARCHING/WIFI_CONNECTING automatically.
+         * Calling this unconditionally every loop tick would now silently
+         * paper over an active reconnect attempt with a false "all is
+         * well" heartbeat the very next iteration. Only assert idle when
+         * we're actually idle. */
+        if (MQTT_IsConnected())
         {
-            BSP_LED_On(LED_GREEN);
-            idle_led_on = 1;
-            last_idle_blink = HAL_GetTick();
-        }
-        else if (idle_led_on && (HAL_GetTick() - last_idle_blink) >= IDLE_BLINK_ON_MS)
-        {
-            BSP_LED_Off(LED_GREEN);
-            idle_led_on = 0;
-            /* Keep last_idle_blink anchor for stable IDLE_BLINK_PERIOD_MS period */
+            BoardStatus_Set(BOARD_STATUS_ONLINE_IDLE);
         }
         /* ── PS-REST gate ──
          * When the agent has enabled PS-REST (low_power_mode=ps_rest) and no
@@ -1176,52 +1268,45 @@ int main(void)
             poll_start = HAL_GetTick();
         }
 
-        /* ── Handle: B3 button (short = capture, long ≥3s = portal) ── */
-        if (s_button_held)
+        /* ── Handle: B3 button (short=capture, 3s=portal, 8s=factory-reset
+         * warning, 10s=commit) — see _button_poll_gesture() for the full
+         * staged design and firmware_config.h for the thresholds. Runs
+         * every loop iteration regardless of s_button_held so the
+         * FACTORY_RESET_WARNING LED can be armed/cleared promptly. */
         {
-            uint32_t held_ms = HAL_GetTick() - s_button_press_tick;
-            int still_pressed = (BSP_PB_GetState(BUTTON_USER) != 0);
-
-            /* LED feedback: RED on after 1s to signal "keep holding for portal" */
-            if (held_ms >= 1000 && still_pressed && !s_button_led_on)
+            ButtonGesture_t gesture = _button_poll_gesture();
+            switch (gesture)
             {
-                BSP_LED_On(LED_RED);
-                s_button_led_on = 1;
-            }
-
-            if (held_ms >= BUTTON_LONG_PRESS_MS && still_pressed)
-            {
-                /* ── Long press confirmed → enter portal mode ── */
-                s_button_held = 0;
-                s_button_led_on = 0;
-                BSP_LED_Off(LED_RED);
-
-                /* Confirmation flash: 5× rapid green blinks */
-                for (int i = 0; i < 5; i++) {
-                    BSP_LED_On(LED_GREEN);
-                    HAL_Delay(100);
-                    BSP_LED_Off(LED_GREEN);
-                    HAL_Delay(100);
-                }
-
-                LOG_INFO(TAG_BOOT, "=== LONG PRESS — entering WiFi setup portal ===");
-                MQTT_PublishStatus("{\"status\":\"portal_button\"}");
-                s_portal_requested = 1;
-            }
-            else if (!still_pressed)
-            {
-                /* ── Button released → short press = capture ── */
-                s_button_held = 0;
-                if (s_button_led_on) {
-                    BSP_LED_Off(LED_RED);
-                    s_button_led_on = 0;
-                }
-
-                if (held_ms >= BUTTON_DEBOUNCE_MS)
-                {
+                case BUTTON_GESTURE_SHORT_CAPTURE:
                     _do_button_capture();
-                }
-                poll_start = HAL_GetTick();
+                    poll_start = HAL_GetTick();
+                    break;
+
+                case BUTTON_GESTURE_PORTAL:
+                    /* Confirmation flash: 5× rapid green blinks */
+                    for (int i = 0; i < 5; i++) {
+                        BSP_LED_On(LED_GREEN);
+                        HAL_Delay(100);
+                        BSP_LED_Off(LED_GREEN);
+                        HAL_Delay(100);
+                    }
+                    LOG_INFO(TAG_BOOT, "=== BUTTON HELD — entering WiFi setup portal ===");
+                    MQTT_PublishStatus("{\"status\":\"portal_button\"}");
+                    s_portal_requested = 1;
+                    break;
+
+                case BUTTON_GESTURE_FACTORY_RESET:
+                    LOG_WARN(TAG_BOOT, "=== BUTTON HELD 10s — erasing WiFi credentials ===");
+                    MQTT_PublishStatus("{\"status\":\"factory_reset_button\"}");
+                    WiFiCred_Erase();
+                    HAL_Delay(200);
+                    NVIC_SystemReset();
+                    /* Never returns */
+                    break;
+
+                case BUTTON_GESTURE_NONE:
+                default:
+                    break;
             }
         }
 
@@ -1840,6 +1925,111 @@ void BSP_PB_Callback(Button_TypeDef Button)
 }
 
 /**
+ * @brief  Evaluate the USER (B3) button's current hold, resolving a
+ *         gesture exactly once — on release, or the instant the factory-
+ *         reset commit threshold is reached while still held.
+ *
+ * Stage-gated so a destructive action can never fire from a stray tap:
+ *   < 3s held+released         -> BUTTON_GESTURE_SHORT_CAPTURE
+ *   3s..8s held, then released -> BUTTON_GESTURE_PORTAL (creds untouched)
+ *   >= 8s held, still pressed  -> BOARD_STATUS_FACTORY_RESET_WARNING LED
+ *                                  armed (nothing destructive yet)
+ *   released during 8s..10s    -> ABORTS the warning, falls back to
+ *                                  BUTTON_GESTURE_PORTAL (held >= 3s)
+ *   held continuously to 10s   -> BUTTON_GESTURE_FACTORY_RESET (commits)
+ *
+ * The RESET (B2/NRST) button is a hardware line wired directly to the
+ * MCU's reset pin — it cannot run this or any other software gesture, and
+ * cannot erase anything. It is documented as the always-safe "just
+ * reboot it" button precisely BECAUSE none of this logic can touch it.
+ *
+ * Safe to call from any polling context (main loop, boot-time retry
+ * backoff wait) — non-blocking, only reads s_button_held/s_button_press_tick.
+ */
+static ButtonGesture_t _button_poll_gesture(void)
+{
+    static uint8_t s_warning_armed = 0;
+
+    if (!s_button_held)
+    {
+        if (s_warning_armed)
+        {
+            BoardStatus_Clear(BOARD_STATUS_FACTORY_RESET_WARNING);
+            s_warning_armed = 0;
+        }
+        return BUTTON_GESTURE_NONE;
+    }
+
+    uint32_t held_ms = HAL_GetTick() - s_button_press_tick;
+    int still_pressed = (BSP_PB_GetState(BUTTON_USER) == BUTTON_PRESSED);
+
+    if (still_pressed && !s_warning_armed && held_ms >= BUTTON_FACTORY_RESET_WARN_MS)
+    {
+        BoardStatus_Set(BOARD_STATUS_FACTORY_RESET_WARNING);
+        s_warning_armed = 1;
+        LOG_WARN(TAG_PORT, "Button held %lums — factory-reset warning (release now to cancel)",
+                 (unsigned long)held_ms);
+    }
+
+    if (still_pressed && held_ms >= BUTTON_FACTORY_RESET_COMMIT_MS)
+    {
+        s_button_held = 0;
+        BoardStatus_Clear(BOARD_STATUS_FACTORY_RESET_WARNING);
+        s_warning_armed = 0;
+        LOG_WARN(TAG_PORT, "=== FACTORY RESET COMMITTED (%lums hold) ===", (unsigned long)held_ms);
+        return BUTTON_GESTURE_FACTORY_RESET;
+    }
+
+    if (!still_pressed)
+    {
+        s_button_held = 0;
+        if (s_warning_armed)
+        {
+            BoardStatus_Clear(BOARD_STATUS_FACTORY_RESET_WARNING);
+            s_warning_armed = 0;
+        }
+
+        if (held_ms < BUTTON_DEBOUNCE_MS)
+            return BUTTON_GESTURE_NONE;  /* Debounce noise */
+
+        if (held_ms < BUTTON_LONG_PRESS_MS)
+            return BUTTON_GESTURE_SHORT_CAPTURE;
+
+        LOG_INFO(TAG_PORT, "Button released after %lums — portal", (unsigned long)held_ms);
+        return BUTTON_GESTURE_PORTAL;
+    }
+
+    return BUTTON_GESTURE_NONE;  /* Still held, still deciding */
+}
+
+/**
+ * @brief  Wait up to `wait_ms`, polling the button gesture + refreshing
+ *         the watchdog + rendering BoardStatus the whole time, so an
+ *         infinite background WiFi retry (boot-time, AP absent) can
+ *         always be interrupted by the manual portal / factory-reset
+ *         gestures even before the main while(1) loop is reached.
+ * @retval The resolved gesture, or BUTTON_GESTURE_NONE if `wait_ms`
+ *         elapsed with nothing resolved.
+ */
+static ButtonGesture_t _boot_wait_with_button_poll(uint32_t wait_ms)
+{
+    uint32_t start = HAL_GetTick();
+    do
+    {
+#if WATCHDOG_ENABLED
+        HAL_IWDG_Refresh(&hiwdg);
+#endif
+        BoardStatus_Tick();
+        ButtonGesture_t g = _button_poll_gesture();
+        if (g != BUTTON_GESTURE_NONE)
+            return g;
+        HAL_Delay(20);
+    } while ((HAL_GetTick() - start) < wait_ms);
+
+    return BUTTON_GESTURE_NONE;
+}
+
+/**
  * Perform a single camera capture + HTTP upload cycle.
  * Called from the main loop on B3 short press (< 3s).
  */
@@ -1930,6 +2120,7 @@ static void _do_button_capture(void)
         return;
     }
 
+    BoardStatus_Pulse(BOARD_PULSE_CAPTURE);
     LOG_INFO(TAG_BOOT, "Captured %lu bytes — uploading...",
              (unsigned long)captured_size);
 
@@ -2074,6 +2265,7 @@ static void _do_capture_now(void)
         return;
     }
 
+    BoardStatus_Pulse(BOARD_PULSE_CAPTURE);
     LOG_INFO(TAG_BOOT, "Captured %lu bytes — uploading...",
              (unsigned long)captured_size);
 
@@ -2297,6 +2489,7 @@ static void _do_ota_update(void)
     MQTT_PublishStatus("{\"status\":\"ota_checking\"}");
 
     s_ota_in_progress = 1;
+    BoardStatus_Set(BOARD_STATUS_OTA_IN_PROGRESS);
 
     OTAVersionInfo_t info;
     OTAStatus_t status = OTA_CheckForUpdate(&info);
@@ -2306,6 +2499,7 @@ static void _do_ota_update(void)
         LOG_INFO(TAG_OTA, "Already up-to-date (v%s)", FW_VERSION);
         MQTT_PublishStatus("{\"status\":\"ota_up_to_date\",\"firmware\":\"" FW_VERSION "\"}");
         s_ota_in_progress = 0;
+        BoardStatus_Clear(BOARD_STATUS_OTA_IN_PROGRESS);
         return;
     }
 
@@ -2318,6 +2512,7 @@ static void _do_ota_update(void)
                  status);
         MQTT_PublishStatus(msg);
         s_ota_in_progress = 0;
+        BoardStatus_Clear(BOARD_STATUS_OTA_IN_PROGRESS);
         return;
     }
 
@@ -2366,6 +2561,7 @@ static void _do_ota_update(void)
             MQTT_Init(&re_cfg);
             MQTT_SubscribeCommands(on_command_received);
             s_ota_in_progress = 0;
+        BoardStatus_Clear(BOARD_STATUS_OTA_IN_PROGRESS);
             return;
         }
     }
@@ -2417,6 +2613,7 @@ static void _do_ota_update(void)
         }
 
         s_ota_in_progress = 0;
+        BoardStatus_Clear(BOARD_STATUS_OTA_IN_PROGRESS);
         return;
     }
 
@@ -2440,6 +2637,7 @@ static void _do_ota_update(void)
     /* If we get here, swap failed */
     MQTT_PublishStatus("{\"status\":\"ota_error\",\"reason\":\"bank_swap_failed\"}");
     s_ota_in_progress = 0;
+    BoardStatus_Clear(BOARD_STATUS_OTA_IN_PROGRESS);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2573,7 +2771,11 @@ static void _do_start_portal(void)
         NVIC_SystemReset();  /* Hard reboot as last resort */
     }
 
-    CaptivePortal_Start();  /* Blocks until configured + auto-reboots */
+    /* Always PORTAL_REASON_MANUAL here: this function is only reached via
+     * an explicit operator/agent request (button gesture or MQTT portal
+     * command) — never the automatic creds-suspect path, which calls
+     * CaptivePortal_Start() directly from the boot/reconnect logic. */
+    CaptivePortal_Start(PORTAL_REASON_MANUAL);  /* Blocks until configured + auto-reboots */
     /* Never returns */
 }
 
@@ -2622,6 +2824,16 @@ static void EnterPSRest(void)
 
     uint32_t btn_tick_before = s_button_press_tick;
 
+    /* LEDs off for the sleep window (BOARD_STATUS_ASLEEP) -- waking the
+     * LEDs briefly to show state would defeat the point of PS-REST's
+     * energy saving. ASLEEP is a tier-1 phase (board_status.c), so there
+     * is no "restore previous" to fall back on when we wake — see the
+     * explicit BoardStatus_Set() right after Scheduler_EnterLowPower()
+     * below, not a Clear() call, which would be a silent no-op for a
+     * tier-1 state. */
+    BoardStatus_Set(BOARD_STATUS_ASLEEP);
+    BoardStatus_Tick();
+
     /* STOP2 sleep.  Note: SysTick (HAL_GetTick) is frozen during STOP2 and is
      * NOT corrected for sleep duration on wake (Scheduler_EnterLowPower only
      * restores the clock frequency).  Therefore PS-REST sleep time is NOT
@@ -2633,6 +2845,16 @@ static void EnterPSRest(void)
 #if WATCHDOG_ENABLED
     HAL_IWDG_Refresh(&hiwdg);    /* IWDG resumes on STOP2 exit — refresh now */
 #endif
+
+    /* Wake: EnterPSRest() only sleeps when MQTT_IsConnected() was true at
+     * entry (guarded at the top of this function) and PS-REST keeps WiFi
+     * associated via 802.11 power-save, so we are virtually always still
+     * online on wake — assert that directly instead of leaving ASLEEP
+     * rendered until some unrelated Set() call happens to fire later.
+     * If MQTT actually did drop during sleep, the main loop's own
+     * MQTT_IsConnected()-guarded reconnect logic corrects this on its
+     * very next tick regardless. */
+    BoardStatus_Set(BOARD_STATUS_ONLINE_IDLE);
 
 #if WIFI_POWERSAVE_ENABLED
     /* Back to full power so MQTT_ProcessLoop services pending RX promptly */

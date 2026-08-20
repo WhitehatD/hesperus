@@ -20,6 +20,7 @@
 #include "firmware_config.h"
 #include "debug_log.h"
 #include "main.h"
+#include "board_status.h"
 #include "ota_update.h"  /* Firmware_CRC32 — shared with the chunked upload finalizer */
 
 #include "mx_wifi.h"
@@ -153,6 +154,50 @@ WiFiStatus_t WiFi_Init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  SSID Presence Check — disambiguates "AP absent" from "AP present but
+ *  connect failed" so callers can tell a temporary hotspot outage apart
+ *  from actually-wrong credentials. MX_WIFI_Scan(MC_SCAN_ACTIVE, ssid, ...)
+ *  is a directed probe-request scan for that specific SSID — the vendor
+ *  driver's own mipc_request() call already blocks with its own bounded
+ *  timeout (MX_WIFI_SCAN_TIMEOUT, mx_wifi.h:91, 5000ms), so this never
+ *  needs a wait loop of its own.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static bool _wifi_ssid_in_scan(const char *ssid)
+{
+    MX_WIFIObject_t *wifi = wifi_obj_get();
+    size_t ssid_len = strlen(ssid);
+
+    if (MX_WIFI_Scan(wifi, MC_SCAN_ACTIVE, (char *)ssid, (int32_t)ssid_len) != MX_WIFI_STATUS_OK)
+    {
+        /* Scan itself failed (module busy/IO error) — NOT evidence the AP
+         * is absent. Treat as "unknown/present" so a flaky scan can't get
+         * mistaken for a real AP-absence and can't get mistaken for a
+         * creds-suspect strike either — the caller's connect attempt below
+         * is the real signal in that case. */
+        LOG_WARN(TAG_WIFI, "SSID scan failed (module busy?) — assuming AP may be present");
+        return true;
+    }
+
+    mwifi_ap_info_t results[MX_WIFI_MAX_DETECTED_AP];
+    int8_t count = MX_WIFI_Get_scan_result(wifi, (uint8_t *)results, MX_WIFI_MAX_DETECTED_AP);
+
+    for (int8_t i = 0; i < count; i++)
+    {
+        if (strncmp(results[i].ssid, ssid, sizeof(results[i].ssid)) == 0)
+        {
+            LOG_DEBUG(TAG_WIFI, "SSID '%s' seen in scan (RSSI=%ld, ch=%ld)",
+                      ssid, (long)results[i].rssi, (long)results[i].channel);
+            return true;
+        }
+    }
+
+    LOG_INFO(TAG_WIFI, "SSID '%s' NOT seen in scan (%d APs found) — AP absent/out of range",
+             ssid, count);
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Connection
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -164,106 +209,113 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
         return WIFI_ERROR_INIT;
     }
 
+    /* ── Step 0: is the AP even broadcasting right now? ──
+     * This is the disambiguation the whole retry policy hinges on (see
+     * firmware_config.h's "Enterprise WiFi Retry Policy" note): the vendor
+     * driver's connect() return code alone cannot tell "wrong password"
+     * apart from "AP not in range". A directed scan for this exact SSID
+     * can. If it's not there, don't even attempt the handshake — fail
+     * fast with a result the caller can act on correctly (retry forever,
+     * never touch the portal), instead of burning a full connect+DHCP
+     * timeout finding out the AP was never there to begin with. */
+    BoardStatus_Set(BOARD_STATUS_WIFI_CONNECTING);
+    if (!_wifi_ssid_in_scan(ssid))
+    {
+        BoardStatus_Set(BOARD_STATUS_WIFI_SEARCHING);
+        return WIFI_ERROR_AP_NOT_FOUND;
+    }
+    BoardStatus_Set(BOARD_STATUS_WIFI_CONNECTING);
+
     LOG_INFO(TAG_WIFI, "Connecting to '%s'...", ssid);
 
     /* Enable DHCP — without this, the driver sends static IP config (all zeros) */
     wifi_obj_get()->NetSettings.DHCP_IsEnabled = 1;
 
-    uint32_t backoff_ms = 1000;  /* Exponential backoff: 1s → 2s → 4s */
+    int32_t ret = MX_WIFI_Connect(wifi_obj_get(), ssid, password, MX_WIFI_SEC_AUTO);
 
-    for (int attempt = 1; attempt <= WIFI_CONNECT_RETRIES; attempt++)
+    if (ret != MX_WIFI_STATUS_OK)
     {
-        LOG_DEBUG(TAG_WIFI, "Attempt %d/%d", attempt, WIFI_CONNECT_RETRIES);
-
-        int32_t ret = MX_WIFI_Connect(
-            wifi_obj_get(),
-            ssid,
-            password,
-            MX_WIFI_SEC_AUTO
-        );
-
-        if (ret == MX_WIFI_STATUS_OK)
-        {
-            s_connected = 1;
-            LOG_INFO(TAG_WIFI, "Connected to '%s' (attempt %d)", ssid, attempt);
-
-            /* Establish a KNOWN power-save state for normal operation.
-             *
-             * 2026-08-19: bulk upload crawled at ~1.3 KB/s over a phone
-             * hotspot (18KB in 14s) while a laptop on the same AP did
-             * ~1 MB/s, with the SPI FLOW line pinned LOW — i.e. the module
-             * could not drain what we handed it. In 802.11 power-save the
-             * station only transmits around DTIM beacon windows, which
-             * throttles sustained TX to a trickle while leaving small
-             * sends (MQTT keepalives, HTTP headers) apparently fine.
-             * Nothing in this firmware ever disabled it outside the
-             * PS-REST feature, so whatever the module's boot default is,
-             * we inherited it for every upload.
-             *
-             * NOTE this deliberately does NOT fight the low-power modes:
-             * PS-REST still enables power-save via WiFi_SetPowerSave()
-             * when it wants to, and uploads force it off only for the
-             * duration of the transfer, restoring the mode's wish after
-             * (see WiFi_HttpPostImage). This call just makes "normal"
-             * mode mean what it says. */
-            WiFi_SetPowerSave(0);
-
-            /* Wait for DHCP to assign an IP address.
-             * iPhone hotspots can be very slow (10-30s) to respond to
-             * embedded DHCP clients — be patient and yield aggressively. */
-            MX_WIFI_IO_YIELD(wifi_obj_get(), 5000);
-            Watchdog_Refresh();
-
-            uint8_t ip[4] = {0};
-            bool got_ip = false;
-            for (int dhcp_wait = 0; dhcp_wait < 15; dhcp_wait++)
-            {
-                /* EMW3080 Connect API is asynchronous for WPA handshakes.
-                 * If the user provided a wrong password, association might succeed 
-                 * but the subsequent 4-way handshake will fail and the AP will kick us.
-                 * If we lose link layer connectivity, fail fast instead of waiting 35s. */
-                if (MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
-                {
-                    LOG_ERROR(TAG_WIFI, "Link dropped during DHCP (wrong password or AP reject)");
-                    break;
-                }
-
-                if (MX_WIFI_GetIPAddress(wifi_obj_get(), ip, MC_STATION) == MX_WIFI_STATUS_OK
-                    && (ip[0] | ip[1] | ip[2] | ip[3]) != 0)
-                {
-                    got_ip = true;
-                    break;
-                }
-                /* Yield 2s between retries to process SPI + DHCP exchanges */
-                MX_WIFI_IO_YIELD(wifi_obj_get(), 2000);
-                Watchdog_Refresh();
-            }
-
-            if (got_ip)
-            {
-                LOG_INFO(TAG_WIFI, "IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-                return WIFI_OK;
-            }
-            else
-            {
-                LOG_ERROR(TAG_WIFI, "DHCP failed — no IP assigned (timeout or link drop)");
-                s_connected = 0;
-                
-                /* CRITICAL: Force the module to tear down the socket and radio
-                 * state before we attempt another connection, avoiding state machine locks */
-                MX_WIFI_Disconnect(wifi_obj_get());
-                MX_WIFI_IO_YIELD(wifi_obj_get(), 1000);
-                continue;  /* Retry full connection */
-            }
-        }
-
-        LOG_WARN(TAG_WIFI, "Attempt %d failed (err=%ld), retrying in %lu ms...",
-                 attempt, (long)ret, (unsigned long)backoff_ms);
-        HAL_Delay(backoff_ms);
-        backoff_ms *= 2;  /* Exponential backoff */
+        LOG_WARN(TAG_WIFI, "MX_WIFI_Connect failed (err=%ld) — SSID was visible, so this "
+                 "counts as a credentials-suspect signal", (long)ret);
+        return WIFI_ERROR_CONNECT;
     }
 
-    LOG_ERROR(TAG_WIFI, "All %d connection attempts to '%s' failed", WIFI_CONNECT_RETRIES, ssid);
+    s_connected = 1;
+    LOG_INFO(TAG_WIFI, "Associated with '%s'", ssid);
+
+    /* Establish a KNOWN power-save state for normal operation.
+     *
+     * 2026-08-19: bulk upload crawled at ~1.3 KB/s over a phone
+     * hotspot (18KB in 14s) while a laptop on the same AP did
+     * ~1 MB/s, with the SPI FLOW line pinned LOW — i.e. the module
+     * could not drain what we handed it. In 802.11 power-save the
+     * station only transmits around DTIM beacon windows, which
+     * throttles sustained TX to a trickle while leaving small
+     * sends (MQTT keepalives, HTTP headers) apparently fine.
+     * Nothing in this firmware ever disabled it outside the
+     * PS-REST feature, so whatever the module's boot default is,
+     * we inherited it for every upload.
+     *
+     * NOTE this deliberately does NOT fight the low-power modes:
+     * PS-REST still enables power-save via WiFi_SetPowerSave()
+     * when it wants to, and uploads force it off only for the
+     * duration of the transfer, restoring the mode's wish after
+     * (see WiFi_HttpPostImage). This call just makes "normal"
+     * mode mean what it says. */
+    WiFi_SetPowerSave(0);
+
+    /* Wait for DHCP to assign an IP address, tightly polled against a real
+     * deadline (WIFI_CONNECT_TIMEOUT_MS, firmware_config.h — actually
+     * enforced now, unlike the old fixed 5000ms-then-30000ms-worst-case
+     * shape). iPhone hotspots can still be slow (several seconds) to
+     * respond to embedded DHCP clients, so the deadline stays generous —
+     * it's just no longer paid unconditionally on every attempt. */
+    uint8_t ip[4] = {0};
+    bool got_ip = false;
+    uint32_t dhcp_start = HAL_GetTick();
+    const uint32_t dhcp_poll_ms = 300;
+
+    while ((HAL_GetTick() - dhcp_start) < WIFI_CONNECT_TIMEOUT_MS)
+    {
+        /* EMW3080 Connect API is asynchronous for WPA handshakes.
+         * If the user provided a wrong password, association might succeed
+         * but the subsequent 4-way handshake will fail and the AP will kick
+         * us. If we lose link layer connectivity, fail fast instead of
+         * waiting out the full deadline. */
+        if (MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
+        {
+            LOG_ERROR(TAG_WIFI, "Link dropped during DHCP (wrong password or AP reject)");
+            break;
+        }
+
+        if (MX_WIFI_GetIPAddress(wifi_obj_get(), ip, MC_STATION) == MX_WIFI_STATUS_OK
+            && (ip[0] | ip[1] | ip[2] | ip[3]) != 0)
+        {
+            got_ip = true;
+            break;
+        }
+
+        MX_WIFI_IO_YIELD(wifi_obj_get(), dhcp_poll_ms);
+        Watchdog_Refresh();
+    }
+
+    if (got_ip)
+    {
+        LOG_INFO(TAG_WIFI, "IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+        return WIFI_OK;
+    }
+
+    LOG_ERROR(TAG_WIFI, "DHCP failed — no IP assigned (timeout or link drop)");
+    s_connected = 0;
+
+    /* CRITICAL: Force the module to tear down the socket and radio
+     * state before the caller attempts another connection, avoiding
+     * state machine locks. */
+    MX_WIFI_Disconnect(wifi_obj_get());
+    MX_WIFI_IO_YIELD(wifi_obj_get(), 500);
+
+    /* SSID was confirmed visible above, so a DHCP/handshake failure this
+     * far in is a real credentials-suspect signal, not an AP-absence one. */
     return WIFI_ERROR_CONNECT;
 }
 

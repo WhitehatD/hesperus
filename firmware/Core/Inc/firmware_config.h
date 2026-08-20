@@ -23,8 +23,46 @@
  *  Never commit plaintext credentials to source control.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define WIFI_CONNECT_RETRIES        3
-#define WIFI_CONNECT_TIMEOUT_MS     10000
+#define WIFI_CONNECT_TIMEOUT_MS     10000  /* Per-attempt assoc+DHCP deadline (WiFi_Connect) */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Enterprise WiFi Retry Policy (2026-08-20)
+ *
+ *  The EMW3080 driver cannot report *why* a connect failed via its return
+ *  code (MX_WIFI_STATUS_T is only OK/ERROR/TIMEOUT/IO_ERROR/PARAM_ERROR).
+ *  We disambiguate ourselves: an active scan for the stored SSID
+ *  (MX_WIFI_Scan + MX_WIFI_Get_scan_result) tells us whether the AP is
+ *  actually broadcasting in range, independent of the auth handshake.
+ *
+ *    - SSID NOT seen in scan  -> AP absent (hotspot off / out of range).
+ *      Retry FOREVER with capped backoff. Never auto-portal — the stored
+ *      credentials are presumed correct and will work again once the AP
+ *      reappears.
+ *    - SSID SEEN in scan, but WIFI_CREDS_SUSPECT_STRIKES consecutive full
+ *      connect+DHCP attempts still fail -> the AP demonstrably exists and
+ *      we still can't get on it -> very likely a bad password. Auto-enter
+ *      the portal so the operator can fix it, instead of retrying into a
+ *      wall forever.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+/* NOTE: no WIFI_SCAN_TIMEOUT_MS here — MX_WIFI_Scan() is a blocking vendor
+ * call already bounded by the driver's own MX_WIFI_SCAN_TIMEOUT (5000ms,
+ * mx_wifi.h:91). Duplicating it as a second, unenforced constant here is
+ * exactly the "dead config" trap WIFI_CONNECT_TIMEOUT_MS used to be —
+ * intentionally not repeating it. */
+#define WIFI_CREDS_SUSPECT_STRIKES    3      /* Consecutive AP-found-but-failed attempts -> portal */
+#define WIFI_RETRY_BACKOFF_INITIAL_MS 2000   /* First background retry delay */
+#define WIFI_RETRY_BACKOFF_MAX_MS     30000  /* Backoff ceiling (doubles each failure up to this) */
+#define WIFI_REINIT_AFTER_ATTEMPTS    5      /* Full module DeInit/Init only after this many
+                                               * consecutive failed attempts (any reason) — not
+                                               * on every single retry, to avoid paying the ~5s
+                                               * hardware reset delay repeatedly for a module
+                                               * that is still perfectly healthy. */
+#define WIFI_PORTAL_SANITY_RECHECK_MS (5U * 60U * 1000U)  /* Background retry of stored creds
+                                               * while the creds-suspect portal is open — in
+                                               * case it was a fluke. Auto-exits + reboots on
+                                               * success. Deliberately infrequent so we don't
+                                               * hammer an AP that may be rate-limiting failed
+                                               * auth attempts. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Server Configuration (FastAPI backend)
@@ -184,8 +222,23 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  *  B3 USER Button — Short Press / Long Press
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define BUTTON_LONG_PRESS_MS          3000  /* Hold ≥3s = enter captive portal mode */
+#define BUTTON_LONG_PRESS_MS          3000  /* Hold ≥3s = enter captive portal mode (creds untouched) */
 #define BUTTON_DEBOUNCE_MS            50    /* Ignore presses shorter than 50ms */
+
+/* Factory-reset gesture (2026-08-20) — deliberately staged so it can never
+ * fire from a stray tap or a normal 3s portal-hold:
+ *   0s..3s   : (unchanged) portal hold window
+ *   3s..8s   : nothing new — still just "force portal" if released
+ *   8s..10s  : PENDING-ERASE WARNING — distinct fast RED/GREEN alternate LED.
+ *              Nothing destructive yet. Releasing here safely ABORTS with
+ *              zero side effects (falls back to the 3s force-portal outcome).
+ *   >=10s    : commits WiFiCred_Erase() + reboot into a fresh first-boot
+ *              portal. Only the RESET (NRST) button is guaranteed side-
+ *              effect-free at all times — this is the only path that can
+ *              erase credentials, and it requires ~10s of continuous,
+ *              deliberate holding with a clear on-board warning first. */
+#define BUTTON_FACTORY_RESET_WARN_MS   8000
+#define BUTTON_FACTORY_RESET_COMMIT_MS 10000
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  SEC-07: Command Rate-Limiting

@@ -23,6 +23,7 @@
 #include "firmware_config.h"
 #include "debug_log.h"
 #include "wifi.h"
+#include "board_status.h"
 #include "main.h"
 
 #include "mx_wifi.h"
@@ -40,6 +41,7 @@
 static volatile uint8_t s_portal_active = 0;
 static int32_t s_http_server_sock = -1;
 static int32_t s_dns_sock = -1;
+static PortalReason_t s_portal_reason = PORTAL_REASON_FRESH;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Embedded HTML — Configuration Page
@@ -843,13 +845,18 @@ static PortalStatus_t _start_dns_server(void)
  *  Portal Start — Main Entry Point (Blocking)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-PortalStatus_t CaptivePortal_Start(void)
+PortalStatus_t CaptivePortal_Start(PortalReason_t reason)
 {
     LOG_INFO(TAG_PORT, "╔══════════════════════════════════════════╗");
     LOG_INFO(TAG_PORT, "║      CAPTIVE PORTAL MODE STARTING       ║");
     LOG_INFO(TAG_PORT, "╚══════════════════════════════════════════╝");
+    LOG_INFO(TAG_PORT, "Reason: %s",
+             reason == PORTAL_REASON_CREDS_SUSPECT ? "credentials suspect (AP present, repeated auth failure)" :
+             reason == PORTAL_REASON_MANUAL        ? "manual (operator requested)" :
+                                                       "fresh (no stored credentials)");
 
     s_portal_active = 1;
+    s_portal_reason = reason;
 
     /* ── Step 0: Ensure WiFi driver is initialized ────────────── */
     /* Since we removed the compile-time fallback, a fresh board with no
@@ -861,20 +868,23 @@ PortalStatus_t CaptivePortal_Start(void)
         return PORTAL_ERROR_AP;
     }
 
-    /* ── Rapid RED blink to indicate portal mode ── */
-    for (int i = 0; i < 5; i++)
-    {
-        BSP_LED_Toggle(LED_RED);
-        HAL_Delay(200);
-    }
-    BSP_LED_On(LED_RED);  /* Solid RED = portal active */
+    /* Distinct LED language: PORTAL_CREDS_SUSPECT (RED solid + GREEN slow
+     * pulse) makes it visually obvious "I stopped trying to connect on
+     * purpose" versus plain PORTAL_ACTIVE (RED slow blink) for a fresh
+     * device or a deliberate button-hold entry — see board_status.h. */
+    BoardStatus_Set(reason == PORTAL_REASON_CREDS_SUSPECT
+                     ? BOARD_STATUS_PORTAL_CREDS_SUSPECT
+                     : BOARD_STATUS_PORTAL_ACTIVE);
 
     /* ── Step 1: Start SoftAP ─────────────────────────── */
     PortalStatus_t status = _start_softap();
     if (status != PORTAL_OK)
     {
         LOG_ERROR(TAG_PORT, "SoftAP start failed — cannot serve portal");
-        s_portal_active = 0;
+        CaptivePortal_Stop();  /* Releases the PORTAL_* BoardStatus override too — see
+                                 * CaptivePortal_Stop()'s comment; safe even though nothing
+                                 * actually started (socket closes/StopAP are no-ops on
+                                 * already-unset state). */
         return status;
     }
 
@@ -901,6 +911,8 @@ PortalStatus_t CaptivePortal_Start(void)
     MX_WIFI_Socket_setsockopt(wifi, s_http_server_sock, MX_SOL_SOCKET,
                                MX_SO_RCVTIMEO, &accept_timeout, sizeof(accept_timeout));
 
+    uint32_t last_sanity_recheck = HAL_GetTick();
+
     while (s_portal_active)
     {
 #if WATCHDOG_ENABLED
@@ -913,12 +925,67 @@ PortalStatus_t CaptivePortal_Start(void)
         /* Yield SPI pipeline */
         MX_WIFI_IO_YIELD(wifi, 50);
 
-        /* Blink RED LED to indicate waiting */
-        static uint32_t blink_tick = 0;
-        if ((HAL_GetTick() - blink_tick) > 1000)
+        /* Render whatever BoardStatus_Set() picked above (PORTAL_ACTIVE or
+         * PORTAL_CREDS_SUSPECT) — replaces the old ad-hoc RED toggle. */
+        BoardStatus_Tick();
+
+        /* ── Background sanity re-check (creds-suspect only) ──
+         * The EMW3080 cannot reliably run SoftAP + a STA connect attempt
+         * at the same time — a channel switch for the STA handshake kills
+         * the SoftAP's own TCP sockets (see WiFiCred module notes / the
+         * deferred test-before-save design elsewhere in this file). So
+         * this is not a silent background thread: it briefly tears the
+         * portal down, makes ONE bounded connect attempt with the OLD
+         * stored credentials, and either reboots into normal operation
+         * (success) or brings the portal back up (still failing) — at
+         * most once every WIFI_PORTAL_SANITY_RECHECK_MS, so a flaky
+         * router isn't hammered with repeated failed auth attempts. */
+        if (s_portal_reason == PORTAL_REASON_CREDS_SUSPECT &&
+            (HAL_GetTick() - last_sanity_recheck) >= WIFI_PORTAL_SANITY_RECHECK_MS)
         {
-            BSP_LED_Toggle(LED_RED);
-            blink_tick = HAL_GetTick();
+            last_sanity_recheck = HAL_GetTick();
+            WiFiCredentials_t old_creds;
+
+            if (WiFiCred_Load(&old_creds) == WIFI_CRED_OK)
+            {
+                LOG_INFO(TAG_PORT, "Sanity recheck: briefly leaving the portal to retry "
+                         "stored credentials for '%s'...", old_creds.ssid);
+
+                MX_WIFI_Socket_close(wifi, s_http_server_sock);
+                s_http_server_sock = -1;
+                if (s_dns_sock >= 0)
+                {
+                    MX_WIFI_Socket_close(wifi, s_dns_sock);
+                    s_dns_sock = -1;
+                }
+                MX_WIFI_StopAP(wifi);
+                MX_WIFI_IO_YIELD(wifi, 500);
+
+                if (WiFi_Connect(old_creds.ssid, old_creds.password) == WIFI_OK)
+                {
+                    LOG_INFO(TAG_PORT, "Sanity recheck SUCCEEDED — stored credentials work "
+                             "again. Rebooting into normal operation, no user action needed.");
+                    HAL_Delay(300);
+                    NVIC_SystemReset();
+                    /* Never returns */
+                }
+
+                LOG_WARN(TAG_PORT, "Sanity recheck failed — still can't connect. "
+                         "Restarting portal.");
+                MX_WIFI_Disconnect(wifi);
+                MX_WIFI_IO_YIELD(wifi, 300);
+
+                if (_start_softap() != PORTAL_OK || _start_dns_server() != PORTAL_OK ||
+                    _start_http_server() != PORTAL_OK)
+                {
+                    LOG_ERROR(TAG_PORT, "Failed to restart portal after sanity recheck — rebooting");
+                    NVIC_SystemReset();
+                }
+                wifi = wifi_obj_get();
+                MX_WIFI_Socket_setsockopt(wifi, s_http_server_sock, MX_SOL_SOCKET,
+                                           MX_SO_RCVTIMEO, &accept_timeout, sizeof(accept_timeout));
+                BoardStatus_Set(BOARD_STATUS_PORTAL_CREDS_SUSPECT);
+            }
         }
 
         /* Accept HTTP connection (non-blocking with timeout) */
@@ -935,9 +1002,10 @@ PortalStatus_t CaptivePortal_Start(void)
         }
 
         LOG_INFO(TAG_PORT, "HTTP client connected (sock=%ld)", (long)client_sock);
+        BoardStatus_Pulse(BOARD_PULSE_PORTAL_CLIENT);
 
-        /* Explicitly set receive timeout to 100ms. EMW3080 accept() creates new sockets 
-         * with the default 10000ms blocking timeout instead of inheriting from the server socket. 
+        /* Explicitly set receive timeout to 100ms. EMW3080 accept() creates new sockets
+         * with the default 10000ms blocking timeout instead of inheriting from the server socket.
          * Without this, speculative browser connections cause a 10s deadlock (Command 0x0205 timeout). */
         int32_t rcv_timeout = 100;
         MX_WIFI_Socket_setsockopt(wifi, client_sock, MX_SOL_SOCKET, MX_SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
@@ -998,6 +1066,18 @@ void CaptivePortal_Stop(void)
 
     MX_WIFI_StopAP(wifi);
 
-    BSP_LED_Off(LED_RED);
+    /* Release BOTH possible portal overrides — PORTAL_ACTIVE and
+     * PORTAL_CREDS_SUSPECT are mutually exclusive so only one is ever
+     * actually active, but Clear() is a no-op if `state` isn't the
+     * current override, so calling both unconditionally is safe and
+     * covers every reason the portal could have been started with.
+     * (2026-08-20 verification round 3: previously NEITHER was ever
+     * cleared anywhere in the firmware — a failed SoftAP/HTTP bring-up,
+     * or any call to CaptivePortal_Stop(), left the tier-2 override
+     * latched forever, permanently masking OTA/WiFi/MQTT LED states for
+     * the rest of the device's uptime.) */
+    BoardStatus_Clear(BOARD_STATUS_PORTAL_ACTIVE);
+    BoardStatus_Clear(BOARD_STATUS_PORTAL_CREDS_SUSPECT);
+
     LOG_INFO(TAG_PORT, "Captive portal stopped");
 }
