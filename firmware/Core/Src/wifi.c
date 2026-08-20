@@ -844,6 +844,75 @@ static const char *_find_json_body(const uint8_t *resp_buf)
  * can catch a chunk landing at the wrong offset or a partial write before
  * treating the frame as valid image data.
  */
+/**
+ * @brief  Ask the server how many bytes of this task it has actually stored.
+ * @param  task_id   Server-side upload task id.
+ * @param  offset_out Written with the server's confirmed byte offset on success.
+ * @retval true if the server answered 200 with a parseable received_offset.
+ *
+ * Used both to resume an interrupted upload at start, and — more importantly —
+ * to avoid re-sending a chunk that already landed. It is a tiny GET, so it
+ * still gets through on a link too degraded to move a 4KB POST promptly,
+ * which is exactly the situation where knowing the truth matters most.
+ */
+static bool _query_server_offset(uint32_t task_id, uint32_t *offset_out)
+{
+    bool got = false;
+
+    int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
+        "GET %s/resume?task_id=%lu HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "X-Upload-Token: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        SERVER_UPLOAD_PATH, (unsigned long)task_id,
+        SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
+
+    int32_t rsock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+    if (rsock < 0)
+        return false;
+
+    if (_socket_send_all(rsock, (uint8_t *)s_http_header, header_len) == 0)
+    {
+        uint8_t rbuf[512] = {0};
+        int32_t rlen = 0;
+        uint32_t rwait = HAL_GetTick();
+        while ((HAL_GetTick() - rwait) < HTTP_RESPONSE_TIMEOUT_MS)
+        {
+            MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
+            rlen = MX_WIFI_Socket_recv(wifi_obj_get(), rsock, rbuf, sizeof(rbuf) - 1, 0);
+            if (rlen > 0)
+                break;
+        }
+        if (rlen > 0)
+        {
+            rbuf[rlen] = '\0';
+            if (_parse_http_status(rbuf) == 200)
+            {
+                const char *body = _find_json_body(rbuf);
+                if (body != NULL)
+                {
+                    json_mem_reset();
+                    cJSON *root = cJSON_Parse(body);
+                    if (root != NULL)
+                    {
+                        cJSON *j_off = cJSON_GetObjectItem(root, "received_offset");
+                        if (cJSON_IsNumber(j_off))
+                        {
+                            *offset_out = (uint32_t)j_off->valuedouble;
+                            got = true;
+                        }
+                        cJSON_Delete(root);
+                    }
+                }
+            }
+        }
+    }
+
+    MX_WIFI_Socket_close(wifi_obj_get(), rsock);
+    return got;
+}
+
 WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                                  const uint8_t *data, uint32_t data_len)
 {
@@ -873,6 +942,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
     uint32_t offset = 0;
     uint32_t consecutive_failures = 0;
     uint32_t backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+    bool probe_before_resend = false;
 
     /* Resume: ask the server how far a PREVIOUS attempt for this task got.
      * Without this, hitting the deadline (or a reboot mid-upload) would
@@ -883,60 +953,12 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
      * assigned until the server sees chunk 0. */
     if (task_id != 0 && !(task_id >= 10000 && task_id <= 40000))
     {
-        int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
-            "GET %s/resume?task_id=%lu HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "X-Upload-Token: %s\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id,
-            SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
-
-        int32_t rsock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
-        if (rsock >= 0)
+        uint32_t srv = 0;
+        if (_query_server_offset(resolved_task_id, &srv) && srv > 0 && srv < data_len)
         {
-            if (_socket_send_all(rsock, (uint8_t *)s_http_header, header_len) == 0)
-            {
-                uint8_t rbuf[512] = {0};
-                int32_t rlen = 0;
-                uint32_t rwait = HAL_GetTick();
-                while ((HAL_GetTick() - rwait) < HTTP_RESPONSE_TIMEOUT_MS)
-                {
-                    MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
-                    rlen = MX_WIFI_Socket_recv(wifi_obj_get(), rsock, rbuf, sizeof(rbuf) - 1, 0);
-                    if (rlen > 0)
-                        break;
-                }
-                if (rlen > 0)
-                {
-                    rbuf[rlen] = '\0';
-                    if (_parse_http_status(rbuf) == 200)
-                    {
-                        const char *body = _find_json_body(rbuf);
-                        if (body != NULL)
-                        {
-                            json_mem_reset();
-                            cJSON *root = cJSON_Parse(body);
-                            if (root != NULL)
-                            {
-                                cJSON *j_off = cJSON_GetObjectItem(root, "received_offset");
-                                if (cJSON_IsNumber(j_off))
-                                {
-                                    uint32_t srv = (uint32_t)j_off->valuedouble;
-                                    if (srv > 0 && srv < data_len)
-                                    {
-                                        offset = srv;
-                                        LOG_INFO(TAG_HTTP, "Resuming upload at %lu/%lu bytes",
-                                                 (unsigned long)offset, (unsigned long)data_len);
-                                    }
-                                }
-                                cJSON_Delete(root);
-                            }
-                        }
-                    }
-                }
-            }
-            MX_WIFI_Socket_close(wifi_obj_get(), rsock);
+            offset = srv;
+            LOG_INFO(TAG_HTTP, "Resuming upload at %lu/%lu bytes",
+                     (unsigned long)offset, (unsigned long)data_len);
         }
     }
 
@@ -1101,6 +1123,22 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             {
                 MX_WIFI_Socket_close(wifi_obj_get(), sock);
                 sock = -1;
+
+                /* A timeout means we never SAW the response — it does NOT
+                 * mean the server never got the chunk. Measured live
+                 * (task 20, server access log vs board log): the server
+                 * received and answered 200 to EVERY attempt the board
+                 * reported as "No response", because the request itself
+                 * needed ~5-6s to traverse the link while the board was
+                 * only willing to wait 5s. Blindly re-POSTing 4KB in that
+                 * situation is the worst possible move: the data is
+                 * already delivered, so the resend is pure waste that adds
+                 * load to the very link that was too slow, and it later
+                 * lands as a duplicate (the 409s in the server log).
+                 * So: before resending anything, ask the server what it
+                 * actually has. The probe is a tiny GET that gets through
+                 * even when a 4KB POST struggles. */
+                probe_before_resend = true;
             }
         }
 
@@ -1150,6 +1188,27 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         _wait_servicing_mqtt(backoff_ms);
         backoff_ms = (backoff_ms * 2 > UPLOAD_CHUNK_RETRY_MAX_MS) ? UPLOAD_CHUNK_RETRY_MAX_MS : backoff_ms * 2;
         MQTT_SendPing();
+
+        /* Ask the server what it actually holds before re-sending a chunk we
+         * may well have already delivered (see the note where this flag is
+         * set). A confirmed offset lets us skip straight past chunks that
+         * landed while we weren't listening, instead of pushing the same
+         * bytes over a link that is already the bottleneck. */
+        if (probe_before_resend)
+        {
+            probe_before_resend = false;
+            uint32_t confirmed = offset;
+            if (_query_server_offset(resolved_task_id, &confirmed) && confirmed > offset)
+            {
+                LOG_INFO(TAG_HTTP, "Server already has %lu/%lu bytes — skipping resend, "
+                         "advancing offset %lu -> %lu",
+                         (unsigned long)confirmed, (unsigned long)data_len,
+                         (unsigned long)offset, (unsigned long)confirmed);
+                offset = confirmed;
+                consecutive_failures = 0;
+                backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
+            }
+        }
     }
 
     /* Chunks are done — release the keep-alive socket before finalizing so
@@ -1245,10 +1304,17 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         if (done_ok)
         {
             uint32_t upload_ms = HAL_GetTick() - upload_start_tick;
-            uint32_t kbps = (upload_ms > 0) ? (data_len / upload_ms) : 0;
-            LOG_INFO(TAG_HTTP, "[PERF] Chunked upload: %lu bytes in %lums (%lu KB/s), task %lu",
+            /* Tenths of KB/s — bytes/ms IS ~KB/s dimensionally, but plain
+             * integer division floors every rate under 1.0 KB/s to a
+             * misleading "0 KB/s" (e.g. 7051 bytes / 7402 ms = 0.95). Rates
+             * in that range are exactly what a degraded link produces, so
+             * the one number meant to show progress showed nothing. Max
+             * payload 614400 * 10 fits uint32 with 700x headroom. */
+            uint32_t kbps_x10 = (upload_ms > 0) ? (data_len * 10u / upload_ms) : 0;
+            LOG_INFO(TAG_HTTP, "[PERF] Chunked upload: %lu bytes in %lums (%lu.%lu KB/s), task %lu",
                      (unsigned long)data_len, (unsigned long)upload_ms,
-                     (unsigned long)kbps, (unsigned long)resolved_task_id);
+                     (unsigned long)(kbps_x10 / 10u), (unsigned long)(kbps_x10 % 10u),
+                     (unsigned long)resolved_task_id);
             BSP_LED_Off(LED_GREEN);
             _powersave_restore(ps_prev);
             return WIFI_OK;

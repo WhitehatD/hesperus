@@ -102,12 +102,24 @@
  * loop ("No response to chunk at offset 0"), then completed in ~2s once it
  * gave up and used a fresh socket.
  *
- * A HEALTHY chunk response is 140-166ms (server access log, tasks 12/13), so
- * 5000ms is ~30x margin and still allows a full recv timeout plus slack. The
- * point is to fail over to a fresh socket FAST — retrying is cheap and
- * lossless (offset only advances on server confirmation, and /api/upload/
- * resume re-syncs), whereas waiting is pure dead time. */
-#define HTTP_RESPONSE_TIMEOUT_MS   5000
+ * CORRECTED again after measuring the REQUEST leg, not just the response:
+ * 5000 was set from the healthy-case response time (140-166ms, tasks 12/13)
+ * and was wrong, because it ignored how long the request itself takes to
+ * traverse a degraded link. Server access log vs board log, task 20: the
+ * board began the upload at 23:22:51 and the server did not receive the
+ * chunk until 23:22:56.4 — 5.3s IN FLIGHT — so a 5s budget expired just
+ * before delivery, every time. Task 19 shows the same shape: first chunk
+ * 5.6s to land, subsequent chunks on the same socket 1.45s. The server
+ * answered 200 to every one of those "failed" attempts; nothing was ever
+ * lost, the board just stopped listening too early and then re-sent 4KB it
+ * had already delivered — adding load to the exact link that was slow.
+ *
+ * 15000 covers the measured first-chunk latency with ~3x margin. Waiting is
+ * nearly free; a spurious resend is not. Note the retry path now probes
+ * /api/upload/resume before re-sending (see wifi.c), so even when this
+ * budget is exceeded the board skips chunks the server already holds
+ * instead of duplicating them. */
+#define HTTP_RESPONSE_TIMEOUT_MS   15000
 
 /* SEC-05: image-upload auth token, same pattern as SEC-01 (WiFi creds) —
  * inject at build time, never commit a real value. Empty = unauthenticated

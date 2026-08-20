@@ -336,12 +336,14 @@ UploadState_t Upload_Poll(UploadCtx_t *ctx)
             if (http_code >= 200 && http_code < 300)
             {
                 uint32_t elapsed = HAL_GetTick() - ctx->start_tick;
-                uint32_t kbps = elapsed > 0 ? (ctx->data_len / elapsed) : 0;
-                LOG_INFO(TAG_HTTP, "Async upload OK (HTTP %d, %lu bytes, %lums, %lu KB/s)",
+                /* Tenths of KB/s — integer bytes/ms floors sub-1.0 KB/s to "0". */
+                uint32_t kbps_x10 = elapsed > 0 ? (ctx->data_len * 10u / elapsed) : 0;
+                LOG_INFO(TAG_HTTP, "Async upload OK (HTTP %d, %lu bytes, %lums, %lu.%lu KB/s)",
                          http_code,
                          (unsigned long)ctx->data_len,
                          (unsigned long)elapsed,
-                         (unsigned long)kbps);
+                         (unsigned long)(kbps_x10 / 10u),
+                         (unsigned long)(kbps_x10 % 10u));
             }
             else
             {

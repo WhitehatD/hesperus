@@ -761,14 +761,15 @@ OTAStatus_t OTA_DownloadAndFlash(const OTAVersionInfo_t *info,
                 last_progress_bytes = total_downloaded;
                 uint32_t pct = total_downloaded * 100 / info->size;
                 uint32_t elapsed_ms = HAL_GetTick() - download_start_tick;
-                uint32_t kbps = (elapsed_ms > 0)
-                                ? (total_downloaded / elapsed_ms) : 0;
+                uint32_t kbps_x10 = (elapsed_ms > 0)
+                                    ? (total_downloaded * 10u / elapsed_ms) : 0;
 
-                LOG_INFO(TAG_OTA, "Download: %lu/%lu bytes (%lu%%) [%lu KB/s]",
+                LOG_INFO(TAG_OTA, "Download: %lu/%lu bytes (%lu%%) [%lu.%lu KB/s]",
                          (unsigned long)total_downloaded,
                          (unsigned long)info->size,
                          (unsigned long)pct,
-                         (unsigned long)kbps);
+                         (unsigned long)(kbps_x10 / 10u),
+                         (unsigned long)(kbps_x10 % 10u));
 
                 /* Publish progress to dashboard via MQTT */
                 char progress_msg[192];
@@ -818,13 +819,16 @@ OTAStatus_t OTA_DownloadAndFlash(const OTAVersionInfo_t *info,
 
     /* ── Download Throughput Telemetry ──────────────────────────────── */
     uint32_t download_ms = HAL_GetTick() - download_start_tick;
-    uint32_t throughput_kbps = (download_ms > 0)
-                               ? (total_downloaded / download_ms) : 0;
-    (void)throughput_kbps;
-    LOG_INFO(TAG_OTA, "[PERF] Download: %lu bytes in %lums (%lu KB/s)",
+    /* Tenths of KB/s. Integer bytes/ms floors every sub-1.0 KB/s rate to a
+     * meaningless "0 KB/s" — and sub-1.0 is exactly the range a degraded link
+     * produces, i.e. the case the number exists to show. */
+    uint32_t throughput_x10 = (download_ms > 0)
+                              ? (total_downloaded * 10u / download_ms) : 0;
+    LOG_INFO(TAG_OTA, "[PERF] Download: %lu bytes in %lums (%lu.%lu KB/s)",
              (unsigned long)total_downloaded,
              (unsigned long)download_ms,
-             (unsigned long)throughput_kbps);
+             (unsigned long)(throughput_x10 / 10u),
+             (unsigned long)(throughput_x10 % 10u));
     LOG_INFO(TAG_OTA, "Download complete: %lu bytes in RAM",
              (unsigned long)total_downloaded);
 
