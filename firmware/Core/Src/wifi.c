@@ -1488,7 +1488,16 @@ int32_t WiFi_TcpConnect(const char *host, uint16_t port)
      * doesn't block the MIPC layer up to 30s (MX_WIFI_CMD_TIMEOUT) and trip the 16s watchdog!
      * NOTE: MX_WIFI_Socket_setsockopt explicitly expects a 4-byte int32_t representing ms.
      * Passing an 8-byte POSIX timeval struct corrupts the AT firmware's timeout state. */
-    int32_t mx_timeout = 4000;
+    /* 1500ms, lowered from 4000 on 2026-08-21. This bounds a SINGLE recv when
+     * no data has arrived yet; callers poll in a loop against their own
+     * overall budget (HTTP_RESPONSE_TIMEOUT_MS), so a shorter value does not
+     * shorten how long we're willing to wait overall — it only decides how
+     * quickly we notice that nothing came. At 4000 a 5s budget bought exactly
+     * one attempt; at 1500 it buys three, so a dead socket is detected and
+     * replaced ~2.7x sooner. recv still returns immediately whenever data IS
+     * available, so healthy transfers are completely unaffected. Shorter is
+     * also strictly safer for the 16s IWDG than the old 4s. */
+    int32_t mx_timeout = 1500;
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_RCVTIMEO, &mx_timeout, sizeof(mx_timeout));
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_SNDTIMEO, &mx_timeout, sizeof(mx_timeout));
 

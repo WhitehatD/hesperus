@@ -92,7 +92,22 @@
  * this above ~14s without also raising WATCHDOG_TIMEOUT_S (max ~16s on
  * IWDG/256) or a stalled first send could reset the board before its own
  * timeout even fires. */
-#define HTTP_RESPONSE_TIMEOUT_MS   12000
+/* REVISED 2026-08-21 (measured, chunked-upload era): 12000 was sized for the
+ * OLD failure mode above — a single 10.1s MX_WIFI_CMD_TIMEOUT recovery on
+ * 614KB monolithic uploads. With 4KB chunks that budget is now pure waste on
+ * the failure path: the socket's own MX_SO_RCVTIMEO (WiFi_TcpConnect) bounds
+ * each recv, so a 12s budget just stacks THREE blocking recv calls waiting
+ * for a response that is never coming, then retries. Measured live, task 14:
+ * an 8380-byte capture spent ~16s of its 18.4s total sitting in exactly that
+ * loop ("No response to chunk at offset 0"), then completed in ~2s once it
+ * gave up and used a fresh socket.
+ *
+ * A HEALTHY chunk response is 140-166ms (server access log, tasks 12/13), so
+ * 5000ms is ~30x margin and still allows a full recv timeout plus slack. The
+ * point is to fail over to a fresh socket FAST — retrying is cheap and
+ * lossless (offset only advances on server confirmation, and /api/upload/
+ * resume re-syncs), whereas waiting is pure dead time. */
+#define HTTP_RESPONSE_TIMEOUT_MS   5000
 
 /* SEC-05: image-upload auth token, same pattern as SEC-01 (WiFi creds) —
  * inject at build time, never commit a real value. Empty = unauthenticated
