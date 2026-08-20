@@ -823,14 +823,24 @@ int main(void)
 
                 consecutive_failures++;
 
-                if (ret == WIFI_ERROR_AP_NOT_FOUND || ret == WIFI_ERROR_INIT)
+                if (ret == WIFI_ERROR_AP_NOT_FOUND || ret == WIFI_ERROR_INIT
+                    || ret == WIFI_ERROR_DHCP)
                 {
-                    /* Neither is evidence of bad credentials:
-                     *  - AP_NOT_FOUND = the AP simply isn't broadcasting now.
+                    /* None of these are evidence of bad credentials:
+                     *  - AP_NOT_FOUND = the AP simply isn't broadcasting now
+                     *    (or wasn't scan-confirmed present this attempt —
+                     *    see wifi.c, the scan is advisory/unreliable against
+                     *    real phone hotspots, never a hard gate).
                      *  - INIT        = our own radio module is unhealthy; the
                      *    stored password has nothing to do with it, and
                      *    dumping the operator into a "your password looks
                      *    wrong" portal for a dead module would be a lie.
+                     *  - DHCP        = the radio-level handshake was ALREADY
+                     *    accepted (proves the password was right) but no IP
+                     *    ever arrived — a link/DHCP-server/timing issue, not
+                     *    a credentials issue. Split out 2026-08-20 after this
+                     *    exact path forced the portal open on genuinely
+                     *    correct credentials during a live incident.
                      * Reset the counter so alternating failure kinds can't
                      * accumulate toward the creds-suspect threshold either. */
                     creds_suspect_strikes = 0;

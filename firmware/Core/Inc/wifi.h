@@ -20,13 +20,25 @@
 typedef enum {
     WIFI_OK = 0,
     WIFI_ERROR_INIT,
-    WIFI_ERROR_CONNECT,      /* AP was seen (or scan itself failed/unclear) but auth/DHCP failed —
-                               * counts toward the creds-suspect strike threshold in the caller. */
+    WIFI_ERROR_CONNECT,      /* SSID was confirmed present, and the module's own connect() command
+                               * itself was rejected (auth/handshake failure at the radio level).
+                               * This is the ONLY result that should count toward a caller's
+                               * creds-suspect strike threshold — it is the one signal that
+                               * actually implicates the password. */
     WIFI_ERROR_TIMEOUT,
     WIFI_ERROR_SEND,
     WIFI_ERROR_AP_NOT_FOUND, /* Active scan did NOT see this SSID broadcasting — the AP is
                                * genuinely absent/out of range right now. NOT a credentials
                                * signal: callers should retry forever, never auto-portal on this. */
+    WIFI_ERROR_DHCP,         /* The module's connect() command itself SUCCEEDED (radio-level
+                               * handshake was accepted) but no IP was ever assigned — link
+                               * dropped mid-DHCP, DHCP server unavailable, or a transient radio
+                               * issue. Deliberately NOT the same signal as WIFI_ERROR_CONNECT:
+                               * a successful handshake already proves the password was right, so
+                               * this must never count toward a creds-suspect strike (see the
+                               * 2026-08-20 incident this was split out to prevent — a host-side
+                               * timing race in the DHCP poll caused false failures here on
+                               * genuinely correct credentials and forced the portal open). */
 } WiFiStatus_t;
 
 /**

@@ -209,24 +209,29 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
         return WIFI_ERROR_INIT;
     }
 
-    /* ── Step 0: is the AP even broadcasting right now? ──
-     * This is the disambiguation the whole retry policy hinges on (see
-     * firmware_config.h's "Enterprise WiFi Retry Policy" note): the vendor
-     * driver's connect() return code alone cannot tell "wrong password"
-     * apart from "AP not in range". A directed scan for this exact SSID
-     * can. If it's not there, don't even attempt the handshake — fail
-     * fast with a result the caller can act on correctly (retry forever,
-     * never touch the portal), instead of burning a full connect+DHCP
-     * timeout finding out the AP was never there to begin with. */
-    BoardStatus_Set(BOARD_STATUS_WIFI_CONNECTING);
-    if (!_wifi_ssid_in_scan(ssid))
-    {
-        BoardStatus_Set(BOARD_STATUS_WIFI_SEARCHING);
-        return WIFI_ERROR_AP_NOT_FOUND;
-    }
+    /* ── Step 0: is the AP visible in an active scan right now? ──
+     * ADVISORY ONLY — never a gate on whether we attempt to connect.
+     *
+     * Live incident, 2026-08-20: a directed MX_WIFI_Scan() for a genuinely
+     * present, genuinely-working iPhone Personal Hotspot ("Iph 17 alex")
+     * returned 0 APs found on 2 of 3 consecutive real-hardware attempts —
+     * the SAME SSID the very next scan found fine (RSSI=-46, ch=6). An
+     * earlier revision of this function used a negative scan result as a
+     * hard gate that skipped the connect attempt entirely and reported
+     * WIFI_ERROR_AP_NOT_FOUND — on real hardware that meant the board sat
+     * in WIFI_SEARCHING refusing to even TRY a connection that would have
+     * succeeded, roughly 2 times out of 3, against exactly the AP type
+     * (phone hotspot) this whole project targets. Do not gate on this
+     * again without on-hardware verification against a real phone hotspot,
+     * not just a stable home router.
+     *
+     * The scan result is still useful — just only to INTERPRET a
+     * subsequent real failure, not to avoid attempting the real thing. */
+    bool ssid_seen = _wifi_ssid_in_scan(ssid);
     BoardStatus_Set(BOARD_STATUS_WIFI_CONNECTING);
 
-    LOG_INFO(TAG_WIFI, "Connecting to '%s'...", ssid);
+    LOG_INFO(TAG_WIFI, "Connecting to '%s'%s...", ssid,
+             ssid_seen ? "" : " (not seen in scan — attempting anyway, scan is advisory)");
 
     /* Enable DHCP — without this, the driver sends static IP config (all zeros) */
     wifi_obj_get()->NetSettings.DHCP_IsEnabled = 1;
@@ -235,8 +240,19 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
 
     if (ret != MX_WIFI_STATUS_OK)
     {
-        LOG_WARN(TAG_WIFI, "MX_WIFI_Connect failed (err=%ld) — SSID was visible, so this "
-                 "counts as a credentials-suspect signal", (long)ret);
+        if (!ssid_seen)
+        {
+            /* Never scan-confirmed present AND the connect command itself
+             * failed too — the closest this module can get to "AP is
+             * genuinely not there right now" without over-trusting a
+             * single flaky scan. Not a credentials signal. */
+            LOG_WARN(TAG_WIFI, "MX_WIFI_Connect failed (err=%ld), and SSID was not seen in "
+                     "scan either — treating as AP-absent, not a credentials signal", (long)ret);
+            BoardStatus_Set(BOARD_STATUS_WIFI_SEARCHING);
+            return WIFI_ERROR_AP_NOT_FOUND;
+        }
+        LOG_WARN(TAG_WIFI, "MX_WIFI_Connect failed (err=%ld) — SSID WAS confirmed visible this "
+                 "attempt, so this counts as a credentials-suspect signal", (long)ret);
         return WIFI_ERROR_CONNECT;
     }
 
@@ -264,12 +280,30 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
      * mode mean what it says. */
     WiFi_SetPowerSave(0);
 
+    /* CRITICAL (restored 2026-08-20 after a live incident): MX_WIFI_Connect()
+     * returning OK does NOT mean MX_WIFI_IsConnected() reports true yet —
+     * the module confirms the handshake over the IPC channel asynchronously,
+     * and the ORIGINAL working code always paid an unconditional 5000ms
+     * MX_WIFI_IO_YIELD() here, BEFORE the very first status check, to let
+     * that confirmation land. An earlier revision of this function deleted
+     * that yield as "wasted time" to tighten the connect path — but it was
+     * load-bearing: without it, the very first MX_WIFI_IsConnected() check
+     * below can run before the module has finished telling the host it's
+     * associated, is read as "link dropped", and WiFi_Connect() reports
+     * WIFI_ERROR_CONNECT on a handshake that actually succeeded. Three fast
+     * failures like that are enough to trip WIFI_CREDS_SUSPECT_STRIKES and
+     * force the portal open on genuinely correct credentials — confirmed
+     * live: a board OTA'd to the version without this yield never
+     * reconnected to MQTT again (mosquitto broker log: connects, then zero
+     * further attempts for 10+ minutes) and ended up stuck in provisioning.
+     * Do not remove this without on-hardware verification. */
+    MX_WIFI_IO_YIELD(wifi_obj_get(), 5000);
+    Watchdog_Refresh();
+
     /* Wait for DHCP to assign an IP address, tightly polled against a real
-     * deadline (WIFI_CONNECT_TIMEOUT_MS, firmware_config.h — actually
-     * enforced now, unlike the old fixed 5000ms-then-30000ms-worst-case
-     * shape). iPhone hotspots can still be slow (several seconds) to
-     * respond to embedded DHCP clients, so the deadline stays generous —
-     * it's just no longer paid unconditionally on every attempt. */
+     * deadline (WIFI_CONNECT_TIMEOUT_MS, firmware_config.h) after the settle
+     * window above. iPhone hotspots can still be slow (several seconds) to
+     * respond to embedded DHCP clients, so the deadline stays generous. */
     uint8_t ip[4] = {0};
     bool got_ip = false;
     uint32_t dhcp_start = HAL_GetTick();
@@ -314,9 +348,25 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
     MX_WIFI_Disconnect(wifi_obj_get());
     MX_WIFI_IO_YIELD(wifi_obj_get(), 500);
 
-    /* SSID was confirmed visible above, so a DHCP/handshake failure this
-     * far in is a real credentials-suspect signal, not an AP-absence one. */
-    return WIFI_ERROR_CONNECT;
+    if (!ssid_seen)
+    {
+        /* MX_WIFI_Connect() itself accepted the handshake (we got this far),
+         * which is actually decent evidence the AP IS there — but since our
+         * own scan missed it moments earlier, stay conservative and don't
+         * treat this as a credentials signal either. */
+        BoardStatus_Set(BOARD_STATUS_WIFI_SEARCHING);
+        return WIFI_ERROR_AP_NOT_FOUND;
+    }
+
+    /* Radio-level handshake was accepted (MX_WIFI_Connect() returned OK,
+     * confirmed by 'Associated' in the log) AND the scan confirmed the AP
+     * present — but no IP ever arrived. This is NOT a credentials signal:
+     * a rejected password fails at the handshake step above, not here.
+     * WIFI_ERROR_DHCP exists specifically so callers don't count this
+     * toward a creds-suspect strike (see wifi.h — split out 2026-08-20
+     * after this exact path incorrectly forced the portal open on
+     * genuinely correct credentials). */
+    return WIFI_ERROR_DHCP;
 }
 
 bool WiFi_IsConnected(void)
