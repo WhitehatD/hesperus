@@ -71,7 +71,44 @@ static char s_http_header[HTTP_HEADER_MAX];
  * See the long note at the check itself for why waiting longer buys nothing. */
 #define SOCKET_STALL_MS              5000u
 
-#define UPLOAD_CHUNK_WIRE_SIZE       32768u
+/* Bytes of image body carried by ONE HTTP chunk request.
+ *
+ * MUST stay well under the EMW3080's TCP send buffer (~7300 bytes — see
+ * below), because a chunk is a single HTTP POST: the server does not reply
+ * until the ENTIRE body has arrived, so within one chunk the only thing
+ * draining the module's send buffer is TCP ACKs. Once more than the buffer's
+ * worth of data is outstanding, MX_WIFI_Socket_send() stops accepting bytes,
+ * the SPI FLOW line goes low, and _socket_send_all() stalls until
+ * SOCKET_STALL_MS kills the socket — turning a sub-second upload into tens of
+ * seconds of stall-and-retry.
+ *
+ * ROOT CAUSE, measured (2026-08-20, and the same signature in the 2026-08-19
+ * incident): this was 32768 — 4.5x larger than the module's entire send
+ * buffer — so EVERY image over ~7.3KB was guaranteed to hit the wall. Two
+ * independent live captures stalled at byte offset 7300 EXACTLY:
+ *   - 7391-byte JPEG -> "Send stalled >5000ms at offset 7300/7391
+ *     [zero_sends=0 neg_sends=1 flow=LOW(blocked)]", 91 bytes from done,
+ *     total upload 37.4s for 7KB.
+ *   - 7332-byte JPEG (previous session) -> stalled "32 bytes from done",
+ *     i.e. also offset 7300.
+ * 7300 = 5 x 1460 = 5 TCP MSS at the 1500-byte MTU (mx_wifi_conf.h
+ * MX_WIFI_MTU_SIZE), i.e. the module buffers exactly 5 full segments of
+ * unacknowledged data and then blocks. The earlier "shrink the payload with
+ * JPEG encoding" work masked this for small images and the "detect the stall
+ * fast and reconnect" work recovered from it, but neither removed the cause:
+ * a chunk larger than the send buffer cannot complete without stalling.
+ *
+ * 4096 + the ~300-byte chunk header is ~4.4KB, leaving ~2.9KB of headroom.
+ * Each chunk now fits entirely in the module's buffer, so the send never
+ * blocks; the buffer then fully drains while we wait for that chunk's HTTP
+ * response (ACKs flow during the response round-trip), and the next chunk
+ * starts from an empty buffer. Matches HTTP_UPLOAD_CHUNK_SIZE (the per-send
+ * clamp inside _socket_send_all), so the wire chunk and the send granularity
+ * are consistent instead of silently disagreeing by 8x.
+ *
+ * Do NOT raise this above ~6KB without re-measuring the module's send buffer
+ * on real hardware. Bigger chunks are not faster here — they stall. */
+#define UPLOAD_CHUNK_WIRE_SIZE       4096u
 #define UPLOAD_CHUNK_MAX_RETRIES     8
 #define UPLOAD_CHUNK_RETRY_BASE_MS   500
 #define UPLOAD_CHUNK_RETRY_MAX_MS    8000
