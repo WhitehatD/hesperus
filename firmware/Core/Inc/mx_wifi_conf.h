@@ -24,8 +24,8 @@ extern "C" {
 /* ─── Transport: SPI (not UART) ──────────────────────── */
 #define MX_WIFI_USE_SPI                             (1)
 
-/* SPI DMA usage — disabled, using blocking SPI transfers */
-#define DMA_ON_USE                                  (0)
+/* SPI DMA. Channels are set up in mx_wifi_hw.c (_spi2_dma_init). */
+#define DMA_ON_USE                                  (1)
 
 /* ─── No RTOS — bare-metal ────────────────────────────── */
 #define MX_WIFI_USE_CMSIS_OS                        (0)

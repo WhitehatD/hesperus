@@ -25,6 +25,12 @@
 #include "b_u585i_iot02a_camera.h"
 #include "mx_wifi_io.h"
 
+#if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
+/* Owned by mx_wifi_hw.c */
+DMA_HandleTypeDef *MX_WIFI_GetSpiDmaTx(void);
+DMA_HandleTypeDef *MX_WIFI_GetSpiDmaRx(void);
+#endif
+
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 /* Private macro -------------------------------------------------------------*/
@@ -136,6 +142,21 @@ void GPDMA1_Channel12_IRQHandler(void)
 {
   BSP_CAMERA_DMA_IRQ_HANDLER(0);
 }
+
+#if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
+/**
+  * @brief  GPDMA1 ch0/ch1 — SPI2 TX/RX for the EMW3080 Wi-Fi module.
+  */
+void GPDMA1_Channel0_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(MX_WIFI_GetSpiDmaTx());
+}
+
+void GPDMA1_Channel1_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(MX_WIFI_GetSpiDmaRx());
+}
+#endif /* DMA_ON_USE == 1 */
 
 /**
   * @brief  EXTI13 interrupt handler.

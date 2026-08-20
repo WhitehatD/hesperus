@@ -26,6 +26,77 @@
 /* ── Global SPI handle (extern'd by mx_wifi_spi.c) ───────────────────────── */
 SPI_HandleTypeDef MXCHIP_SPI;
 
+#if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
+/* SPI2 DMA. GPDMA1 ch0/ch1 — ch12 belongs to the camera (DCMI, linked-list
+ * mode). These are plain direct-mode transfers, so HAL_DMA_Init, not
+ * HAL_DMAEx_List_Init. Completion: HAL_SPI_TxRxCpltCallback below signals
+ * the driver's SpiTransferDoneSem, which mx_wifi_spi.c's DMA path waits on. */
+static DMA_HandleTypeDef hdma_spi2_tx;
+static DMA_HandleTypeDef hdma_spi2_rx;
+
+static void _spi2_dma_init(SPI_HandleTypeDef *hspi)
+{
+    __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+    /* ── TX: memory -> SPI2 peripheral ───────────────────────────────────── */
+    hdma_spi2_tx.Instance                     = GPDMA1_Channel0;
+    hdma_spi2_tx.Init.Request                 = GPDMA1_REQUEST_SPI2_TX;
+    hdma_spi2_tx.Init.BlkHWRequest            = DMA_BREQ_SINGLE_BURST;
+    hdma_spi2_tx.Init.Direction               = DMA_MEMORY_TO_PERIPH;
+    hdma_spi2_tx.Init.SrcInc                  = DMA_SINC_INCREMENTED;
+    hdma_spi2_tx.Init.DestInc                 = DMA_DINC_FIXED;
+    hdma_spi2_tx.Init.SrcDataWidth            = DMA_SRC_DATAWIDTH_BYTE;
+    hdma_spi2_tx.Init.DestDataWidth           = DMA_DEST_DATAWIDTH_BYTE;
+    hdma_spi2_tx.Init.Priority                = DMA_LOW_PRIORITY_LOW_WEIGHT;
+    hdma_spi2_tx.Init.SrcBurstLength          = 1;
+    hdma_spi2_tx.Init.DestBurstLength         = 1;
+    hdma_spi2_tx.Init.TransferAllocatedPort   = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT0;
+    hdma_spi2_tx.Init.TransferEventMode       = DMA_TCEM_BLOCK_TRANSFER;
+    hdma_spi2_tx.Init.Mode                    = DMA_NORMAL;
+
+    if (HAL_DMA_Init(&hdma_spi2_tx) != HAL_OK)
+    {
+        while (1) {}
+    }
+    __HAL_LINKDMA(hspi, hdmatx, hdma_spi2_tx);
+    (void)HAL_DMA_ConfigChannelAttributes(&hdma_spi2_tx, DMA_CHANNEL_NPRIV);
+
+    /* ── RX: SPI2 peripheral -> memory ───────────────────────────────────── */
+    hdma_spi2_rx.Instance                     = GPDMA1_Channel1;
+    hdma_spi2_rx.Init.Request                 = GPDMA1_REQUEST_SPI2_RX;
+    hdma_spi2_rx.Init.BlkHWRequest            = DMA_BREQ_SINGLE_BURST;
+    hdma_spi2_rx.Init.Direction               = DMA_PERIPH_TO_MEMORY;
+    hdma_spi2_rx.Init.SrcInc                  = DMA_SINC_FIXED;
+    hdma_spi2_rx.Init.DestInc                 = DMA_DINC_INCREMENTED;
+    hdma_spi2_rx.Init.SrcDataWidth            = DMA_SRC_DATAWIDTH_BYTE;
+    hdma_spi2_rx.Init.DestDataWidth           = DMA_DEST_DATAWIDTH_BYTE;
+    hdma_spi2_rx.Init.Priority                = DMA_LOW_PRIORITY_LOW_WEIGHT;
+    hdma_spi2_rx.Init.SrcBurstLength          = 1;
+    hdma_spi2_rx.Init.DestBurstLength         = 1;
+    hdma_spi2_rx.Init.TransferAllocatedPort   = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT0;
+    hdma_spi2_rx.Init.TransferEventMode       = DMA_TCEM_BLOCK_TRANSFER;
+    hdma_spi2_rx.Init.Mode                    = DMA_NORMAL;
+
+    if (HAL_DMA_Init(&hdma_spi2_rx) != HAL_OK)
+    {
+        while (1) {}
+    }
+    __HAL_LINKDMA(hspi, hdmarx, hdma_spi2_rx);
+    (void)HAL_DMA_ConfigChannelAttributes(&hdma_spi2_rx, DMA_CHANNEL_NPRIV);
+
+    /* Priority 5 = same as the NOTIFY/FLOW/SPI2 lines below, so DMA
+     * completion neither preempts nor is starved by flow control. */
+    HAL_NVIC_SetPriority(GPDMA1_Channel0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(GPDMA1_Channel0_IRQn);
+    HAL_NVIC_SetPriority(GPDMA1_Channel1_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(GPDMA1_Channel1_IRQn);
+}
+
+/* Referenced by stm32u5xx_it.c's GPDMA1_Channel0/1 IRQ handlers. */
+DMA_HandleTypeDef *MX_WIFI_GetSpiDmaTx(void) { return &hdma_spi2_tx; }
+DMA_HandleTypeDef *MX_WIFI_GetSpiDmaRx(void) { return &hdma_spi2_rx; }
+#endif /* DMA_ON_USE == 1 */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  HAL_SPI_MspInit  —  GPIO, clock, and NVIC setup for SPI2
  *
@@ -59,6 +130,10 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *hspi)
     gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio.Alternate = GPIO_AF5_SPI2;
     HAL_GPIO_Init(GPIOD, &gpio);
+
+#if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
+    _spi2_dma_init(hspi);
+#endif
 
     /* ── NSS (PB12) — software chip-select, active-low ───────────────── */
 
