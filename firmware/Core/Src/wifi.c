@@ -57,7 +57,7 @@ static char s_http_header[HTTP_HEADER_MAX];
  * way to resume. Splitting into independent chunks bounds that to one
  * chunk, not the whole frame — see the design note above WiFi_HttpPostImage.
  *
- * 32KB chunk size + a fresh TCP connection per chunk, per the empirical
+ * Chunked sends + a fresh TCP connection per chunk, per the empirical
  * finding that the EMW3080's own MIPC layer already fragments every
  * Socket_send() to <=2482 bytes internally regardless of what we pass
  * (mx_wifi.c:1465, MX_WIFI_IPC_PAYLOAD_SIZE-12) — so app-level chunk size
@@ -654,6 +654,17 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
             offset += sent;
             hard_errors = 0;
 
+            /* Progress resets the stall timer (fixed 2026-08-20). start_tick
+             * used to be set once at function entry and never touched again,
+             * which quietly made SOCKET_STALL_MS a hard TOTAL deadline on the
+             * whole call rather than a stall detector: a send moving bytes
+             * steadily and healthily still got its socket torn down the
+             * moment the call passed 5s, and the log then blamed a "stall"
+             * that never happened. What we actually want to catch is "no
+             * forward progress for SOCKET_STALL_MS", so the clock restarts
+             * every time the module accepts data. */
+            start_tick = HAL_GetTick();
+
             if (offset < len)
                 MX_WIFI_IO_YIELD(wifi_obj_get(), 2);
 
@@ -670,9 +681,9 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
              * pre-JPEG-compression upload could take minutes, risking the
              * MQTT_KEEPALIVE_SECONDS=60 broker timeout. Payloads are now
              * 7-56KB (jpeg_encode.c), chunked at UPLOAD_CHUNK_WIRE_SIZE
-             * (32KB) — even at the pessimistic ~1.3KB/s throughput once
+             * (4KB) — even at the pessimistic ~1.3KB/s throughput once
              * measured on a degraded link (a separate, since-fixed
-             * power-save bug), one chunk is ~25s, comfortably inside the
+             * power-save bug), one chunk is ~3s, comfortably inside the
              * 60s budget with margin. The outer chunk loop already pings
              * correctly at clean boundaries (after each chunk succeeds,
              * and after each full retry backoff — see the two
@@ -801,7 +812,7 @@ static const char *_find_json_body(const uint8_t *resp_buf)
  * that couldn't be salvaged and restarted from byte 0 into the same
  * conditions — on a sustained-loss link that never converges.
  *
- * This sends the image as independent ~32KB chunks (UPLOAD_CHUNK_WIRE_SIZE),
+ * This sends the image as independent 4KB chunks (UPLOAD_CHUNK_WIRE_SIZE),
  * each its own short-lived POST to /api/upload/chunk carrying its byte
  * offset — see server/app/api/routes.py's matching endpoint. A stalled
  * connection costs one chunk, not the whole frame: on failure we retry
@@ -984,7 +995,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
          * trusted, so start clean. On this module it is actively harmful:
          * every closed TCP socket sits in TIME_WAIT holding buffer memory
          * on a device with very little RAM, so churning one socket per
-         * 32KB chunk exhausts its pool. Symptom: chunk 1 lands fine, chunk
+         * chunk exhausts its pool. Symptom: chunk 1 lands fine, chunk
          * 2 wedges partway (~46KB total), FLOW pinned LOW with the socket
          * API reporting neither backpressure nor error — the module simply
          * has nothing left to accept data into. The old single-connection
