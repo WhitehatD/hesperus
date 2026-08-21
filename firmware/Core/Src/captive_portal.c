@@ -536,12 +536,22 @@ static int _handle_http_client(int32_t client_sock)
     {
         MX_WIFI_IO_YIELD(wifi_obj_get(), 10);
 
-        /* Block for max 150ms per iteration at MIPC hardware layer */
-        int32_t n = MX_WIFI_Socket_recv_timeout(
+        /* Stock MX_WIFI_Socket_recv, bounded by the socket's own SO_RCVTIMEO
+         * (1000ms, set above on client_sock) instead of a per-call custom
+         * MIPC timeout. Trade-off vs. the old 150ms-per-call granularity:
+         * the outer max_wait deadline is now only re-checked every ~1000ms
+         * instead of every ~150ms, so one idle speculative connection can
+         * hold the listener slightly longer before being dropped. Verify
+         * on hardware that this doesn't reintroduce portal stalls under
+         * multiple simultaneous speculative connections (the original bug
+         * this loop exists to prevent) — if it does, the real fix is
+         * confirming whether SO_RCVTIMEO values between 500-1000ms are
+         * actually honored on this module (untested), not re-patching the
+         * vendor driver. */
+        int32_t n = MX_WIFI_Socket_recv(
             wifi_obj_get(), client_sock,
             &req_buf[total_recv],
-            (int32_t)(sizeof(req_buf) - 1 - (uint32_t)total_recv), 0,
-            150);
+            (int32_t)(sizeof(req_buf) - 1 - (uint32_t)total_recv), 0);
 
         if (n > 0)
         {
@@ -1004,10 +1014,18 @@ PortalStatus_t CaptivePortal_Start(PortalReason_t reason)
         LOG_INFO(TAG_PORT, "HTTP client connected (sock=%ld)", (long)client_sock);
         BoardStatus_Pulse(BOARD_PULSE_PORTAL_CLIENT);
 
-        /* Explicitly set receive timeout to 100ms. EMW3080 accept() creates new sockets
+        /* Explicitly set receive timeout. EMW3080 accept() creates new sockets
          * with the default 10000ms blocking timeout instead of inheriting from the server socket.
-         * Without this, speculative browser connections cause a 10s deadlock (Command 0x0205 timeout). */
-        int32_t rcv_timeout = 100;
+         * Without this, speculative browser connections cause a 10s deadlock (Command 0x0205 timeout).
+         *
+         * 2026-08-21: was 100ms, paired with a hand-patched recv variant to work
+         * around it. The module's AT firmware silently ignores sub-500ms
+         * SO_RCVTIMEO values and falls back to the 10s MX_WIFI_CMD_TIMEOUT —
+         * confirmed the hard way in ota_update.c's socket setup, which is why
+         * that path uses 1000ms and it's reliably honored. Matching that proven
+         * value here instead of guessing a new one; the outer accept loop below
+         * still bounds total time spent on one client via max_wait. */
+        int32_t rcv_timeout = 1000;
         MX_WIFI_Socket_setsockopt(wifi, client_sock, MX_SOL_SOCKET, MX_SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
 
         /* Handle the request */

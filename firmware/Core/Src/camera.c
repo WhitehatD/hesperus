@@ -7,17 +7,29 @@
  * Wraps the BSP_CAMERA functions for the MB1379 camera module (OV5640 sensor)
  * on the B-U585I-IOT02A Discovery Kit.
  *
- * Enterprise optimizations applied:
+ * 2026-08-21: reverted to the OV5640 manufacturer-recommended baseline
+ * (Drivers/BSP/Components/ov5640/ov5640.c OV5640_Common[] — ST's complete
+ * OmniVision init table: LSC, gamma, color matrix, AWB, AEC, timing). This
+ * file used to override ~10 of those registers (AEC ceiling/target band,
+ * VTS, PCLK divider, sharpen/denoise, a manual AWB freeze) tuned around an
+ * assumption — a fixed, unchanging monitoring scene — that doesn't hold in
+ * practice, and it produced measurably wrong images once the camera saw a
+ * different scene than whatever it booted in front of. All removed except
+ * binning (has a direct datasheet citation). AEC/AWB now run continuously
+ * in AUTO (the vendor default) and reconverge before every capture instead
+ * of freezing once at boot — see _wait_aec_converge(), called from both
+ * capture entry points below.
+ *
+ * Remaining optimizations kept:
  *   - Adaptive AEC polling (replaces fixed 2s delay)
  *   - Continuous-mode warm-up (replaces 6× snapshot Start/Stop loop)
- *   - Lower VTS for ~12fps frame rate (83ms/frame vs 330ms)
- *   - PCLK boost for faster pixel throughput
  *   - Compile-time SRAM budget validation
  *   - Diagnostics gated behind CAMERA_DIAG_ENABLED flag
  *
  * Capture flow:
- *   1. Camera_Init() — power up sensor, configure resolution + register tuning
- *   2. Camera_CaptureFrame() — continuous-mode warm-up + final frame capture
+ *   1. Camera_Init() — power up sensor, configure resolution (once per boot)
+ *   2. Camera_CaptureFrame() / Camera_WarmCapture() — reconverge AEC, then
+ *      continuous-mode warm-up + final frame (cold) or single snapshot (warm)
  *   3. Camera_DeInit() — power down to save energy before sleep
  */
 
@@ -126,6 +138,289 @@ static uint32_t _find_jpeg_size(const uint8_t *buf, uint32_t max)
     return 0;   /* marker not found — truncated or bad capture */
 }
 #endif /* CAMERA_JPEG_MODE */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Sensor Stream-State Assertion
+ *
+ *  OV5640 register 0x3008 (SYSTEM_CTROL0) is the master stream control:
+ *    0x02 = normal operation (streaming)   — what OV5640_Start() writes
+ *    0x42 = software power down (no video) — what OV5640_Stop() writes
+ *
+ *  ST's OV5640_Common[] init table ends with 0x3008=0x02, so a full sensor
+ *  init is *supposed* to leave it streaming, and this codebase has always
+ *  relied on that: BSP_CAMERA_Start() only arms DCMI (HAL_DCMI_Start_DMA),
+ *  it performs no I2C at all, so nothing in the capture path ever asserts
+ *  stream-on. That's a single point of failure with no recovery — if the
+ *  sensor ends up in power-down for any reason, every capture from then on
+ *  times out with a perfectly healthy DCMI, and even a full camera
+ *  DeInit/Init cycle won't necessarily dig it out.
+ *
+ *  Measured live 2026-08-21 with a direct pin probe: PIXCLK toggling
+ *  (263k edges/250ms) while HSYNC, VSYNC and all eight data lines sat
+ *  completely static across multiple frame periods — the exact signature
+ *  of a clocked-but-not-streaming sensor. So assert the documented state
+ *  explicitly before arming DCMI rather than assuming it.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void _ensure_sensor_streaming(void)
+{
+    uint8_t ctrl0 = 0xFFu;
+
+    if (BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3008, &ctrl0, 1) != BSP_ERROR_NONE)
+    {
+        LOG_WARN(TAG_CAM, "Could not read SYSTEM_CTROL0 (0x3008) — I2C read failed");
+        return;
+    }
+
+    if (ctrl0 != 0x02u)
+    {
+        LOG_WARN(TAG_CAM, "Sensor NOT streaming: 0x3008=0x%02X (0x42=power-down) — asserting "
+                 "stream-on (0x02)", ctrl0);
+        uint8_t on = 0x02u;
+        (void)BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3008, &on, 1);
+    }
+
+    /* ── Manufacturer-validated DVP power-up ─────────────────────────────
+     * Source: Linux mainline drivers/media/i2c/ov5640.c,
+     * ov5640_set_power_dvp() — the actively maintained encoding of
+     * OmniVision's parallel-mode bring-up (the OmniVision app note PDF is
+     * scanned images and unusable as a reference; this driver is the same
+     * sequence in verifiable form).
+     *
+     * THE DISCREPANCY THAT MATTERS — 0x300E (IO_MIPI_CTRL00):
+     *   Linux DVP power ON  -> 0x18  [4]=1 power down MIPI HS Tx,
+     *                                [3]=1 power down MIPI LS Rx,
+     *                                [2]=0 DVP enabled
+     *   Linux DVP power OFF -> 0x58  (its documented reset default)
+     * This sensor reads 0x58 — the powered-OFF value. ST's OV5640_Common[]
+     * never writes the DVP-active value, and ST's own EnableDVPMode()
+     * writes 0x58 as if it were the "on" value, which contradicts the
+     * Linux driver. With the MIPI block left in its default state the core
+     * can stream and the pads can read "enabled" while the DVP output
+     * block is not actually driving framed video — exactly the measured
+     * symptom (PCLK driven, HREF/VSYNC/data idle).
+     *
+     * Pad enables also differ: Linux uses 0x3017=0x7F (VSYNC/HREF/PCLK +
+     * D[9:6]) and 0x3018=0xFC (all of D[5:0]). ST uses 0xFF/0xF3, and 0xF3
+     * leaves bits[3:2] — two D[5:0] enables — CLEAR while setting the
+     * GPIO bits[1:0] instead. Use the Linux values. */
+    /* 0x3103 SCCB_SYSTEM_CTRL1 bit1: 0 = system clock from PAD (XCLK),
+     * 1 = system clock from PLL. Both ST's OV5640_Common[] and Linux's
+     * init table do 0x3103=0x11 (from pad, so the PLL can be reprogrammed
+     * safely) -> software reset -> 0x3103=0x03 (switch to PLL). If the
+     * sequence is interrupted or the second write is lost, the sensor is
+     * left running off the pad clock with the PLL output not feeding the
+     * output stage: registers all read correct, SCCB still works, the
+     * output pads still drive their idle levels — and NO PCLK is produced.
+     * That is precisely the measured state (PCLK pin floating, VSYNC/HSYNC/
+     * data driven but static), so check and assert it. */
+    struct { uint16_t reg; uint8_t val; const char *what; } dvp[] = {
+        { 0x3103, 0x03, "clock source: PLL (not pad)"             },
+        { 0x4740, 0x22, "polarity: HREF active-high, PCLK rising" },
+        { 0x300E, 0x18, "MIPI Tx/Rx powered down, DVP enabled"    },
+        { 0x3017, 0x7F, "pad enable: VSYNC/HREF/PCLK + D[9:6]"    },
+        { 0x3018, 0xFC, "pad enable: D[5:0]"                      },
+        { 0x4300, 0x6F, "format: RGB565"                          },
+    };
+
+    int changed = 0;
+#if CAMERA_ASSERT_DVP_REGS
+    for (unsigned i = 0; i < sizeof(dvp) / sizeof(dvp[0]); i++)
+    {
+        uint8_t cur = 0;
+        if (BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, dvp[i].reg, &cur, 1) != BSP_ERROR_NONE)
+            continue;
+        if (cur == dvp[i].val)
+            continue;
+
+        LOG_WARN(TAG_CAM, "DVP setup 0x%04X: 0x%02X -> 0x%02X (%s)",
+                 dvp[i].reg, cur, dvp[i].val, dvp[i].what);
+        uint8_t v = dvp[i].val;
+        (void)BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, dvp[i].reg, &v, 1);
+        changed = 1;
+    }
+#else
+    (void)dvp;  /* held back — see CAMERA_ASSERT_DVP_REGS in firmware_config.h */
+#endif
+
+    if (changed)
+    {
+        /* Re-assert stream-on after touching the output block, then give
+         * the sensor a couple of frame periods to start framing before
+         * DCMI is armed. */
+        uint8_t on = 0x02u;
+        (void)BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3008, &on, 1);
+        HAL_Delay(100);
+        LOG_INFO(TAG_CAM, "DVP output block reconfigured per Linux ov5640_set_power_dvp()");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  DVP Signal-Activity Probe
+ *
+ *  Added 2026-08-21 to settle a hardware-vs-software question decisively
+ *  instead of guessing at it. When DCMI reports 0 frames, there are two
+ *  fundamentally different causes and the register state alone does not
+ *  distinguish them:
+ *
+ *    (a) the sensor isn't clocking pixels out at all (not streaming, or the
+ *        DVP bus isn't physically connected) — nothing software can fix;
+ *    (b) the sensor IS clocking, but DCMI/DMA is misconfigured on our side
+ *        — entirely a firmware bug.
+ *
+ *  GPIO IDR still reflects the live pin level while a pin is in alternate-
+ *  function mode, so we can sample the three sync/clock lines directly and
+ *  count transitions without disturbing DCMI. Pin map from the BSP's
+ *  DCMI_MspInit (b_u585i_iot02a_camera.c): PIXCLK=PA6, VSYNC=PB7, HSYNC=PH8.
+ *
+ *  PIXCLK runs in the MHz range, so even a short sample window sees
+ *  thousands of transitions when the sensor is alive. Zero transitions on
+ *  PIXCLK is conclusive: case (a).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  DVP Pin Continuity Test  (driven vs floating — unambiguous, no scope)
+ *
+ *  Every register on this sensor reads correct while the sync/data lines
+ *  stay idle, and edge-count evidence became untrustworthy once PCLK's
+ *  count shifted merely from enabling other output pads (a hallmark of
+ *  crosstalk on an undriven pin, not of a real clock).
+ *
+ *  This resolves it definitively. Reconfigure each DVP line as a plain
+ *  GPIO input, first with the internal pull-UP, then the pull-DOWN, and
+ *  read the level each time:
+ *     level follows the pull (1 then 0)  -> pin is FLOATING (undriven)
+ *     level holds against the pull       -> pin is actively DRIVEN
+ *  The sensor's push-pull output easily overpowers the ~40k internal
+ *  pull resistors, so this cannot produce a false "driven" result.
+ *
+ *  Pins are restored to DCMI alternate function afterwards.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void _probe_pin_continuity(void)
+{
+    static const struct {
+        GPIO_TypeDef *port;
+        uint16_t      pin;
+        uint8_t       bit;
+        const char   *name;
+    } lines[] = {
+        { GPIOA, GPIO_PIN_6,  6,  "PCLK/PA6"  },
+        { GPIOB, GPIO_PIN_7,  7,  "VSYNC/PB7" },
+        { GPIOH, GPIO_PIN_8,  8,  "HSYNC/PH8" },
+        { GPIOC, GPIO_PIN_6,  6,  "D0/PC6"    },
+        { GPIOH, GPIO_PIN_14, 14, "D4/PH14"   },
+        { GPIOI, GPIO_PIN_7,  7,  "D7/PI7"    },
+    };
+
+    for (unsigned i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
+    {
+        GPIO_InitTypeDef g = {0};
+        g.Pin   = lines[i].pin;
+        g.Mode  = GPIO_MODE_INPUT;
+        g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+        g.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(lines[i].port, &g);
+        HAL_Delay(2);
+        uint32_t with_pu = (lines[i].port->IDR >> lines[i].bit) & 1U;
+
+        g.Pull = GPIO_PULLDOWN;
+        HAL_GPIO_Init(lines[i].port, &g);
+        HAL_Delay(2);
+        uint32_t with_pd = (lines[i].port->IDR >> lines[i].bit) & 1U;
+
+        const char *verdict = (with_pu == 1U && with_pd == 0U)
+                                ? "FLOATING (follows pull — nothing driving it)"
+                                : "DRIVEN (holds against pull)";
+        LOG_ERROR(TAG_CAM, "  %-10s pull-up=%lu pull-down=%lu -> %s",
+                  lines[i].name, (unsigned long)with_pu, (unsigned long)with_pd, verdict);
+
+        /* Restore DCMI alternate function on this pin. */
+        g.Pull      = GPIO_NOPULL;
+        g.Mode      = GPIO_MODE_AF_PP;
+        g.Alternate = (lines[i].port == GPIOA) ? GPIO_AF4_DCMI : GPIO_AF10_DCMI;
+        HAL_GPIO_Init(lines[i].port, &g);
+    }
+}
+
+static void _probe_dvp_signals(void)
+{
+    /* Sample for a fixed WALL-CLOCK window, not a fixed iteration count.
+     * VSYNC only pulses once per frame (~33-66ms), so a short window can
+     * legitimately see zero VSYNC edges even on a perfectly healthy sensor
+     * — a trap the first version of this probe fell into. 250ms guarantees
+     * several frame periods. HSYNC (~one pulse per line, tens of kHz) and
+     * PIXCLK (MHz, heavily aliased by our sample rate but unmistakably
+     * active) both show large counts when alive. */
+    const uint32_t WINDOW_MS = 250;
+
+    uint32_t pixclk_edges = 0, vsync_edges = 0, hsync_edges = 0, data_edges = 0;
+    uint32_t samples = 0;
+
+    /* Data bus: D0=PC6 D1=PC7 D2=PC8, D3=PE1, D4=PH14, D5=PI6 D6=PI4 D7=PI7.
+     * Pack the ones we can read cheaply into a signature and watch it move —
+     * we only care whether pixel data is changing at all, not its value. */
+#define DVP_DATA_SIG()  ( ((GPIOC->IDR >> 6) & 0x7U)        \
+                        | (((GPIOE->IDR >> 1) & 1U) << 3)   \
+                        | (((GPIOH->IDR >> 14) & 1U) << 4)  \
+                        | (((GPIOI->IDR >> 4) & 1U) << 5)   \
+                        | (((GPIOI->IDR >> 6) & 1U) << 6)   \
+                        | (((GPIOI->IDR >> 7) & 1U) << 7) )
+
+    uint32_t prev_pixclk = (GPIOA->IDR >> 6) & 1U;
+    uint32_t prev_vsync  = (GPIOB->IDR >> 7) & 1U;
+    uint32_t prev_hsync  = (GPIOH->IDR >> 8) & 1U;
+    uint32_t prev_data   = DVP_DATA_SIG();
+
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < WINDOW_MS)
+    {
+        uint32_t pixclk = (GPIOA->IDR >> 6) & 1U;
+        uint32_t vsync  = (GPIOB->IDR >> 7) & 1U;
+        uint32_t hsync  = (GPIOH->IDR >> 8) & 1U;
+        uint32_t data   = DVP_DATA_SIG();
+
+        if (pixclk != prev_pixclk) { pixclk_edges++; prev_pixclk = pixclk; }
+        if (vsync  != prev_vsync)  { vsync_edges++;  prev_vsync  = vsync;  }
+        if (hsync  != prev_hsync)  { hsync_edges++;  prev_hsync  = hsync;  }
+        if (data   != prev_data)   { data_edges++;   prev_data   = data;   }
+        samples++;
+    }
+#undef DVP_DATA_SIG
+
+    LOG_ERROR(TAG_CAM, "DVP probe %lums (%lu samples): PIXCLK=%lu VSYNC=%lu HSYNC=%lu DATA=%lu "
+              "(levels: pclk=%lu vs=%lu hs=%lu data=0x%02lX)",
+              (unsigned long)WINDOW_MS, (unsigned long)samples,
+              (unsigned long)pixclk_edges, (unsigned long)vsync_edges,
+              (unsigned long)hsync_edges,  (unsigned long)data_edges,
+              (unsigned long)prev_pixclk, (unsigned long)prev_vsync,
+              (unsigned long)prev_hsync,  (unsigned long)prev_data);
+
+    if (pixclk_edges == 0)
+    {
+        LOG_ERROR(TAG_CAM, "DVP verdict: PIXCLK DEAD — sensor not clocking at all.");
+    }
+    else if (hsync_edges == 0 && data_edges == 0)
+    {
+        LOG_ERROR(TAG_CAM, "DVP verdict: PIXCLK alive, but NO line sync AND NO pixel data — "
+                  "the sensor is clocked but not streaming video. Sensor-side: stream/standby "
+                  "or output-format state, NOT a DCMI/DMA fault and NOT the ribbon (PIXCLK and "
+                  "I2C both cross it fine).");
+    }
+    else if (hsync_edges == 0 && data_edges > 0)
+    {
+        LOG_ERROR(TAG_CAM, "DVP verdict: pixel data IS moving but HSYNC is static — sync lines "
+                  "specifically are not reaching the MCU. Points at the HSYNC/VSYNC pins/traces, "
+                  "not the sensor.");
+    }
+    else
+    {
+        LOG_ERROR(TAG_CAM, "DVP verdict: sensor IS delivering framed video (sync + data active) "
+                  "— the fault is ours: DCMI config, DMA, or IRQ wiring.");
+    }
+
+    /* Settle driven-vs-floating for each line — see _probe_pin_continuity(). */
+    LOG_ERROR(TAG_CAM, "Pin continuity test (driven vs floating):");
+    _probe_pin_continuity();
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  AEC Convergence Polling (replaces fixed HAL_Delay)
@@ -237,8 +532,20 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
     /*
      * ── OV5640 Register Overrides ────────────────────────────────────────
      *
-     * Strategy: Keep AEC in AUTO mode (let the ISP converge naturally),
-     * but raise every ceiling it's allowed to reach + optimize frame rate.
+     * 2026-08-21 cleanup: this used to override ~10 registers (AEC gain
+     * ceiling, AEC target band, VTS, PCLK divider, sharpen/denoise, a
+     * manual AWB freeze) on top of ST's manufacturer-verified init table
+     * (Drivers/BSP/Components/ov5640/ov5640.c OV5640_Common[], which IS
+     * OmniVision's complete recommended config: LSC, gamma, color matrix,
+     * AWB, AEC). None of those overrides were re-validated against each
+     * other on hardware, and they produced measurably wrong images (hazy/
+     * washed-out outdoors, blown-out+torn on a bright ceiling) once the
+     * camera was pointed at scenes other than the one it happened to boot
+     * in front of. Removed all of them except binning, which has a direct
+     * datasheet citation below. AEC/AWB now run in AUTO continuously (the
+     * vendor default) and reconverge before every capture — see
+     * _wait_aec_converge(), now called per-capture instead of once at
+     * cold init (Camera_CaptureFrame / Camera_WarmCapture).
      *
      * OV5640 I2C address = 0x78 (confirmed in b_u585i_iot02a_camera.h).
      */
@@ -273,143 +580,116 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
      * NOTE: 0x3820 keeps ST's existing bit[1] (vflip) so orientation is
      * unchanged; we only OR in bit[0]. For 0x3821 we set bit[0] ONLY —
      * Linux's 0x07 would also set bits[2:1] which enable mirror. */
+#if CAMERA_BASELINE_ONLY
+    /* 2026-08-21 bisect: skip binning to run a pure ST-baseline init. */
+    (void)val;
+#else
     val = 0x07;  /* 0x06 | bit0 — vertical binning ON, orientation preserved */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3820, &val, 1);
     val = 0x01;  /* bit0 only — horizontal binning ON, no mirror */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3821, &val, 1);
+#endif
 
-    /* 1. AEC Gain Ceiling — 4x, NOT 64x.
-     *
-     * Previously 0x3A18/0x3A19 = 0x03/0xFF = a 64x gain ceiling. For a
-     * STATIC monitoring scene that's actively harmful: the AEC loop raises
-     * exposure toward max_expo FIRST and only reaches for gain once that's
-     * maxed, so a high ceiling just licenses the ISP to multiply noise.
-     * Analog gain is pure noise amplification; a static scene can afford
-     * long exposure instead, which is nearly free.
-     *
-     * With VTS=0x07D0 (83ms base) and night mode extending 4x (~333ms), a
-     * 4x gain ceiling is ample. Raise to 0x78 (7.5x) only if real scenes
-     * come out underexposed. (Linux's general-purpose VGA default is
-     * 0x3A19=0xF8 = 15.5x — still 4x below what we had.) */
-    val = 0x00;
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A18, &val, 1);
-    val = 0x40;  /* 0x040/16 = 4x ceiling (was 0xFF = 64x) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A19, &val, 1);
+    /* Dump the registers that decide whether framed video reaches DCMI at
+     * all. 0x4740 POLARITY_CTRL is the one with history here: the JPEG-mode
+     * block further down documents that BSP_CAMERA_Init writes 0x23, whose
+     * HREF bit inverts the output in silicon, so DCMI (HSPOL active-high)
+     * sees "line never active" and captures nothing. That correction is
+     * gated behind CAMERA_JPEG_MODE, which is 0 — so in RGB565 mode nothing
+     * ever checks it. Log the real values instead of assuming. */
+    {
+        uint8_t pol = 0, tc20 = 0, tc21 = 0, fmt = 0, mux = 0;
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x4740, &pol,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3820, &tc20, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3821, &tc21, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x4300, &fmt,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x501F, &mux,  1);
+        LOG_INFO(TAG_CAM, "Sensor out-cfg: 0x4740(pol)=0x%02X 0x3820=0x%02X 0x3821=0x%02X "
+                 "0x4300(fmt)=0x%02X 0x501F(mux)=0x%02X", pol, tc20, tc21, fmt, mux);
 
-    /* 2. AEC target brightness — narrowed stable band.
-     *
-     * Previous values (0x78/0x68/0xD0/0x78) were aggressive vs OmniVision
-     * defaults (0x30/0x28/0x30/0x26), and the stable-out band was very wide
-     * (0x3A1B=0xD0 vs 0x3A1E=0x78) — AEC could settle far from target and
-     * stay there, giving inconsistent exposure across a monitoring series.
-     * Narrowed so it converges closer to target and holds it. */
-    val = 0x50;  /* Stable-in high (was 0x78) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A0F, &val, 1);
-    val = 0x40;  /* Stable-in low  (was 0x68) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A10, &val, 1);
-    val = 0x58;  /* Stable-out high (was 0xD0) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A1B, &val, 1);
-    val = 0x38;  /* Stable-out low  (was 0x78) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A1E, &val, 1);
-    val = 0x80;  /* Max gain for stable range (default 0x60) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A11, &val, 1);
+        /* Timing generator / output window. If the output size or the total
+         * line/frame periods are degenerate, the sensor clocks forever and
+         * never emits an active line — which is precisely what the pin
+         * probe measures. Proven this session that the sensor DOES drive
+         * the sync pins (a polarity write moved the HSYNC idle level), so
+         * the remaining explanation is the frame geometry itself.
+         *   0x3808/09 = DVP output width   0x380A/0B = output height
+         *   0x380C/0D = HTS (total line)   0x380E/0F = VTS (total frame)
+         * A zero in any of these is fatal to framing. */
+        uint8_t w_h = 0, w_l = 0, h_h = 0, h_l = 0;
+        uint8_t hts_h = 0, hts_l = 0, vts_h = 0, vts_l = 0;
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3808, &w_h,   1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3809, &w_l,   1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380A, &h_h,   1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380B, &h_l,   1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380C, &hts_h, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380D, &hts_l, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380E, &vts_h, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x380F, &vts_l, 1);
+        LOG_INFO(TAG_CAM, "Sensor timing: out=%ux%u HTS=%u VTS=%u",
+                 (unsigned)((w_h << 8) | w_l), (unsigned)((h_h << 8) | h_l),
+                 (unsigned)((hts_h << 8) | hts_l), (unsigned)((vts_h << 8) | vts_l));
 
-    /* 3. Raise max exposure lines for both 50/60Hz bands */
-    val = (uint8_t)((CAMERA_VTS_DEFAULT >> 8) & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A02, &val, 1);  /* MAX_EXPO 60Hz HIGH */
-    val = (uint8_t)(CAMERA_VTS_DEFAULT & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A03, &val, 1);  /* MAX_EXPO 60Hz LOW  */
-    val = (uint8_t)((CAMERA_VTS_DEFAULT >> 8) & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A14, &val, 1);  /* MAX_EXPO 50Hz HIGH */
-    val = (uint8_t)(CAMERA_VTS_DEFAULT & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A15, &val, 1);  /* MAX_EXPO 50Hz LOW  */
+        /* Clock tree + block reset/enable. PCLK is derived from the PLL via
+         * its own divider chain (0x3108 bits[5:4]) while the pixel array and
+         * timing generator run off SCLK (0x3108 bits[1:0]). That's how the
+         * measured state — PCLK driven and responsive, timing generator
+         * silent — is even possible, so read the whole chain. Divider map
+         * from Linux ov5640.c: 0x3034 bit-div, 0x3035 sysclk/MIPI div,
+         * 0x3036 PLL multiplier, 0x3037 pre-div + root-div, 0x3108 SCLK /
+         * SCLK2x / PCLK dividers. Also read the block reset (0x3000-0x3002)
+         * and clock-enable (0x3004-0x3006) registers: a block held in reset
+         * or with its clock gated off produces exactly this signature.
+         * ST's OV5640_Common[] sets 0x3000=0x00, 0x3002=0x1c, 0x3004=0xff,
+         * 0x3006=0xc3 — identical to Linux's table, so any deviation is
+         * something clobbering them at runtime. */
+        uint8_t p34 = 0, p35 = 0, p36 = 0, p37 = 0, p108 = 0;
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3034, &p34,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3035, &p35,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3036, &p36,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3037, &p37,  1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3108, &p108, 1);
 
-    /* 4. Set VTS (Vertical Total Size) for balanced frame rate + exposure.
-     *    VTS=0x07D0 (2000 lines) → ~12fps at VGA, 83ms max base exposure.
-     *    Night mode extends this to 4× (8000 lines, ~300ms) in low light. */
-    val = (uint8_t)((CAMERA_VTS_DEFAULT >> 8) & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x380E, &val, 1);  /* VTS HIGH */
-    val = (uint8_t)(CAMERA_VTS_DEFAULT & 0xFF);
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x380F, &val, 1);  /* VTS LOW  */
+        uint8_t r00 = 0, r01 = 0, r02 = 0, c00 = 0, c01 = 0, c02 = 0;
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3000, &r00, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3001, &r01, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3002, &r02, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3004, &c00, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3005, &c01, 1);
+        (void)BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3006, &c02, 1);
 
-    /* 5. Ensure AEC stays in AUTO mode (no manual exposure override) */
+        LOG_INFO(TAG_CAM, "Sensor clocks: PLL 0x3034=0x%02X 0x3035=0x%02X 0x3036=0x%02X "
+                 "0x3037=0x%02X rootdiv 0x3108=0x%02X", p34, p35, p36, p37, p108);
+        LOG_INFO(TAG_CAM, "Sensor blocks: reset 0x3000=0x%02X 0x3001=0x%02X 0x3002=0x%02X "
+                 "(want 00/xx/1C) | clken 0x3004=0x%02X 0x3005=0x%02X 0x3006=0x%02X "
+                 "(want FF/xx/C3)", r00, r01, r02, c00, c01, c02);
+
+        /* 0x4740 POLARITY_CTRL: per the Linux mainline ov5640 driver
+         * (ov5640_set_power_dvp), bit1=1 means HREF active HIGH — the
+         * DIRECT sense, not inverted. An earlier fix here cleared bit1
+         * based on a comment in this codebase's JPEG block claiming the
+         * opposite; that contradicted both the Linux driver's documented
+         * semantics and the empirical record (captures worked with 0x22 +
+         * DCMI HSPOL active-high). 0x22 = HREF active high + PCLK sample
+         * rising is CORRECT for this DCMI config. Do not "fix" it. */
+        (void)pol;
+    }
+
+    /* 1. Ensure AEC/AGC stay in AUTO mode (matches OV5640 POR default —
+     *    this is a defensive assertion, not an override of anything in
+     *    OV5640_Common[], which doesn't touch 0x3503 either). Everything
+     *    else that used to live here (AEC gain ceiling, AEC target band,
+     *    max-exposure lines, VTS, night mode, PCLK divider, sharpen/
+     *    denoise trim, AWB freeze) has been removed — those were unverified
+     *    deviations from ST's manufacturer-recommended OV5640_Common[]
+     *    table, tuned around an assumption (fixed static scene) that
+     *    doesn't hold, and they were the direct cause of the hazy/washed/
+     *    blown-out captures. AWB and AEC now run continuously in AUTO for
+     *    the lifetime of the sensor (the vendor default) and reconverge
+     *    before every single capture — see _wait_aec_converge(), called
+     *    from Camera_CaptureFrame()/Camera_WarmCapture(), not here. */
     val = 0x00;  /* bit 0=0: AEC auto, bit 1=0: AGC auto */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3503, &val, 1);
-
-    /* 6. Enable AEC night mode with 4x frame insertion ceiling.
-     *    Night mode lets the ISP dynamically increase VTS (lower fps) when
-     *    the scene is dark, extending max exposure up to 4× the base VTS.
-     *    With VTS=2000 and 4x ceiling: max exposure ≈ 8000 lines ≈ 300ms. */
-    val = 0x7C;  /* AEC_CTRL00: enable night mode + band filter */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A00, &val, 1);
-    val = 0x03;  /* AEC_MAX_EXPO_INSERT: 11 = 4x frame insertion ceiling */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A05, &val, 1);
-
-    /* 7. PCLK boost — set PLL pre-divider for higher pixel clock.
-     *    Register 0x3824 (PCLK divider): lower value = faster PCLK.
-     *    Default from BSP init table is usually 0x04 → set to 0x02 for 2× boost. */
-    val = 0x02;
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3824, &val, 1);
-
-    /* 8. Sharpen/denoise trim — optimize for genuine detail, not for a
-     *    punchy consumer look. ST's CIP block sharpens with thresholds
-     *    (0x5300=0x08, 0x5301=0x30, 0x5302=0x10, 0x5303=0x00) but ships NO
-     *    denoise override (0x5304-0x5307 sit at silicon defaults).
-     *
-     *    Oversharpening creates halo/ringing artifacts around edges that a
-     *    vision-LLM can misread as real texture or structure — the opposite
-     *    of what we want for scene analysis. Halve the sharpen offset and
-     *    add mild denoise (kept mild, not disabled: at a 4x gain ceiling
-     *    there's little noise to begin with, and killing denoise entirely
-     *    lets chroma speckle straight through the JPEG encode). */
-    val = 0x08;  /* Sharpen offset1 (was implicit default via CIP enable) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5302, &val, 1);
-    val = 0x00;
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5303, &val, 1);
-    val = 0x08;  /* Denoise threshold (mild) */
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5306, &val, 1);
-    val = 0x16;
-    BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x5307, &val, 1);
-
-    /* ── Adaptive AEC convergence (replaces fixed 2s delay) ── */
-    _wait_aec_converge();
-
-    /* 9. Lock AWB after convergence.
-     *
-     *    For a monitoring SERIES, frame-to-frame colour drift is worse than
-     *    a small constant colour error — it makes consecutive captures of
-     *    the same static scene look like different lighting to the VLM.
-     *    _wait_aec_converge() already waits for AEC (luma) to settle; AWB
-     *    needs longer (~10-20 frames from cold vs ~5-10 for AEC), so read
-     *    back the converged gains AFTER waiting and freeze them by writing
-     *    them back with the manual-AWB bit set. Read-modify-write (not a
-     *    fixed table) because correct gains are scene- and light-dependent
-     *    and there is no calibrated reference to hardcode. */
-    {
-        uint8_t awb_gain[6];
-        int32_t rd_ok = BSP_ERROR_NONE;
-        for (int i = 0; i < 6; i++)
-        {
-            if (BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, (uint16_t)(0x3400 + i),
-                                    &awb_gain[i], 1) != BSP_ERROR_NONE)
-            {
-                rd_ok = BSP_ERROR_COMPONENT_FAILURE;
-                break;
-            }
-        }
-        if (rd_ok == BSP_ERROR_NONE)
-        {
-            for (int i = 0; i < 6; i++)
-            {
-                BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, (uint16_t)(0x3400 + i),
-                                     &awb_gain[i], 1);
-            }
-            val = 0x01;  /* 0x3406 bit0 = manual AWB (use frozen gains above) */
-            BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3406, &val, 1);
-        }
-        /* If the read failed, leave AWB in auto mode rather than lock a
-         * garbage/partial gain set. */
-    }
 
 #if CAMERA_JPEG_MODE
     /* ── Enable OV5640 JPEG output + DCMI JPEG mode ──────────────────────
@@ -493,9 +773,9 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
     }
 #endif /* CAMERA_JPEG_MODE */
 
-    LOG_INFO(TAG_CAM, "Camera initialized OK (raw frame size: %lu bytes, VTS=0x%04X)",
-             (unsigned long)_raw_frame_size(resolution),
-             (unsigned)CAMERA_VTS_DEFAULT);
+    LOG_INFO(TAG_CAM, "Camera initialized OK (raw frame size: %lu bytes, "
+             "AEC/AWB auto, manufacturer timing)",
+             (unsigned long)_raw_frame_size(resolution));
 
     s_initialized = 1;
     return CAMERA_OK;
@@ -543,10 +823,19 @@ CameraStatus_t Camera_CaptureFrame(uint8_t *buffer, uint32_t buffer_size,
     /* In JPEG mode the DCMI JPEG protocol requires snapshot mode (variable frame
      * size with VSYNC-terminated transfer). The continuous-mode warmup path
      * assumes fixed-size frames and does not work reliably with JPEG output.
-     * AEC is already settled from Camera_Init, so no warmup is needed. */
+     * Camera_WarmCapture() reconverges AEC itself before capturing, so no
+     * separate warmup is needed here. */
     LOG_INFO(TAG_CAM, "JPEG mode: delegating to Camera_WarmCapture (single snapshot)");
     return Camera_WarmCapture(buffer, buffer_size, captured_size);
 #endif
+
+    /* 2026-08-21: reconverge AEC before every capture, not just once at
+     * cold init — see the matching comment in Camera_WarmCapture(). This
+     * path only runs on a genuinely cold camera (main.c falls back here
+     * when Camera_IsInitialized() is false), but the same staleness bug
+     * applies: don't trust whatever exposure happened to be in the sensor. */
+    _ensure_sensor_streaming();
+    _wait_aec_converge();
 
     const uint32_t TOTAL_FRAMES = CAMERA_WARMUP_FRAMES + 1;  /* warm-up + final */
     int32_t ret;
@@ -579,9 +868,9 @@ CameraStatus_t Camera_CaptureFrame(uint8_t *buffer, uint32_t buffer_size,
     /* Wait for TOTAL_FRAMES frame-complete interrupts */
     uint32_t start_tick = HAL_GetTick();
 
-    /* At VTS=0x07D0 (~12fps), each frame takes ~83ms.
-     * Total expected: ~83ms × 4 = ~330ms.
-     * Timeout: generous 3s to handle low-light slow-down. */
+    /* Frame timing now comes from ST's stock OV5640_Common[] VTS (0x0440),
+     * not a project override. Timeout: generous 3s to handle low-light
+     * slow-down regardless of the exact stock frame rate. */
     const uint32_t CAPTURE_TIMEOUT_MS = 3000;
 
     while (s_frame_count < TOTAL_FRAMES)
@@ -592,6 +881,10 @@ CameraStatus_t Camera_CaptureFrame(uint8_t *buffer, uint32_t buffer_size,
                       (unsigned long)CAPTURE_TIMEOUT_MS,
                       (unsigned long)s_frame_count,
                       (unsigned long)TOTAL_FRAMES);
+            /* Probe the DVP lines BEFORE stopping DCMI — the sensor is still
+             * streaming at this point, so this tells us whether pixels are
+             * physically arriving at all. */
+            _probe_dvp_signals();
             BSP_CAMERA_Stop(0);
             BSP_LED_Off(LED_RED);
             s_active_buffer = NULL;
@@ -692,11 +985,14 @@ CameraStatus_t Camera_CaptureFrame(uint8_t *buffer, uint32_t buffer_size,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Zero-Overhead Warm Capture — Enterprise Fast Path
+ *  Warm Capture — single snapshot, no DCMI/sensor re-init
  *
- *  Captures exactly 1 frame with zero warmup. The sensor is already
- *  AEC-converged from the persistent init, so the first frame is usable.
- *  Expected latency: ~83ms at VTS=0x07D0 (~12fps).
+ *  Captures exactly 1 frame. Reconverges AEC first (2026-08-21 — the
+ *  sensor's own AEC loop runs continuously in the background regardless of
+ *  DCMI state, so this is normally a fast poll of an already-settled
+ *  register, not a fresh multi-frame convergence), then arms DCMI for one
+ *  snapshot. No fixed-VTS latency claim here anymore — actual timing comes
+ *  from ST's stock OV5640_Common[] table.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 CameraStatus_t Camera_WarmCapture(uint8_t *buffer, uint32_t buffer_size,
@@ -705,7 +1001,7 @@ CameraStatus_t Camera_WarmCapture(uint8_t *buffer, uint32_t buffer_size,
     uint32_t perf_start = HAL_GetTick();
     (void)perf_start;
 
-    LOG_INFO(TAG_CAM, "Warm capture (single frame, zero warmup)...");
+    LOG_INFO(TAG_CAM, "Warm capture (single frame, no DCMI warmup)...");
 
     if (buffer == NULL || captured_size == NULL)
     {
@@ -720,6 +1016,19 @@ CameraStatus_t Camera_WarmCapture(uint8_t *buffer, uint32_t buffer_size,
                   (unsigned long)CAMERA_FRAME_BUFFER_SIZE);
         return CAMERA_ERROR_CAPTURE;
     }
+
+    /* 2026-08-21: reconverge AEC before EVERY capture, not just once at
+     * cold Camera_Init(). This is the dominant fix for wrong exposure —
+     * previously AEC/AWB converged once at boot and every subsequent
+     * WarmCapture (the path used for all normal scheduled captures, see
+     * main.c) reused whatever settled at that first scene forever, even
+     * as lighting changed or the board was repositioned. The sensor's own
+     * AEC loop runs continuously in the background regardless of DCMI
+     * state (BSP_CAMERA_Init leaves it streaming), so this is usually a
+     * fast poll of an already-settled register, not a fresh convergence —
+     * see _wait_aec_converge(). */
+    _ensure_sensor_streaming();
+    _wait_aec_converge();
 
     /* ── Enterprise Retry Loop ──────────────────────────────────────
      * The DCMI/sensor can miss a snapshot trigger after extended idle.

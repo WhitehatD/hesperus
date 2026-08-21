@@ -1613,61 +1613,6 @@ int32_t MX_WIFI_Socket_recv(MX_WIFIObject_t *Obj, int32_t SockFd, uint8_t *Buf,
 }
 
 
-/* ENTERPRISE PATCH: recv variant with configurable MIPC transport timeout.
- * The standard Socket_recv uses MX_WIFI_CMD_TIMEOUT (10000ms) which blocks
- * the entire SPI bus when a browser opens speculative TCP connections without
- * sending HTTP data. This variant lets the caller specify a shorter ceiling. */
-int32_t MX_WIFI_Socket_recv_timeout(MX_WIFIObject_t *Obj, int32_t SockFd, uint8_t *Buf,
-                                     int32_t Len, int32_t flags, uint32_t timeout_ms)
-{
-  int32_t ret = (int32_t)MX_WIFI_STATUS_PARAM_ERROR;
-
-  if ((NULL != Obj) && (0 <= SockFd) && (NULL != Buf) && (0 < Len))
-  {
-    socket_recv_cparams_t cp = {0};
-    const uint16_t cp_size = (uint16_t)(sizeof(cp));
-    socket_recv_rparams_t *rp = NULL;
-    size_t data_len = (size_t)Len;
-    uint16_t rp_size;
-
-    ret = (int32_t)MX_WIFI_STATUS_ERROR;
-
-    if ((data_len + sizeof(socket_recv_rparams_t) - 1) > MX_WIFI_IPC_PAYLOAD_SIZE)
-    {
-      data_len = MX_WIFI_IPC_PAYLOAD_SIZE - (sizeof(socket_recv_rparams_t) - 1);
-    }
-
-    rp_size = (uint16_t)(sizeof(socket_recv_rparams_t) - 1 + data_len);
-    rp = (socket_recv_rparams_t *)MX_WIFI_MALLOC(rp_size);
-    if (NULL != rp)
-    {
-      rp->received = 0;
-      cp.socket = SockFd;
-      cp.size = data_len;
-      cp.flags = flags;
-      if (MIPC_CODE_SUCCESS == mipc_request(MIPC_API_SOCKET_RECV_CMD,
-                                            (uint8_t *)&cp, cp_size,
-                                            (uint8_t *)rp, &rp_size,
-                                            timeout_ms))
-      {
-        if (rp->received > 0)
-        {
-          const size_t received_len = (size_t)rp->received;
-          if (received_len <= data_len)
-          {
-            (void)memcpy(Buf, &rp->buffer[0], received_len);
-          }
-        }
-        ret = rp->received;
-      }
-      MX_WIFI_FREE(rp);
-    }
-  }
-
-  return ret;
-}
-
-
 int32_t MX_WIFI_Socket_recvfrom(MX_WIFIObject_t *Obj, int32_t SockFd, uint8_t *Buf,
                                 int32_t Len, int32_t Flags,
                                 struct mx_sockaddr *FromAddr, uint32_t *FromAddrLen)

@@ -914,7 +914,7 @@ export default function BoardPage({
 							className={`panel-tab ${activeTab === "energy" ? "active" : ""}`}
 							onClick={() => setActiveTab("energy")}
 						>
-							Energy
+							Power &amp; Energy
 							{energy.windows > 0 && (
 								<span className="tab-count">{energy.windows}</span>
 							)}

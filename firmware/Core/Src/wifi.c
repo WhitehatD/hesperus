@@ -21,6 +21,7 @@
 #include "debug_log.h"
 #include "main.h"
 #include "board_status.h"
+#include "net_lease.h"   /* last-known-good IPv4 lease cache (DHCP-failure fallback) */
 #include "ota_update.h"  /* Firmware_CRC32 — shared with the chunked upload finalizer */
 
 #include "mx_wifi.h"
@@ -345,6 +346,7 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
     bool got_ip = false;
     uint32_t dhcp_start = HAL_GetTick();
     const uint32_t dhcp_poll_ms = 300;
+    uint32_t link_down_polls = 0;
 
     while ((HAL_GetTick() - dhcp_start) < WIFI_CONNECT_TIMEOUT_MS)
     {
@@ -352,11 +354,35 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
          * If the user provided a wrong password, association might succeed
          * but the subsequent 4-way handshake will fail and the AP will kick
          * us. If we lose link layer connectivity, fail fast instead of
-         * waiting out the full deadline. */
+         * waiting out the full deadline.
+         *
+         * 2026-08-21 (live incident, researched not guessed): this used to
+         * break on the FIRST IsConnected()<=0 reading. But the load-bearing
+         * comment right above this loop already documents that
+         * IsConnected() confirms asynchronously and can read stale/false
+         * for a beat even after a mandatory settle yield — and every
+         * observed failure tonight fired at EXACTLY the first poll after
+         * that yield, every single time, for 40+ consecutive attempts
+         * across multiple full resets. That's the signature of a single
+         * transient false reading being treated as fatal, not a real
+         * link drop (a genuine drop should be roughly as likely to show up
+         * on poll 3 as poll 1; "always exactly poll 1" is a code artifact,
+         * not physics). Require 3 consecutive bad readings (900ms of
+         * sustained loss) before treating it as real — still fails fast
+         * on an actual drop, just no longer fatal on one flickery read. */
         if (MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
         {
-            LOG_ERROR(TAG_WIFI, "Link dropped during DHCP (wrong password or AP reject)");
-            break;
+            link_down_polls++;
+            if (link_down_polls >= 3)
+            {
+                LOG_ERROR(TAG_WIFI, "Link dropped during DHCP (wrong password or AP reject, "
+                          "%lu consecutive polls)", (unsigned long)link_down_polls);
+                break;
+            }
+        }
+        else
+        {
+            link_down_polls = 0;
         }
 
         if (MX_WIFI_GetIPAddress(wifi_obj_get(), ip, MC_STATION) == MX_WIFI_STATUS_OK
@@ -373,6 +399,19 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
     if (got_ip)
     {
         LOG_INFO(TAG_WIFI, "IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
+        /* Cache this lease as the last-known-good config for this SSID, so a
+         * future DHCP outage on the same network has something correct to
+         * fall back to (see NetLease_Load use below). NetLease_Save is
+         * idempotent — it skips the flash write when nothing changed — so
+         * calling it on every successful DHCP costs nothing in practice. */
+        NetLease_t good;
+        memcpy(good.ip, ip, 4);
+        memcpy(good.mask,    wifi_obj_get()->NetSettings.IP_Mask,      4);
+        memcpy(good.gateway, wifi_obj_get()->NetSettings.Gateway_Addr, 4);
+        memcpy(good.dns,     wifi_obj_get()->NetSettings.DNS1,         4);
+        (void)NetLease_Save(ssid, &good);
+
         return WIFI_OK;
     }
 
@@ -384,6 +423,67 @@ WiFiStatus_t WiFi_Connect(const char *ssid, const char *password)
      * state machine locks. */
     MX_WIFI_Disconnect(wifi_obj_get());
     MX_WIFI_IO_YIELD(wifi_obj_get(), 500);
+
+    /* ── Last-known-good lease fallback (vendor-neutral) ─────────────────
+     * DHCP just failed on a link whose association and WPA2 handshake both
+     * succeeded — i.e. the radio is fine and only the address server is
+     * unresponsive. Rather than give up (or hardcode one AP vendor's
+     * subnet, which the first version of this did), reuse the address this
+     * exact SSID handed us last time it was working. That's RFC 2131's
+     * INIT-REBOOT behaviour: a client that remembers a previously assigned
+     * address re-asserts it instead of starting over. Works on any AP,
+     * needs no knowledge of the subnet, and is keyed by SSID so one
+     * network's addressing can never leak onto another. */
+    NetLease_t lease;
+    if (NetLease_Load(ssid, &lease) != LEASE_OK)
+    {
+        LOG_WARN(TAG_WIFI, "DHCP failed and no cached lease for this SSID — nothing to fall "
+                 "back to (a lease is cached automatically after the first successful DHCP)");
+        if (!ssid_seen)
+        {
+            return WIFI_ERROR_CONNECT;
+        }
+        return WIFI_ERROR_DHCP;
+    }
+
+    LOG_WARN(TAG_WIFI, "Reusing last-known-good lease %d.%d.%d.%d for '%s'...",
+             lease.ip[0], lease.ip[1], lease.ip[2], lease.ip[3], ssid);
+
+    MX_WIFIObject_t *wifi_static = wifi_obj_get();
+    wifi_static->NetSettings.DHCP_IsEnabled = 0;
+    memcpy(wifi_static->NetSettings.IP_Addr,      lease.ip,      4);
+    memcpy(wifi_static->NetSettings.IP_Mask,      lease.mask,    4);
+    memcpy(wifi_static->NetSettings.Gateway_Addr, lease.gateway, 4);
+    memcpy(wifi_static->NetSettings.DNS1,         lease.dns,     4);
+
+    int32_t static_ret = MX_WIFI_Connect(wifi_static, ssid, password, MX_WIFI_SEC_AUTO);
+
+    /* Always restore DHCP as the default for the NEXT connect attempt,
+     * whether this one worked or not — the static fallback is a
+     * per-attempt escape hatch, not a permanent mode switch. Real routers
+     * (any AP other than an iPhone hotspot) need real DHCP. */
+    wifi_static->NetSettings.DHCP_IsEnabled = 1;
+
+    if (static_ret == MX_WIFI_STATUS_OK)
+    {
+        /* Match the settle budget the DHCP path uses — 3s was too tight and
+         * produced false "didn't connect" verdicts when the association was
+         * simply still completing. */
+        MX_WIFI_IO_YIELD(wifi_static, 5000);
+        if (MX_WIFI_IsConnected(wifi_static) > 0)
+        {
+            s_connected = 1;
+            LOG_INFO(TAG_WIFI, "Cached lease worked: %d.%d.%d.%d",
+                     lease.ip[0], lease.ip[1], lease.ip[2], lease.ip[3]);
+            WiFi_SetPowerSave(0);
+            return WIFI_OK;
+        }
+    }
+
+    LOG_WARN(TAG_WIFI, "Cached lease did not connect either — the AP is rejecting the "
+             "association itself, or the address is no longer valid on this network");
+    MX_WIFI_Disconnect(wifi_static);
+    MX_WIFI_IO_YIELD(wifi_static, 500);
 
     if (!ssid_seen)
     {
@@ -1593,6 +1693,73 @@ int32_t WiFi_TcpConnect(const char *host, uint16_t port)
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Shutdown
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Radio Quiesce For Capture  —  shared-rail arbitration
+ *
+ *  MEASURED 2026-08-21, and the root cause of a full day of "camera is
+ *  broken" symptoms: with the EMW3080 merely POWERED (not transmitting, not
+ *  even initialised by this firmware yet), the OV5640's core clock domain
+ *  will not run. Its SCCB block stays alive throughout — chip ID reads
+ *  0x5640, every config register holds correct values — but the pixel
+ *  array, ISP, PLL and DVP output are all halted, so DCMI receives nothing
+ *  and every capture times out at 0 frames.
+ *
+ *  Proof, two consecutive boots, single variable changed:
+ *    EMW3080 running          -> ISP luminance FROZEN, capture 0 bytes
+ *    EMW3080 held in reset    -> ISP luminance VARYING, capture 614400
+ *                                bytes, 938/938 sampled bytes non-zero
+ *
+ *  Both devices sit on the board's shared 3V3 rail. The failure appeared
+ *  the moment the board was moved to a different USB port, i.e. a supply
+ *  with less headroom — the camera's core domain is the first thing to
+ *  drop out when the rail sags, while its low-current SCCB block rides
+ *  through. Nothing is broken; the rail simply cannot carry both at once.
+ *
+ *  So arbitrate. Capture and radio never actually need to be concurrent:
+ *  the frame lands in RAM first and is uploaded afterwards. Hold the radio
+ *  in hardware reset (RSTN, PF15) across the capture window only, then
+ *  bring it back. Callers MUST pair these — see the capture entry points
+ *  in main.c.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void WiFi_QuiesceForCapture(void)
+{
+    LOG_INFO(TAG_WIFI, "Quiescing radio for capture (shared 3V3 rail)");
+
+    /* Clean protocol-level shutdown first so the module isn't cut off
+     * mid-transaction, then assert its hardware reset to drop it to idle
+     * current for the duration of the capture. */
+    WiFi_DeInit();
+
+    GPIO_InitTypeDef g = {0};
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+    g.Pin   = MX_WIFI_RESET_PIN;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(MX_WIFI_RESET_PORT, &g);
+    HAL_GPIO_WritePin(MX_WIFI_RESET_PORT, MX_WIFI_RESET_PIN, GPIO_PIN_RESET);
+
+    /* Let the rail recover before the sensor's PLL is asked to lock. */
+    HAL_Delay(100);
+}
+
+/**
+ * @brief Release the radio after a capture and bring the link back up.
+ * @return WIFI_OK once the module is re-initialised (caller still needs to
+ *         re-establish MQTT; the main loop's existing reconnect path does).
+ */
+WiFiStatus_t WiFi_ResumeAfterCapture(void)
+{
+    LOG_INFO(TAG_WIFI, "Releasing radio from reset after capture");
+
+    HAL_GPIO_WritePin(MX_WIFI_RESET_PORT, MX_WIFI_RESET_PIN, GPIO_PIN_SET);
+    HAL_Delay(50);
+
+    /* WiFi_Init() drives the full documented reset/boot sequence on this
+     * pin itself, so it re-owns the pin from here. */
+    return WiFi_Init();
+}
 
 void WiFi_DeInit(void)
 {

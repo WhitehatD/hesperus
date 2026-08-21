@@ -244,18 +244,22 @@ static int _ota_send_all(int32_t sock, const uint8_t *data, int32_t len)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Enterprise-Grade Yield-First Socket Receive
+ *  Bounded-Retry Socket Receive
  *
- *  The EMW3080 processes TCP data asynchronously: radio → internal buffer
- *  → MIPC framing → SPI transfer to STM32. Each step requires sustained
- *  SPI bus time. The critical insight: we must yield the SPI bus BEFORE
- *  each recv() call so the module has uninterrupted time to complete
- *  this pipeline.
- *
- *  Strategy (matches proven WiFi_HttpGetTime pattern in wifi.c):
- *    1. Yield SPI bus for 200ms (≈2 TCP round-trips to a remote VPS)
- *    2. Call recv() with flag 0 + 1s SO_RCVTIMEO
- *    3. Each poll cycle takes ~1.2s max → 10+ polls in a 15s window
+ *  2026-08-21: previously called a hand-patched vendor-driver function
+ *  (MX_WIFI_Socket_recv_timeout, since removed from mx_wifi.c/.h) that
+ *  duplicated the stock recv() but with a caller-supplied MIPC transport
+ *  timeout. That's two different timeouts conflated: the socket-level
+ *  SO_RCVTIMEO (how long the MODULE waits for TCP data before answering
+ *  the recv command — set once in _ota_socket_open, 1000ms, confirmed by
+ *  hardware testing to be the smallest value the AT firmware reliably
+ *  honors, see that function) vs. the LOCAL wait for the module's SPI
+ *  reply to arrive at all (stock recv() uses the fixed MX_WIFI_CMD_TIMEOUT
+ *  = 10000ms — a safety ceiling, not something normally hit, since the
+ *  module should answer within its SO_RCVTIMEO window regardless). Now
+ *  uses stock MX_WIFI_Socket_recv() and lets the already-correct
+ *  SO_RCVTIMEO govern module-side wait; this outer loop still re-polls up
+ *  to total_timeout_ms, same as before.
  *
  *  Chunk size aligned to 1460 bytes (TCP MSS) to prevent MIPC
  *  fragmentation and maximize per-recv throughput.
@@ -271,13 +275,7 @@ static int32_t _ota_safe_recv(int32_t sock, uint8_t *buf, int32_t max_len, uint3
 #if WATCHDOG_ENABLED
         IWDG->KR = 0x0000AAAAu;
 #endif
-        /* ENTERPRISE FIX: We must poll the Wi-Fi module as fast as possible!
-         * Explicitly yielding for 200ms between reads artificially caps the STM32 processing
-         * speed to ~5 KB/s. Even with the Backend StreamingRate limit at 200 KB/s, the 
-         * fast server instantly overwhelms the EMW3080 LwIP buffer while the STM32 sleeps!
-         * MX_WIFI_Socket_recv_timeout internally yields the IO thread safely while waiting. */
-        
-        /* ENTERPRISE FIX: MIPC/SPI Payload Allocation Fault mitigation.
+        /* MIPC/SPI Payload Allocation Fault mitigation.
          * Although standard Ethernet MSS is 1460, EMW3080 AT firmware internally
          * allocates MIPC structures from a very small pool. If we request 1460
          * bytes when >1460 bytes are buffered, it fails to allocate an IPC packet
@@ -285,14 +283,7 @@ static int32_t _ota_safe_recv(int32_t sock, uint8_t *buf, int32_t max_len, uint3
          * starving the STM32 for `total_timeout_ms` (15s). 1000 bytes is safe. */
         int32_t safe_chunk = (max_len > 1000) ? 1000 : max_len;
 
-        /* ENTERPRISE FIX: MIPC timeout must strictly exceed the AT firmware's hardcoded
-         * 10000ms (MX_WIFI_CMD_TIMEOUT) blocking time. If we cap this at 1000ms or 2000ms,
-         * the STM32 drops the SPI command, but the EMW3080 AT firmware is STILL executing
-         * it, permanently bricking the MIPC sync. We set it to 15000ms to allow the AT 
-         * firmware to safely return its own -1 after 10s if no data arrives. 
-         * Retriggering CI. 
-         * Quadruple CI trigger. */
-        ret = MX_WIFI_Socket_recv_timeout(wifi_obj_get(), sock, buf, safe_chunk, 0, 15000);
+        ret = MX_WIFI_Socket_recv(wifi_obj_get(), sock, buf, safe_chunk, 0);
         polls++;
 
         if (ret > 0)

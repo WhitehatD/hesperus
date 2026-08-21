@@ -184,6 +184,28 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef *hspi)
         return;
     }
 
+#if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
+    /* 2026-08-21: this function's own header says "Symmetric teardown" but
+     * was NOT symmetric with _spi2_dma_init() above — it never deinit'd the
+     * GPDMA1 ch0/ch1 handles that init sets up, and never disabled their
+     * IRQs. Every WiFi_DeInit()->WiFi_Init() cycle therefore called
+     * HAL_DMA_Init() on the SAME static handles again without ever calling
+     * HAL_DMA_DeInit() first — no clean reset of the channel's transfer/
+     * error state between cycles. Found live: after ~20 WiFi reinit cycles
+     * during a sustained reconnect incident, camera capture (a completely
+     * separate peripheral, DCMI on GPDMA1 channel 12 — same GPDMA1
+     * controller, different channel) started failing 100% of the time,
+     * including through its own full DeInit/Init cycle, which rules out a
+     * camera-side cause. Deinit'ing the SPI2 DMA channels here — instead
+     * of leaving stale channel state for the next _spi2_dma_init() to
+     * silently overwrite — is the correct, symmetric fix regardless of
+     * the exact mechanism. */
+    HAL_NVIC_DisableIRQ(GPDMA1_Channel0_IRQn);
+    HAL_NVIC_DisableIRQ(GPDMA1_Channel1_IRQn);
+    (void)HAL_DMA_DeInit(&hdma_spi2_tx);
+    (void)HAL_DMA_DeInit(&hdma_spi2_rx);
+#endif
+
     __HAL_RCC_SPI2_CLK_DISABLE();
 
     /* De-init SPI data lines */

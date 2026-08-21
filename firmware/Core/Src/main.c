@@ -783,6 +783,297 @@ int main(void)
      *      — 3s=force portal, 8s=factory-reset warning, 10s=commit — via
      *      _boot_wait_with_button_poll(), so a stuck board never requires
      *      waiting out the full retry policy to be reconfigured. */
+    /* ── Camera comes up BEFORE the radio (shared 3V3 rail) ───────────────
+     * Measured 2026-08-21: the EMW3080 and the OV5640 share the board's 3V3
+     * rail, and with the radio powered the sensor's PLL will not lock — its
+     * core never starts, so every capture returns 0 frames while SCCB still
+     * answers normally (chip ID and all config registers read correct). That
+     * combination is what made this look like dead silicon for a full day.
+     *
+     * The constraint is on PLL LOCK only. Once initialised on a quiet rail
+     * the sensor keeps framing with the radio fully active — measured warm
+     * capture 601ms / 614400 bytes with WiFi up and MQTT connected. So the
+     * cheapest correct fix is ordering: initialise the camera here, before
+     * WiFi_Init() has ever powered the module, and it costs nothing. The
+     * later "keep it warm" step is a no-op once this succeeds, and the
+     * runtime cold-reinit path quiesces the radio explicitly because that
+     * is the only other place a PLL lock happens with the radio live. */
+    if (Camera_Init(CAMERA_DEFAULT_RESOLUTION) != CAMERA_OK)
+    {
+        LOG_ERROR(TAG_BOOT, "Camera init failed pre-WiFi — captures will cold-start");
+    }
+    else
+    {
+        LOG_INFO(TAG_BOOT, "Camera initialised pre-WiFi (PLL locked on a quiet rail)");
+    }
+
+#if CAMERA_BOOT_SELFTEST
+    /* ── Boot-time camera self-test ───────────────────────────────────────
+     * Runs BEFORE WiFi so it works on a board that can't associate. The
+     * capture path is entirely local (sensor -> DCMI -> RAM); only the
+     * upload needs a network, so there is no reason a camera diagnostic
+     * should depend on one. Added because the board was spending all its
+     * time in the boot WiFi retry loop, where the main loop's
+     * capture-on-button-tap is never reached — making the camera
+     * untestable exactly when it most needed testing. */
+    {
+        LOG_INFO(TAG_BOOT, "=== CAMERA BOOT SELF-TEST (pre-WiFi) ===");
+        (void)0;
+
+#if CAMERA_SELFTEST_QUIESCE_WIFI
+        /* ── Power-interaction test ───────────────────────────────────────
+         * The sensor's array provably RUNS during each boot's init (its
+         * frozen luminance values are scene-correlated per session) and
+         * then halts — deterministically, every boot, since the incident.
+         * The EMW3080 WiFi module shares the 3V3 rail with the camera
+         * module and draws its heaviest burst currents during radio
+         * activity; the failure era also exactly coincides with the WiFi
+         * reconnect storm AND a USB-port change. A rail sagging under
+         * combined load would halt the sensor's core clock domain first
+         * while its low-current SCCB block rides through — precisely the
+         * measured signature, with zero broken hardware.
+         * Isolate it: hold the EMW3080 in hardware reset (RSTN low, PF15)
+         * for the duration of the camera test so the module draws idle
+         * current only. If the camera frames with WiFi quiesced and fails
+         * with it active, the diagnosis is power delivery, not the sensor. */
+        {
+            GPIO_InitTypeDef wrst = {0};
+            __HAL_RCC_GPIOF_CLK_ENABLE();
+            wrst.Pin   = GPIO_PIN_15;
+            wrst.Mode  = GPIO_MODE_OUTPUT_PP;
+            wrst.Pull  = GPIO_NOPULL;
+            wrst.Speed = GPIO_SPEED_FREQ_LOW;
+            HAL_GPIO_Init(GPIOF, &wrst);
+            HAL_GPIO_WritePin(GPIOF, GPIO_PIN_15, GPIO_PIN_RESET);
+            HAL_Delay(100);
+            LOG_INFO(TAG_BOOT, "SELFTEST: EMW3080 held in reset (PF15 low) — WiFi quiesced "
+                     "for power-isolation test");
+        }
+#endif
+        if (Camera_Init(CAMERA_DEFAULT_RESOLUTION) != CAMERA_OK)
+        {
+            LOG_ERROR(TAG_BOOT, "SELFTEST: Camera_Init failed");
+        }
+        else
+        {
+#if CAMERA_DRIVE_XCLK_FROM_MCU
+            /* ── Drive the sensor's XCLK master clock from the MCU ─────────
+             * Everything measured says the OV5640's core clock domain is
+             * dead while its SCCB domain is alive: chip ID reads 0x5640,
+             * every config register holds correct values, XSDN/RSTI are
+             * both correctly de-asserted, the internal test-pattern
+             * generator is enabled — and the ISP's live luminance
+             * accumulator (0x56A1) is frozen bit-identical across a full
+             * second, with no DVP transitions and an empty DMA buffer.
+             * A sensor with no master clock behaves exactly like that,
+             * because SCCB is clocked by SCL from the MCU and is the one
+             * domain that survives.
+             *
+             * Per ST's camera documentation for these boards, XCLK is an
+             * MCU output (RCC_MCO on PA8, ~24MHz). This firmware has never
+             * configured MCO and PA8 is entirely unused, so if the module's
+             * own oscillator has stopped there is currently nothing driving
+             * that net. Drive it: HSI16 straight out of MCO1 is 16MHz,
+             * inside the OV5640's documented 6-27MHz XCLK range. The PLL
+             * dividers in OV5640_Common[] assume 24MHz, so the resulting
+             * frame rate will be ~2/3 nominal — irrelevant here, since the
+             * question is only whether the core starts framing at all.
+             * Harmless if PA8 isn't routed to the camera on this board. */
+            {
+                GPIO_InitTypeDef mco = {0};
+                __HAL_RCC_GPIOA_CLK_ENABLE();
+                mco.Pin       = GPIO_PIN_8;
+                mco.Mode      = GPIO_MODE_AF_PP;
+                mco.Pull      = GPIO_NOPULL;
+                mco.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+                mco.Alternate = GPIO_AF0_MCO;
+                HAL_GPIO_Init(GPIOA, &mco);
+
+                HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSI, RCC_MCODIV_1);
+                HAL_Delay(50);
+                LOG_INFO(TAG_BOOT, "SELFTEST: MCO1 driving PA8 @16MHz (HSI) as camera XCLK");
+
+                /* Sensor needs a fresh power-up now that it finally has a
+                 * clock — its PLL and internal state machines could not
+                 * have initialised correctly without one. */
+                (void)BSP_CAMERA_HwReset(0);
+                HAL_Delay(50);
+                (void)Camera_DeInit();
+                (void)Camera_Init(CAMERA_DEFAULT_RESOLUTION);
+                HAL_Delay(100);
+            }
+#endif
+
+            /* ── Sensor power/standby pin state ───────────────────────────
+             * XSDN (PI3) is the OV5640 standby control on this board and
+             * RSTI (PI2) is its reset. Per BSP_CAMERA_HwReset(): XSDN HIGH
+             * = standby asserted, LOW = normal run; RSTI is active-low, so
+             * HIGH = out of reset. A sensor parked in hardware standby
+             * behaves exactly as measured — SCCB answers and the register
+             * file retains writes (SCCB is clocked by SCL from the MCU),
+             * while the array, ISP, PLL and DVP output all stop. Read the
+             * pins rather than assume the BSP left them correct, then run
+             * the manufacturer power-up sequence if standby is asserted. */
+            {
+                uint32_t xsdn = (GPIOI->IDR >> 3) & 1U;
+                uint32_t rsti = (GPIOI->IDR >> 2) & 1U;
+                LOG_INFO(TAG_BOOT, "SELFTEST: XSDN(PI3)=%lu (1=STANDBY asserted) "
+                         "RSTI(PI2)=%lu (0=held in reset)",
+                         (unsigned long)xsdn, (unsigned long)rsti);
+
+                if (xsdn != 0U || rsti == 0U)
+                {
+                    LOG_WARN(TAG_BOOT, "SELFTEST: sensor is parked (standby and/or reset) — "
+                             "running BSP_CAMERA_HwReset() power-up sequence");
+                    (void)BSP_CAMERA_HwReset(0);
+                    HAL_Delay(50);
+                    LOG_INFO(TAG_BOOT, "SELFTEST: after HwReset XSDN=%lu RSTI=%lu",
+                             (unsigned long)((GPIOI->IDR >> 3) & 1U),
+                             (unsigned long)((GPIOI->IDR >> 2) & 1U));
+                    /* Sensor lost its configuration through the reset, so
+                     * re-run the full init before attempting a capture. */
+                    (void)Camera_DeInit();
+                    (void)Camera_Init(CAMERA_DEFAULT_RESOLUTION);
+                }
+            }
+
+            /* ── Is the pixel array actually running? ─────────────────────
+             * 0x300A/0x300B is the chip ID (expect 0x56/0x40) — proves SCCB
+             * is sane. 0x56A1 is the ISP's average-luminance accumulator,
+             * recomputed by the sensor from live pixel data every frame. A
+             * value that JITTERS across reads proves the array and ISP are
+             * clocked and framing internally; a value frozen bit-identical
+             * across a full second proves they are halted, which no output
+             * or format register can be responsible for. This distinguishes
+             * "sensor alive but not driving the bus" from "sensor core
+             * stopped", and needs nothing but I2C. */
+            {
+                uint8_t id_h = 0, id_l = 0;
+                (void)BSP_I2C1_ReadReg16(0x78, 0x300A, &id_h, 1);
+                (void)BSP_I2C1_ReadReg16(0x78, 0x300B, &id_l, 1);
+
+                uint8_t lum[10];
+                for (int k = 0; k < 10; k++)
+                {
+                    lum[k] = 0;
+                    (void)BSP_I2C1_ReadReg16(0x78, 0x56A1, &lum[k], 1);
+                    HAL_Delay(100);
+                }
+                int varied = 0;
+                for (int k = 1; k < 10; k++)
+                    if (lum[k] != lum[0]) varied = 1;
+
+                LOG_INFO(TAG_BOOT, "SELFTEST: chipID=0x%02X%02X (expect 0x5640) | lum samples "
+                         "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X => %s",
+                         id_h, id_l, lum[0], lum[1], lum[2], lum[3], lum[4],
+                         lum[5], lum[6], lum[7], lum[8], lum[9],
+                         varied ? "VARYING (array+ISP are running)"
+                                : "FROZEN (sensor core halted)");
+            }
+#if CAMERA_SELFTEST_TEST_PATTERN
+            /* ── Sensor internal test-pattern isolation ───────────────────
+             * 0x503D (PRE_ISP_TEST_SET1) bit7 = enable, per Linux mainline
+             * ov5640.c: OV5640_TEST_ENABLE | OV5640_TEST_BAR_VERT_CHANGE_1
+             * | OV5640_TEST_BAR = 0x84 (colour bars).
+             *
+             * The sensor synthesises pixels INSIDE the chip, downstream of
+             * the pixel array, lens and exposure. That splits the remaining
+             * problem cleanly in two:
+             *   frames arrive -> output engine, DVP bus, DCMI and DMA are
+             *                    all healthy; fault is upstream (array/ISP).
+             *   still nothing -> the output engine itself is not emitting,
+             *                    which no ISP or exposure setting can fix.
+             * Either result eliminates half the search space. */
+            {
+                uint8_t tp = 0x84u;
+                (void)BSP_I2C1_WriteReg16(0x78, 0x503D, &tp, 1);
+                HAL_Delay(100);
+                uint8_t rb = 0;
+                (void)BSP_I2C1_ReadReg16(0x78, 0x503D, &rb, 1);
+                LOG_INFO(TAG_BOOT, "SELFTEST: test pattern ON, 0x503D=0x%02X", rb);
+            }
+#endif
+#if CAMERA_SELFTEST_RELEASE_BLOCKS
+            /* Controlled experiment, not a guess. Live reads show
+             * 0x3001(SYSTEM_RESET01) bit3 SET (block held in reset) and
+             * 0x3005(CLOCK_ENABLE01) bit3 CLEAR (that same block's clock
+             * gated off) — a matched pair. Neither ST's OV5640_Common[] nor
+             * the Linux driver's init table writes either register, so
+             * whatever set them is not part of any documented init path.
+             * Release every block in that bank and ungate its clocks: if a
+             * needed block was being held down this restores framing; if
+             * they were merely power-on defaults this changes nothing and
+             * eliminates them as a suspect. Safe either way — enabling an
+             * already-enabled block is a no-op. */
+            {
+                uint8_t before01 = 0, before05 = 0, v;
+                (void)BSP_I2C1_ReadReg16(0x78, 0x3001, &before01, 1);
+                (void)BSP_I2C1_ReadReg16(0x78, 0x3005, &before05, 1);
+                v = 0x00u; (void)BSP_I2C1_WriteReg16(0x78, 0x3001, &v, 1);
+                v = 0xFFu; (void)BSP_I2C1_WriteReg16(0x78, 0x3005, &v, 1);
+                HAL_Delay(50);
+                uint8_t after01 = 0, after05 = 0;
+                (void)BSP_I2C1_ReadReg16(0x78, 0x3001, &after01, 1);
+                (void)BSP_I2C1_ReadReg16(0x78, 0x3005, &after05, 1);
+                LOG_INFO(TAG_BOOT, "SELFTEST: released blocks — 0x3001 0x%02X->0x%02X, "
+                         "0x3005 0x%02X->0x%02X", before01, after01, before05, after05);
+            }
+#endif
+            uint32_t got = 0;
+            CameraStatus_t st = Camera_CaptureFrame(s_image_buffer,
+                                                    sizeof(s_image_buffer), &got);
+            if (st == CAMERA_OK && got > 0)
+            {
+                /* Summarise content so a black/garbage frame is
+                 * distinguishable from a real one without a network. */
+                uint32_t nonzero = 0, sum = 0;
+                for (uint32_t i = 0; i < got && i < 60000u; i += 64)
+                {
+                    if (s_image_buffer[i] != 0u) nonzero++;
+                    sum += s_image_buffer[i];
+                }
+                LOG_INFO(TAG_BOOT, "SELFTEST: CAPTURE OK — %lu bytes, %lu/938 sampled bytes "
+                         "non-zero, avg=%lu", (unsigned long)got,
+                         (unsigned long)nonzero, (unsigned long)(sum / 938u));
+            }
+            else
+            {
+                LOG_ERROR(TAG_BOOT, "SELFTEST: CAPTURE FAILED (st=%d, size=%lu)",
+                          (int)st, (unsigned long)got);
+
+                /* "0 frames" is reported by a counter incremented in the DCMI
+                 * frame IRQ. That is NOT the same claim as "no pixels
+                 * arrived" — the DMA can be filling memory correctly while
+                 * the completion signal never fires. Distinguish the two by
+                 * inspecting the DMA engine's own progress registers and the
+                 * buffer itself, instead of trusting the counter. */
+                uint32_t cdar = GPDMA1_Channel12->CDAR;
+                uint32_t remaining = GPDMA1_Channel12->CBR1 & 0xFFFFU;
+                uint32_t written = (cdar >= (uint32_t)(uintptr_t)s_image_buffer)
+                                     ? (cdar - (uint32_t)(uintptr_t)s_image_buffer) : 0u;
+
+                uint32_t nonzero = 0, maxv = 0;
+                for (uint32_t i = 0; i < sizeof(s_image_buffer); i += 512)
+                {
+                    if (s_image_buffer[i] != 0u) nonzero++;
+                    if (s_image_buffer[i] > maxv) maxv = s_image_buffer[i];
+                }
+
+                LOG_ERROR(TAG_BOOT, "SELFTEST: DMA CDAR=0x%08lX (advanced %lu bytes into buf) "
+                          "CBR1_remaining=%lu DCMI_SR=0x%08lX DCMI_CR=0x%08lX",
+                          (unsigned long)cdar, (unsigned long)written,
+                          (unsigned long)remaining,
+                          (unsigned long)DCMI->SR, (unsigned long)DCMI->CR);
+                LOG_ERROR(TAG_BOOT, "SELFTEST: buffer scan — %lu/1200 sampled bytes non-zero, "
+                          "max=%lu  => %s", (unsigned long)nonzero, (unsigned long)maxv,
+                          (nonzero > 0u) ? "PIXELS ARE ARRIVING (signalling bug, not sensor)"
+                                         : "buffer empty (nothing captured)");
+            }
+        }
+        LOG_INFO(TAG_BOOT, "=== CAMERA BOOT SELF-TEST DONE ===");
+    }
+#endif
+
     {
         WiFiCredentials_t flash_creds;
         if (WiFiCred_Load(&flash_creds) == WIFI_CRED_OK)
@@ -1043,13 +1334,47 @@ int main(void)
 #if WATCHDOG_ENABLED
     HAL_IWDG_Refresh(&hiwdg);
 #endif
-    if (Camera_Init(CAMERA_DEFAULT_RESOLUTION) != CAMERA_OK)
+    /* ── Shared-rail sequencing (measured 2026-08-21) ─────────────────────
+     * The EMW3080 and the OV5640 share the 3V3 rail. With the radio powered,
+     * the sensor's PLL will not lock and its core never starts — every
+     * capture then returns 0 frames while SCCB still answers normally, which
+     * is what made this look like dead silicon for a whole day.
+     *
+     * The constraint applies to PLL LOCK, not to steady-state running: once
+     * the sensor is initialised on a quiet rail it keeps framing happily
+     * with the radio fully active (measured: warm capture 601ms / 614400
+     * bytes with WiFi up and MQTT connected). So the radio only has to yield
+     * for this one init, not for every capture — which is why this is done
+     * here rather than around each capture, where the module re-init cost
+     * was adding ~50s per photo. */
+    if (Camera_IsInitialized())
     {
-        LOG_ERROR(TAG_BOOT, "WARNING: Camera init failed at boot — captures will cold-start");
+        LOG_INFO(TAG_BOOT, "Camera already initialised (boot self-test) — keeping it warm");
     }
     else
     {
-        LOG_INFO(TAG_BOOT, "Camera warm and ready (persistent mode)");
+        const bool radio_up = WiFi_IsConnected();
+        if (radio_up)
+        {
+            LOG_INFO(TAG_BOOT, "Quiescing radio so the camera PLL can lock on a quiet rail");
+            WiFi_QuiesceForCapture();
+        }
+
+        CameraStatus_t cam_boot = Camera_Init(CAMERA_DEFAULT_RESOLUTION);
+
+        if (radio_up)
+        {
+            (void)WiFi_ResumeAfterCapture();
+        }
+
+        if (cam_boot != CAMERA_OK)
+        {
+            LOG_ERROR(TAG_BOOT, "WARNING: Camera init failed at boot — captures will cold-start");
+        }
+        else
+        {
+            LOG_INFO(TAG_BOOT, "Camera warm and ready (persistent mode)");
+        }
     }
 
     /* ── Phase 4: Unified Main Loop ───────────────────
@@ -1154,30 +1479,88 @@ int main(void)
                  * auto-reassociate after a prolonged AP outage. Without this,
                  * MQTT_Init() fails immediately every 5 s and the board spins
                  * offline indefinitely (IWDG refreshed by the fast poll loop
-                 * so no watchdog reset -- silent indefinite failure). */
+                 * so no watchdog reset -- silent indefinite failure).
+                 *
+                 * 2026-08-21: added exponential backoff, live-incident-driven.
+                 * Without it, this branch fires on EVERY heartbeat tick this
+                 * loop is offline (STATUS_HEARTBEAT_INTERVAL_MS = 5s), so a
+                 * sustained AP-side problem meant a full associate-then-DHCP
+                 * cycle (and sometimes a full module DeInit/Init reset) every
+                 * ~5-13s, indefinitely, with zero pause — a reconnect storm.
+                 * Observed live: an iPhone Personal Hotspot, confirmed still
+                 * ON by the user, refused DHCP to this exact MAC on every
+                 * single attempt for 7+ minutes straight (40+ consecutive
+                 * identical failures) while the board hammered it every ~12s.
+                 * Standard 802.11 client behavior (and simple self-preservation
+                 * against AP-side rate-limiting / thrash-protection some
+                 * hotspot implementations apply to a client that won't stop
+                 * re-associating) is to back off, not retry immediately
+                 * forever. Backoff starts at one heartbeat interval and
+                 * doubles up to a 60s ceiling; resets to the base the moment
+                 * a reconnect actually succeeds. */
+                static uint32_t s_wifi_backoff_ms = 0;
+                static uint32_t s_wifi_last_attempt = 0;
+                bool backoff_elapsed = (s_wifi_backoff_ms == 0) ||
+                    ((HAL_GetTick() - s_wifi_last_attempt) >= s_wifi_backoff_ms);
+
                 if (s_has_runtime_wifi && MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
                 {
-                    LOG_WARN(TAG_WIFI, "WiFi L2 lost -- reconnecting before MQTT");
-                    s_telemetry.wifi_reconnects++;
-                    Watchdog_Refresh();
-                    /* One quick attempt first (WiFi_Connect now does its own
-                     * SSID-scan diagnosis + BoardStatus signalling — see
-                     * wifi.c) — only pay the ~5s full module reset if that
-                     * didn't even get a link, instead of unconditionally
-                     * DeInit+Init'ing on every single offline heartbeat. */
-                    if (WiFi_Connect(s_runtime_ssid, s_runtime_password) != WIFI_OK
-                        && MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
+                    if (!backoff_elapsed)
                     {
-                        LOG_WARN(TAG_WIFI, "Quick reconnect failed — re-initializing module");
-                        WiFi_DeInit();
-                        HAL_Delay(500);
-                        WiFi_Init();
-                        WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                        LOG_DEBUG(TAG_WIFI, "WiFi L2 still lost — backing off, next attempt in %lums",
+                                  (unsigned long)(s_wifi_backoff_ms - (HAL_GetTick() - s_wifi_last_attempt)));
                     }
-                    Watchdog_Refresh();
+                    else
+                    {
+                        LOG_WARN(TAG_WIFI, "WiFi L2 lost -- reconnecting before MQTT");
+                        s_telemetry.wifi_reconnects++;
+                        s_wifi_last_attempt = HAL_GetTick();
+                        Watchdog_Refresh();
+                        /* One quick attempt first (WiFi_Connect now does its own
+                         * SSID-scan diagnosis + BoardStatus signalling — see
+                         * wifi.c) — only pay the ~5s full module reset if that
+                         * didn't even get a link, instead of unconditionally
+                         * DeInit+Init'ing on every single offline heartbeat. */
+                        WiFiStatus_t reconnect_ret = WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                        if (reconnect_ret != WIFI_OK && MX_WIFI_IsConnected(wifi_obj_get()) <= 0)
+                        {
+                            LOG_WARN(TAG_WIFI, "Quick reconnect failed — re-initializing module");
+                            WiFi_DeInit();
+                            HAL_Delay(500);
+                            WiFi_Init();
+                            reconnect_ret = WiFi_Connect(s_runtime_ssid, s_runtime_password);
+                        }
+                        Watchdog_Refresh();
+
+                        if (reconnect_ret == WIFI_OK || MX_WIFI_IsConnected(wifi_obj_get()) > 0)
+                        {
+                            s_wifi_backoff_ms = 0;  /* success — reset for next time */
+                        }
+                        else
+                        {
+                            s_wifi_backoff_ms = (s_wifi_backoff_ms == 0)
+                                ? STATUS_HEARTBEAT_INTERVAL_MS
+                                : (s_wifi_backoff_ms * 2 > 60000 ? 60000 : s_wifi_backoff_ms * 2);
+                            LOG_WARN(TAG_WIFI, "Reconnect failed — next attempt backed off to %lums",
+                                     (unsigned long)s_wifi_backoff_ms);
+                        }
+                    }
                 }
-                MQTT_Init(&mqtt_cfg);
-                MQTT_SubscribeCommands(on_command_received);
+                else
+                {
+                    s_wifi_backoff_ms = 0;  /* L2 is fine, nothing to back off from */
+                }
+
+                /* Don't bother dialing the broker with no IP address — it's
+                 * a guaranteed-fail TCP connect that just burns time until
+                 * the next heartbeat. Only attempt MQTT when WiFi is either
+                 * already up, or a reconnect was just attempted this tick
+                 * (not skipped by backoff). */
+                if (!s_has_runtime_wifi || MX_WIFI_IsConnected(wifi_obj_get()) > 0 || backoff_elapsed)
+                {
+                    MQTT_Init(&mqtt_cfg);
+                    MQTT_SubscribeCommands(on_command_received);
+                }
             }
             last_ping = HAL_GetTick();
         }
@@ -2238,6 +2621,12 @@ static void _do_capture_now(void)
     /* Turn on RED LED during image capture */
     BSP_LED_On(LED_RED);
 
+    /* No radio quiesce here on purpose: the shared-rail constraint applies
+     * to the sensor's PLL LOCK, not to steady-state capture. Once the
+     * camera is initialised on a quiet rail (see the boot sequence) it
+     * captures fine with the radio fully up — measured at 601ms for a
+     * 614400-byte frame. Quiescing per capture cost ~50s in module
+     * re-init for no benefit. */
     /* ── Attempt 1: Warm capture (with internal retries) ── */
     if (Camera_IsInitialized())
     {
@@ -2258,19 +2647,37 @@ static void _do_capture_now(void)
                  "{\"status\":\"camera_reinit\",\"task_id\":%lu}", (unsigned long)task_id);
         MQTT_PublishStatus(status_msg);
 
-        /* Full power-cycle of the camera subsystem */
+        /* Full power-cycle of the camera subsystem. This re-locks the
+         * sensor PLL, which is the one operation that cannot share the 3V3
+         * rail with an active radio, so the radio yields for it — unlike
+         * the steady-state capture above. */
         Camera_DeInit();
+        const bool reinit_radio_up = WiFi_IsConnected();
+        if (reinit_radio_up)
+        {
+            WiFi_QuiesceForCapture();
+        }
         HAL_Delay(200);  /* Let sensor PLL re-lock after power cycle */
 
-        if (Camera_Init(CAMERA_DEFAULT_RESOLUTION) == CAMERA_OK)
+        CameraStatus_t cold_init = Camera_Init(CAMERA_DEFAULT_RESOLUTION);
+
+        if (cold_init == CAMERA_OK)
+        {
+            captured_size = 0;
+            cam_ret = Camera_CaptureFrame(
+                s_image_buffer, CAMERA_FRAME_BUFFER_SIZE, &captured_size);
+        }
+
+        if (reinit_radio_up)
+        {
+            (void)WiFi_ResumeAfterCapture();
+        }
+
+        if (cold_init == CAMERA_OK)
         {
             snprintf(status_msg, sizeof(status_msg),
                      "{\"status\":\"capturing\",\"task_id\":%lu,\"fallback\":\"cold\"}", (unsigned long)task_id);
             MQTT_PublishStatus(status_msg);
-
-            captured_size = 0;
-            cam_ret = Camera_CaptureFrame(
-                s_image_buffer, CAMERA_FRAME_BUFFER_SIZE, &captured_size);
         }
         else
         {

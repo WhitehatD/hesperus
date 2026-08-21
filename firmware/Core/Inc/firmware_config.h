@@ -25,6 +25,14 @@
 
 #define WIFI_CONNECT_TIMEOUT_MS     10000  /* Per-attempt assoc+DHCP deadline (WiFi_Connect) */
 
+/* DHCP-failure fallback: see net_lease.c. The board caches the last
+ * lease each SSID actually granted it and re-asserts that address when the
+ * AP's DHCP server stops answering (RFC 2131 INIT-REBOOT behaviour). This
+ * replaced an earlier fallback that hardcoded Apple's Personal Hotspot
+ * subnet — that worked on the one AP it knew about and did nothing
+ * anywhere else. Nothing to configure here; the cache is keyed by SSID and
+ * populated automatically on the first successful DHCP. */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Enterprise WiFi Retry Policy (2026-08-20)
  *
@@ -57,6 +65,25 @@
                                                * on every single retry, to avoid paying the ~5s
                                                * hardware reset delay repeatedly for a module
                                                * that is still perfectly healthy. */
+
+/* 2026-08-21 (live incident): association succeeding but DHCP failing on
+ * EVERY attempt, sustained across dozens of retries AND multiple full
+ * resets (module reinit, MCU reflash, true USB power removal, phone
+ * airplane-mode toggle — all identical failure), is a signature that
+ * points at the AP's DHCP server holding some per-client state (stale
+ * lease / thrash-protection cooldown for a MAC that keeps re-associating)
+ * rather than anything on our side. WIFI_RETRY_BACKOFF_MAX_MS (30s) means
+ * the board hammers the AP with a fresh associate+DHCP attempt roughly
+ * every 30-40s FOREVER once capped — for an AP-side cooldown, that's
+ * exactly the wrong behavior: it may be retriggering the same cooldown
+ * timer every attempt, so it can never lapse long enough to clear. Once
+ * failures are consistently DHCP-specific (not "AP absent", not a hard
+ * auth reject) and sustained past this many attempts, escalate the
+ * backoff ceiling much further to give the AP genuine quiet time. Still
+ * retries forever — never gives up, per the existing policy above — just
+ * much more patiently once this pattern is established. */
+#define WIFI_DHCP_STREAK_ESCALATE_AFTER 8       /* Consecutive DHCP-specific failures before escalating */
+#define WIFI_DHCP_BACKOFF_MAX_MS         300000 /* Escalated ceiling: 5 minutes */
 #define WIFI_PORTAL_SANITY_RECHECK_MS (5U * 60U * 1000U)  /* Background retry of stored creds
                                                * while the creds-suspect portal is open — in
                                                * case it was a fluke. Auto-exits + reboots on
@@ -175,6 +202,50 @@
  * Set to 0 to revert to raw RGB565 (for debugging or LLM benchmarks needing raw).
  */
 #define CAMERA_JPEG_MODE            0     /* 0 = RGB565, server converts to JPEG */
+
+/* 2026-08-21 bisect switch: when 1, skip every post-BSP_CAMERA_Init sensor
+ * register override we add on top of ST's OV5640_Common[] table, so a
+ * capture runs on the pure manufacturer baseline. Used to determine
+ * empirically whether our own writes are responsible for the sensor
+ * clocking but not framing, instead of reasoning about it. */
+#define CAMERA_BASELINE_ONLY        0
+
+/* Apply the Linux ov5640_set_power_dvp() register set before each capture.
+ * Held OFF by default: these writes are unproven on this board and were
+ * added while chasing a failure that predates them. The configuration that
+ * demonstrably produced good photos did NOT include them. Turn on only to
+ * re-test that hypothesis deliberately. */
+#define CAMERA_ASSERT_DVP_REGS      0
+
+/* Boot self-test: release all blocks in SYSTEM_RESET01 / CLOCK_ENABLE01
+ * before capturing, to test whether a gated block is what stops framing.
+ * RESULT 2026-08-21: released cleanly (0x3001 0x08->0x00, 0x3005 0xF7->0xFF)
+ * and capture still failed — eliminated, those were power-on defaults. */
+#define CAMERA_SELFTEST_RELEASE_BLOCKS 0
+
+/* Drive the OV5640 XCLK master clock from the MCU via MCO1 on PA8.
+ * ST documents XCLK as an MCU output on camera-equipped boards, but this
+ * firmware never configured MCO and PA8 is otherwise unused.
+ * RESULT 2026-08-21: enabling it changed nothing (sensor core stayed
+ * frozen), so PA8 is NOT routed to the camera XCLK net on this board —
+ * the MB1379 module clocks itself. Kept behind this flag as a documented
+ * dead end so nobody re-derives it. */
+#define CAMERA_DRIVE_XCLK_FROM_MCU     0
+
+/* Boot self-test: hold the EMW3080 WiFi module in hardware reset during the
+ * camera test, isolating shared-3V3-rail load as a cause of the sensor's
+ * core halting while its SCCB block stays alive. */
+#define CAMERA_SELFTEST_QUIESCE_WIFI   0
+
+/* Boot self-test: enable the sensor's internal colour-bar generator so the
+ * pixel array, lens and exposure are bypassed entirely. Isolates "output
+ * engine dead" from "nothing upstream to output". */
+#define CAMERA_SELFTEST_TEST_PATTERN   0
+
+/* Run a full capture at boot, before WiFi, logging the result to serial.
+ * Makes the camera testable on a board that cannot associate (the boot
+ * WiFi retry loop never reaches the main loop's button handler). */
+#define CAMERA_BOOT_SELFTEST        0
 #define CAMERA_JPEG_QUALITY         4     /* OV5640 QS: 0=best/largest, higher=worse/smaller (4 ≈ 80% quality) */
 
 /*
@@ -193,8 +264,7 @@
 
 /* ── Fast-Capture Tuning ──────────────────────────────── */
 #define CAMERA_WARMUP_FRAMES        3                 /* Frames to discard for AEC convergence (cold start only) */
-#define CAMERA_AEC_SETTLE_TIMEOUT_MS 1500             /* Max wait for AEC register convergence */
-#define CAMERA_VTS_DEFAULT          0x07D0            /* VTS=2000 lines — ~12fps, 83ms max exposure (night mode extends 4x) */
+#define CAMERA_AEC_SETTLE_TIMEOUT_MS 1500             /* Max wait for AEC register convergence — now polled before EVERY capture, not just cold start (2026-08-21) */
 #define CAMERA_INTER_FRAME_DELAY_MS 10                /* Brief ISP settle between snapshots */
 #define CAMERA_WARM_CAPTURE_RETRIES 3                 /* Max snapshot attempts before declaring failure */
 

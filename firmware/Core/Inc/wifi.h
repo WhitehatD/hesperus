@@ -114,6 +114,24 @@ WiFiStatus_t WiFi_HttpGetTime(uint8_t *hour, uint8_t *minute, uint8_t *second,
 void WiFi_DeInit(void);
 
 /**
+ * @brief  Hold the radio in hardware reset across a camera capture.
+ *
+ * The EMW3080 and the OV5640 share the board's 3V3 rail, and with the radio
+ * powered the sensor's core clock domain will not run (measured: capture
+ * returns 0 frames with the radio up, a full 614400-byte frame with it in
+ * reset). Capture and radio are never genuinely concurrent — the frame is
+ * buffered in RAM and uploaded afterwards — so the radio yields for the
+ * capture window. Always pair with WiFi_ResumeAfterCapture().
+ */
+void WiFi_QuiesceForCapture(void);
+
+/**
+ * @brief  Release the radio after a capture and re-initialise the module.
+ * @retval WIFI_OK on successful re-init.
+ */
+WiFiStatus_t WiFi_ResumeAfterCapture(void);
+
+/**
  * @brief  Set the 802.11 station power-save state the ACTIVE power mode
  *         wants (0 = off, 1 = on).
  *

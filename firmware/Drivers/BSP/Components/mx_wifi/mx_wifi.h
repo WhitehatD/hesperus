@@ -1001,19 +1001,6 @@ int32_t MX_WIFI_Socket_recv(MX_WIFIObject_t *Obj, int32_t SockFd, uint8_t *Buf,
                             int32_t Len, int32_t flags);
 
 /**
-  * @brief  Socket recv with custom MIPC transport timeout (enterprise patch).
-  * @param  Obj: pointer to module handle
-  * @param  SockFd: socket fd
-  * @param  Buf: recv buffer
-  * @param  Len: length of recv buffer
-  * @param  flags: zero for MXOS
-  * @param  timeout_ms: MIPC transport timeout in milliseconds
-  * @retval Number of bytes received, return < 0 if failed
-  */
-int32_t MX_WIFI_Socket_recv_timeout(MX_WIFIObject_t *Obj, int32_t SockFd, uint8_t *Buf,
-                                     int32_t Len, int32_t flags, uint32_t timeout_ms);
-
-/**
   * @brief  Socket sendto.
   * @param  Obj: pointer to module handle
   * @param  SockFd: socket fd
