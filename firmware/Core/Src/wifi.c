@@ -1059,6 +1059,12 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                 uint32_t resp_wait_start = HAL_GetTick();
                 while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
                 {
+                    /* The board must stay alive while it waits: keep the
+                     * status LEDs animating and keep servicing MQTT so a
+                     * capture/OTA/portal command issued mid-upload is acted
+                     * on instead of silently queued until the transfer ends. */
+                    BoardStatus_Tick();
+                    MQTT_ProcessLoop();
                     MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
                     resp_len = MX_WIFI_Socket_recv(
                         wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
@@ -1265,6 +1271,12 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                 uint32_t resp_wait_start = HAL_GetTick();
                 while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
                 {
+                    /* The board must stay alive while it waits: keep the
+                     * status LEDs animating and keep servicing MQTT so a
+                     * capture/OTA/portal command issued mid-upload is acted
+                     * on instead of silently queued until the transfer ends. */
+                    BoardStatus_Tick();
+                    MQTT_ProcessLoop();
                     MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
                     resp_len = MX_WIFI_Socket_recv(
                         wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
@@ -1554,16 +1566,24 @@ int32_t WiFi_TcpConnect(const char *host, uint16_t port)
      * doesn't block the MIPC layer up to 30s (MX_WIFI_CMD_TIMEOUT) and trip the 16s watchdog!
      * NOTE: MX_WIFI_Socket_setsockopt explicitly expects a 4-byte int32_t representing ms.
      * Passing an 8-byte POSIX timeval struct corrupts the AT firmware's timeout state. */
-    /* 1500ms, lowered from 4000 on 2026-08-21. This bounds a SINGLE recv when
-     * no data has arrived yet; callers poll in a loop against their own
-     * overall budget (HTTP_RESPONSE_TIMEOUT_MS), so a shorter value does not
-     * shorten how long we're willing to wait overall — it only decides how
-     * quickly we notice that nothing came. At 4000 a 5s budget bought exactly
-     * one attempt; at 1500 it buys three, so a dead socket is detected and
-     * replaced ~2.7x sooner. recv still returns immediately whenever data IS
-     * available, so healthy transfers are completely unaffected. Shorter is
-     * also strictly safer for the 16s IWDG than the old 4s. */
-    int32_t mx_timeout = 1500;
+    /* MX_WIFI_Socket_recv() is a round-trip to the module
+     * (MIPC_API_SOCKET_RECV_CMD): when no data is buffered yet, the MODULE
+     * blocks for this SO_RCVTIMEO before answering. It is a polling
+     * granularity, not a deadline — callers loop against their own budget
+     * (HTTP_RESPONSE_TIMEOUT_MS), so every miss costs one whole timeout.
+     *
+     * Measured: at 1500 an upload paid ~1.45s PER CHUNK (server access log,
+     * task 22: 4KB chunks landing 1.47/1.53/1.38/1.47s apart) — a metronome,
+     * not congestion, because a response that arrives 20ms after the call
+     * still waits out the full window. 23572 bytes took 24s, ~8.7s of it
+     * pure blocked waiting. It also froze the LEDs and starved command
+     * handling, since the core sits inside that call doing nothing.
+     *
+     * 100ms polls finely instead: a miss costs 100ms, and a response that
+     * lands mid-window is picked up on the next iteration. Total patience is
+     * unchanged (the caller's budget decides that); only the resolution
+     * improves. */
+    int32_t mx_timeout = 100;
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_RCVTIMEO, &mx_timeout, sizeof(mx_timeout));
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_SNDTIMEO, &mx_timeout, sizeof(mx_timeout));
 
