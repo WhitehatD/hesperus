@@ -38,6 +38,7 @@
 static int32_t  s_socket       = -1;
 static uint8_t  s_connected    = 0;
 static uint16_t s_packet_id    = 1;
+static uint32_t s_last_ping_tick = 0;  /* rate-limits MQTT_SendPing, see there */
 
 /* Callback registered by application for incoming schedules */
 static MQTTScheduleCallback_t s_schedule_callback = NULL;
@@ -466,6 +467,27 @@ void MQTT_ProcessLoop(void)
 void MQTT_SendPing(void)
 {
     if (!s_connected) return;
+
+    /* 2026-08-23: RATE LIMIT. This used to fire on every call, and
+     * WiFi_HttpPostImage calls it after EVERY chunk plus every retry. With
+     * 1024-byte chunks a 10KB image meant 11+ pings in a couple of seconds
+     * (observed live: 12 x "PINGREQ sent" inside ~2s with no PINGRESP in
+     * between). Two costs, both real:
+     *   - every ping is a full MIPC round trip on the module's SINGLE
+     *     command channel, competing with the upload it is supposed to be
+     *     protecting, so it actively slowed the transfer it rode along with;
+     *   - it buried the actual upload story in the log.
+     * The broker keepalive is MQTT_KEEPALIVE_SECONDS (60s); pinging more
+     * often than roughly half that buys nothing. Callers can keep saying
+     * "keep the link alive" as often as they like - this is now idempotent
+     * and only puts a packet on the wire when one is actually due. */
+    const uint32_t now = HAL_GetTick();
+    const uint32_t min_gap_ms = (MQTT_KEEPALIVE_SECONDS * 1000u) / 2u;
+
+    if (s_last_ping_tick != 0u && (now - s_last_ping_tick) < min_gap_ms)
+        return;
+
+    s_last_ping_tick = now;
 
     int pkt_len = _build_pingreq_packet(s_tx_buf);
     _tcp_send(s_tx_buf, pkt_len);

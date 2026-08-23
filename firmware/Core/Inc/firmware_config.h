@@ -145,8 +145,44 @@
  * nearly free; a spurious resend is not. Note the retry path now probes
  * /api/upload/resume before re-sending (see wifi.c), so even when this
  * budget is exceeded the board skips chunks the server already holds
- * instead of duplicating them. */
-#define HTTP_RESPONSE_TIMEOUT_MS   15000
+ * instead of duplicating them.
+ *
+ * 2026-08-23: 15000 IS STILL NOT ENOUGH — this is the THIRD time this
+ * constant has been raised chasing the same shape of bug (5000 -> 12000 ->
+ * 15000 -> this). Task 8, board vs server access log, timestamps compared:
+ *   board "No response to chunk at offset 0"   19:47:18.0
+ *   server received that SAME chunk, 200 OK    19:47:19.269   <- 1s LATER
+ *   offsets 4096/8192 then land fast on the SAME socket: 19:47:20.8 / :21.1
+ *   offset 12288: board gave up 19:47:38, server got it 19:47:53 (15s later)
+ * The server answered 200 to every attempt the board logged as failed —
+ * nothing was ever lost. The eventual full failure (task 8, offset 12288,
+ * 9 attempts, backoff growing to 8000ms, abandoned after ~143s) is a
+ * congestion-collapse spiral we cause ourselves: each timeout re-sends 4KB
+ * onto the exact link that's already behind, which only makes the queue the
+ * NEXT attempt has to clear longer.
+ *
+ * 2026-08-23, LATER SAME NIGHT — 45000 WAS THE WRONG DIRECTION. Server-side
+ * tcpdump (filtered to the board's IP, live during a stalled upload) shows
+ * the real mechanism: the board's outbound segments (~1356B, near the
+ * negotiated 1410 MSS) get lost, and the gaps measured on the wire before
+ * the board's own resends are 2.3s / 4.000s x3 / ~8s / 16.7s — exactly
+ * RFC 6298's DEFAULT initial RTO (1s) doubling on loss: 1,2,4,8,16 — even
+ * though the TCP handshake measured real RTT at 50ms. That backoff runs
+ * INSIDE the EMW3080's own onboard TCP stack; nothing in this codebase can
+ * see it or speed it up. So every previous raise of this constant
+ * (5000->12000->15000->45000) was "wait longer", which only lets the module
+ * sit deeper in a backoff we don't control — the opposite of helpful.
+ *
+ * The one thing this code DOES control is when it gives up and forces a
+ * FRESH connection — the chunk loop already closes the socket and
+ * reconnects on any failure. A fresh SYN cost ~50ms on this link, measured
+ * directly in the same capture, and starts the module's RTO state over from
+ * its unbacked-off beginning. Waiting past ~1-2 RTOs before abandoning only
+ * buys more time inside a ladder we can't influence. 5000 gives real margin
+ * over the 50ms RTT and normal jitter while abandoning before the module's
+ * own backoff compounds past its first couple of steps.
+ * UPLOAD_TOTAL_DEADLINE_MS still bounds the whole operation. */
+#define HTTP_RESPONSE_TIMEOUT_MS   5000
 
 /* SEC-05: image-upload auth token, same pattern as SEC-01 (WiFi creds) —
  * inject at build time, never commit a real value. Empty = unauthenticated

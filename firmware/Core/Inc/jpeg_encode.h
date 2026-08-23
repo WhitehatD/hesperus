@@ -32,7 +32,13 @@
 
 /* IJG-style quality (1..100). 87 ≈ visually lossless for VLM analysis while
  * keeping a VGA frame in the 40-60 KB range. */
-#define JPEG_ENCODE_QUALITY   87
+/* 2026-08-23: 87 -> 62. Total bytes is the other half of the upload-speed
+ * problem: at q87 a capture is 26-41KB = 15-20 chunks, and on this link
+ * most chunks stall at least once. Fewer bytes = fewer chunks = fewer
+ * chances to hit the loss. q62 is still comfortably good enough for VLM
+ * scene analysis. Does NOT affect any thesis benchmark: those score the
+ * pre-curated MIT Indoor Scenes corpus, never board captures. */
+#define JPEG_ENCODE_QUALITY   62
 
 /**
  * @brief  Encode an RGB565 frame as a baseline 4:2:0 JPEG.

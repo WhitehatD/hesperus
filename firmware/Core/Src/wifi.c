@@ -108,8 +108,37 @@ static char s_http_header[HTTP_HEADER_MAX];
  * are consistent instead of silently disagreeing by 8x.
  *
  * Do NOT raise this above ~6KB without re-measuring the module's send buffer
- * on real hardware. Bigger chunks are not faster here — they stall. */
-#define UPLOAD_CHUNK_WIRE_SIZE       4096u
+ * on real hardware. Bigger chunks are not faster here — they stall.
+ *
+ * 2026-08-23: dropped 4096 -> 2048 to keep every chunk inside ONE MIPC frame.
+ * MX_WIFI_IPC_PAYLOAD_SIZE is 2500 and MX_WIFI_Socket_send truncates each
+ * call to payload-12 = 2482 bytes (mx_wifi.c:1465-1484), so a 4096-byte chunk
+ * is ALWAYS split into two sequential send round-trips. The control case is
+ * in this very repo: OTA download uses OTA_DOWNLOAD_CHUNK_SIZE=2048 with the
+ * comment "fits in single MIPC frame (2494 payload max)" and moved 149520
+ * bytes reliably over the same phone hotspot on the same evening that image
+ * upload could not complete 30KB. Measured failure signature that motivated
+ * this: the server's access log proves it received the chunk and answered
+ * 200, while the board's recv on that socket never saw the response — at
+ * 15s AND at 45s budgets, on fresh sockets as well as reused ones, so it is
+ * neither a timeout nor a stale-socket problem. The one structural
+ * difference between the path that works and the path that doesn't is
+ * single- vs multi-frame sends. 2048 also matches HTTP_UPLOAD_CHUNK_SIZE
+ * below, so the wire chunk and the send clamp agree (they must — a mismatch
+ * silently re-fragments and was itself a source of confusion). */
+/* 2026-08-23 (late): 2048 -> 1024. At 2048 the DATA portion of one chunk
+ * exceeds a single TCP segment at the negotiated 1410 MSS, so the module
+ * emits it as TWO segments (measured on the wire: 1356 + ~700). This link
+ * drops segments often enough that needing two per chunk roughly DOUBLES
+ * the per-chunk failure probability - 1-(1-p)^2 instead of p - and the
+ * task-17 log shows the result: retries on offsets 0, 2048, 4096, 24576
+ * and 28672, i.e. most chunks stalling at least once, 75.7s for 31KB at
+ * 0.4 KB/s. 1024 keeps the body inside ONE segment (the header is a
+ * separate _socket_send_all call, so it does not add to this).
+ * NOTE: earlier tonight HTTP_UPLOAD_CHUNK_SIZE was set to 1024 and proved
+ * useless - that is only the per-send() clamp; THIS constant is what sets
+ * the real chunk/offset size. They are different knobs. */
+#define UPLOAD_CHUNK_WIRE_SIZE       1024u
 #define UPLOAD_CHUNK_MAX_RETRIES     8
 #define UPLOAD_CHUNK_RETRY_BASE_MS   500
 #define UPLOAD_CHUNK_RETRY_MAX_MS    8000
@@ -979,6 +1008,11 @@ static bool _query_server_offset(uint32_t task_id, uint32_t *offset_out)
         uint32_t rwait = HAL_GetTick();
         while ((HAL_GetTick() - rwait) < HTTP_RESPONSE_TIMEOUT_MS)
         {
+            /* 2026-08-23: tried 0x08 (MSG_DONTWAIT) here — no effect on the
+             * real bug. Reverted to blocking (0), matching ota_update.c's
+             * proven-working pattern (SO_RCVTIMEO=1000 in WiFi_TcpConnect).
+             * The actual fault is upstream of this recv call entirely — see
+             * UPLOAD_CHUNK_WIRE_SIZE's comment. */
             MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
             rlen = MX_WIFI_Socket_recv(wifi_obj_get(), rsock, rbuf, sizeof(rbuf) - 1, 0);
             if (rlen > 0)
@@ -1092,6 +1126,7 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
 
         uint32_t remaining = data_len - offset;
         uint32_t chunk_len = (remaining < UPLOAD_CHUNK_WIRE_SIZE) ? remaining : UPLOAD_CHUNK_WIRE_SIZE;
+        const uint32_t chunk_start_tick = HAL_GetTick();
 
         int header_len = snprintf(s_http_header, HTTP_HEADER_MAX,
             "POST %s/chunk?task_id=%lu&offset=%lu&total_size=%lu HTTP/1.1\r\n"
@@ -1159,6 +1194,15 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                 uint32_t resp_wait_start = HAL_GetTick();
                 while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
                 {
+                    /* 2026-08-23: tried MSG_DONTWAIT here — no effect. This
+                     * recv genuinely never sees a response after a >1-MIPC-
+                     * frame send, blocking or not, 15s budget or 45s budget,
+                     * fresh socket or reused. See UPLOAD_CHUNK_WIRE_SIZE. */
+                    resp_len = MX_WIFI_Socket_recv(
+                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                    if (resp_len > 0)
+                        break;
+
                     /* The board must stay alive while it waits: keep the
                      * status LEDs animating and keep servicing MQTT so a
                      * capture/OTA/portal command issued mid-upload is acted
@@ -1166,10 +1210,6 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                     BoardStatus_Tick();
                     MQTT_ProcessLoop();
                     MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
-                    resp_len = MX_WIFI_Socket_recv(
-                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
-                    if (resp_len > 0)
-                        break;
                 }
 
                 if (resp_len > 0)
@@ -1264,6 +1304,17 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             backoff_ms = UPLOAD_CHUNK_RETRY_BASE_MS;
             BSP_LED_Toggle(LED_GREEN);
 
+            /* 2026-08-23: chunk success was previously SILENT, so the log
+             * showed only failures and MQTT keepalive noise - impossible to
+             * tell a healthy upload from a stalling one, or to see where the
+             * time actually went. One line per chunk with the elapsed ms for
+             * THAT chunk makes a slow link self-evident (compare 2071ms
+             * total for 11 chunks against 22737ms for the same byte count). */
+            LOG_INFO(TAG_HTTP, "chunk %lu/%lu ok (+%lums, %lums total)",
+                     (unsigned long)offset, (unsigned long)data_len,
+                     (unsigned long)(HAL_GetTick() - chunk_start_tick),
+                     (unsigned long)(HAL_GetTick() - upload_start_tick));
+
             /* Keep MQTT alive during a long upload — same reasoning as
              * before: ProcessLoop's 1s recv timeout would stall chunk
              * sends, so ping only, don't run the full loop here. */
@@ -1317,13 +1368,17 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
         }
     }
 
-    /* Chunks are done — release the keep-alive socket before finalizing so
-     * the module reclaims it while /complete uses its own short-lived one. */
-    if (sock >= 0)
-    {
-        MX_WIFI_Socket_close(wifi_obj_get(), sock);
-        sock = -1;
-    }
+    /* 2026-08-23: deliberately NOT closing the keep-alive socket here.
+     * It just carried every chunk flawlessly (measured: 14 chunks at
+     * 149-181ms each). Closing it forced /complete to build a fresh socket,
+     * and fresh socket creation is the least reliable operation on this
+     * module: when it hangs it costs 2 x MX_WIFI_CMD_TIMEOUT, because
+     * MX_WIFI_Socket_create (0x0202) and MX_WIFI_Socket_connect (0x0208)
+     * each stall the full 10s. Measured on task 21: every chunk done at
+     * 218.5s, Connect-failed-for-/complete at 238.5s - 20s burned inside
+     * one connect, turning a 2.5s upload into 26.1s. That same 0x0202/0x0208
+     * pair also breaks boot time-sync and the OTA version check. Reuse the
+     * socket that is already proven good. */
 
     /* ── Phase 2: every chunk confirmed by the server — finalize with a
      *            whole-payload CRC32 so it can catch a chunk landing at
@@ -1353,13 +1408,16 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             "Host: %s:%d\r\n"
             "X-Upload-Token: %s\r\n"
             "Content-Length: 0\r\n"
-            "Connection: close\r\n"
+            "Connection: keep-alive\r\n"
             "\r\n",
             SERVER_UPLOAD_PATH, (unsigned long)resolved_task_id, (unsigned long)data_len,
             (unsigned long)crc, SERVER_HOST, SERVER_PORT, FIRMWARE_UPLOAD_TOKEN);
 
         bool done_ok = false;
-        int32_t sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
+        /* Reuse the chunk loop's socket while it is still up; only pay
+         * for a connect when we genuinely have none. */
+        if (sock < 0)
+            sock = WiFi_TcpConnect(SERVER_HOST, SERVER_PORT);
         if (sock >= 0)
         {
             if (_socket_send_all(sock, (uint8_t *)s_http_header, header_len) == 0)
@@ -1371,6 +1429,12 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                 uint32_t resp_wait_start = HAL_GetTick();
                 while ((HAL_GetTick() - resp_wait_start) < HTTP_RESPONSE_TIMEOUT_MS)
                 {
+                    /* Same MSG_DONTWAIT-made-no-difference note as above. */
+                    resp_len = MX_WIFI_Socket_recv(
+                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
+                    if (resp_len > 0)
+                        break;
+
                     /* The board must stay alive while it waits: keep the
                      * status LEDs animating and keep servicing MQTT so a
                      * capture/OTA/portal command issued mid-upload is acted
@@ -1378,10 +1442,6 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
                     BoardStatus_Tick();
                     MQTT_ProcessLoop();
                     MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
-                    resp_len = MX_WIFI_Socket_recv(
-                        wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
-                    if (resp_len > 0)
-                        break;
                 }
                 if (resp_len > 0)
                 {
@@ -1406,7 +1466,13 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
             {
                 LOG_WARN(TAG_HTTP, "Failed to send /complete request");
             }
-            MX_WIFI_Socket_close(wifi_obj_get(), sock);
+            /* Keep a socket that just worked; drop one that did not so
+             * the next iteration rebuilds it. Same rule as the chunks. */
+            if (!done_ok)
+            {
+                MX_WIFI_Socket_close(wifi_obj_get(), sock);
+                sock = -1;
+            }
         }
         else
         {
@@ -1531,7 +1597,6 @@ WiFiStatus_t WiFi_HttpGetTime(uint8_t *hour, uint8_t *minute, uint8_t *second,
 
     while ((HAL_GetTick() - start_tick) < HTTP_RESPONSE_TIMEOUT_MS)
     {
-        MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
         resp_len = MX_WIFI_Socket_recv(
             wifi_obj_get(), sock, resp_buf, sizeof(resp_buf) - 1, 0);
 
@@ -1539,6 +1604,7 @@ WiFiStatus_t WiFi_HttpGetTime(uint8_t *hour, uint8_t *minute, uint8_t *second,
         {
             break;
         }
+        MX_WIFI_IO_YIELD(wifi_obj_get(), 50);
     }
 
     MX_WIFI_Socket_close(wifi_obj_get(), sock);
@@ -1682,8 +1748,21 @@ int32_t WiFi_TcpConnect(const char *host, uint16_t port)
      * 100ms polls finely instead: a miss costs 100ms, and a response that
      * lands mid-window is picked up on the next iteration. Total patience is
      * unchanged (the caller's budget decides that); only the resolution
-     * improves. */
-    int32_t mx_timeout = 100;
+     * improves.
+     *
+     * 2026-08-23: WRONG — this repo's own OTA code already knew better.
+     * ota_update.c's _ota_socket_open() uses 1000ms and documents why:
+     * "the EMW3080 AT firmware ignores sub-500ms SO_RCVTIMEO values and
+     * falls back to MX_WIFI_CMD_TIMEOUT (10s)". 100 is below that floor, so
+     * every recv that actually needs to wait (not already-buffered) silently
+     * blocks for 10s instead of 100ms. On a healthy link responses are
+     * usually already buffered when polled, so this never showed up (task
+     * 25's 250ms/chunk measurement). On a degraded link (log: 5 chunks
+     * averaging 7.4s each, then two consecutive ~15s HTTP_RESPONSE_TIMEOUT_MS
+     * stalls on one chunk) it's the dominant cost. Match OTA's proven value.
+     * This fix is real but was NOT the whole bug — see UPLOAD_CHUNK_WIRE_SIZE
+     * for the actual root cause found afterward (multi-MIPC-frame sends). */
+    int32_t mx_timeout = 1000;
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_RCVTIMEO, &mx_timeout, sizeof(mx_timeout));
     MX_WIFI_Socket_setsockopt(wifi_obj_get(), sock, MX_SOL_SOCKET, MX_SO_SNDTIMEO, &mx_timeout, sizeof(mx_timeout));
 

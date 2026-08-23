@@ -91,7 +91,7 @@ typedef struct _spi_header
     HAL_GPIO_WritePin(MX_WIFI_RESET_PORT, MX_WIFI_RESET_PIN, GPIO_PIN_RESET); \
     HAL_Delay(100);                                                           \
     HAL_GPIO_WritePin(MX_WIFI_RESET_PORT, MX_WIFI_RESET_PIN, GPIO_PIN_SET);   \
-    HAL_Delay(3000);                                                          \
+    HAL_Delay(1200);                                                          \
     DEBUG_LOG("\n[%" PRIu32 "] MX_WIFI_HW_RESET\n\n", HAL_GetTick());         \
   } while(0)
 
@@ -118,7 +118,7 @@ typedef struct _spi_header
 extern SPI_HandleTypeDef MXCHIP_SPI;
 
 /* Private variables ---------------------------------------------------------*/
-static MX_WIFIObject_t MxWifiObj = {0};
+static MX_WIFIObject_t MxWifiObj;
 static SPI_HandleTypeDef *const HSpiMX = &MXCHIP_SPI;
 
 static LOCK_DECLARE(SpiTxLock);
@@ -148,13 +148,13 @@ static int8_t MX_WIFI_SPI_Init(uint16_t mode);
 static int8_t MX_WIFI_SPI_DeInit(void);
 
 
-#ifndef MX_WIFI_BARE_OS_H
+#ifndef MX_WIFI_BARE_OS
 static THREAD_DECLARE(MX_WIFI_TxRxThreadId);
 
 static __IO bool SPITxRxTaskQuitFlag = false;
 
 static void mx_wifi_spi_txrx_task(THREAD_CONTEXT_TYPE argument);
-#endif /* MX_WIFI_BARE_OS_H */
+#endif /* MX_WIFI_BARE_OS */
 
 
 static void MX_WIFI_IO_DELAY(uint32_t ms)
@@ -208,11 +208,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi == HSpiMX)
   {
-    /* ENTERPRISE FIX: Removed MX_ASSERT(false). 
-     * During heavy OTA chunk downloads, SPI Overruns (OVR) naturally occur due to SysTick delays.
-     * Asserting here translates to a fatal while(1) loop, causing the 16s IWDG watchdog reset.
-     * By doing nothing, the HAL driver natively aborts the transfer, returns HAL_ERROR, 
-     * and allows the upper MIPC layer to gracefully timeout and retry the TCP chunk. */
+    MX_ASSERT(false);
   }
 }
 
@@ -304,36 +300,7 @@ static HAL_StatusTypeDef TransmitReceive(SPI_HandleTypeDef *hspi, uint8_t *txdat
 {
   HAL_StatusTypeDef ret;
 
-  DEBUG_LOG(("\n%s()> %"PRIu32"\n"), __FUNCTION__, (uint32_t)datalen);
-
-  /* ENTERPRISE FIX: Ensure SPI is ready before starting, aborting previous stuck transfers. */
-  if (hspi->State != HAL_SPI_STATE_READY)
-  {
-      HAL_SPI_Abort(hspi);
-      hspi->State = HAL_SPI_STATE_READY;
-  }
-
-  /* ENTERPRISE FIX: If datalen is 0, return HAL_OK immediately.
-   * This prevents misleading HAL_ERRORs for zero-length transfers. */
-  if (datalen == 0)
-  {
-      return HAL_OK;
-  }
-
-  /* ENTERPRISE FIX: Clear SPI error flags proactively before polling.
-   * Extremely high TCP payloads without DMA drop the CPU into SysTick/Watchdog
-   * yield loops, guaranteeing natural SPI Overruns (OVR). If these flags are
-   * left set, the next HAL_SPI_TransmitReceive will immediately abort with
-   * HAL_ERROR, permanently stalling the MIPC protocol (0x0205 timeout). */
-#if defined(__HAL_SPI_CLEAR_OVRFLAG)
-  __HAL_SPI_CLEAR_OVRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_UDRFLAG)
-  __HAL_SPI_CLEAR_UDRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_MODFFLAG)
-  __HAL_SPI_CLEAR_MODFFLAG(hspi);
-#endif
+  DEBUG_LOG("\n%s()> %" PRIu32 "\n", __FUNCTION__, (uint32_t)datalen);
 
 #if 0
   for (uint32_t i = 0; i < datalen; i++)
@@ -351,12 +318,6 @@ static HAL_StatusTypeDef TransmitReceive(SPI_HandleTypeDef *hspi, uint8_t *txdat
 #endif /* (DMA_ON_USE == 1) */
 
   DEBUG_LOG("\n%s()< %" PRIi32 "\n\n", __FUNCTION__, (int32_t)ret);
-  
-  /* Fallback: Force state to READY if an abort left it BUSY */
-  if (ret != HAL_OK && hspi->State != HAL_SPI_STATE_READY)
-  {
-      hspi->State = HAL_SPI_STATE_READY;
-  }
 
   return ret;
 }
@@ -366,32 +327,7 @@ static HAL_StatusTypeDef Transmit(SPI_HandleTypeDef *hspi, uint8_t *txdata, uint
 {
   HAL_StatusTypeDef ret;
 
-  /* ENTERPRISE FIX: Ensure SPI is ready before starting, aborting previous stuck transfers. */
-  if (hspi->State != HAL_SPI_STATE_READY)
-  {
-      HAL_SPI_Abort(hspi);
-      hspi->State = HAL_SPI_STATE_READY;
-  }
-
-  /* ENTERPRISE FIX: If datalen is 0, return HAL_OK immediately.
-   * This prevents misleading HAL_ERRORs for zero-length transfers. */
-  if (datalen == 0)
-  {
-      return HAL_OK;
-  }
-
   DEBUG_LOG("\n%s()> %" PRIu32 "\n", __FUNCTION__, (uint32_t)datalen);
-
-  /* Proactively clear SPI flags to prevent polling aborts */
-#if defined(__HAL_SPI_CLEAR_OVRFLAG)
-  __HAL_SPI_CLEAR_OVRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_UDRFLAG)
-  __HAL_SPI_CLEAR_UDRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_MODFFLAG)
-  __HAL_SPI_CLEAR_MODFFLAG(hspi);
-#endif
 
 #if 0
   for (uint32_t i = 0; i < datalen; i++)
@@ -411,12 +347,6 @@ static HAL_StatusTypeDef Transmit(SPI_HandleTypeDef *hspi, uint8_t *txdata, uint
 
   DEBUG_LOG("\n%s() <%" PRIi32 "\n\n", __FUNCTION__, (int32_t)ret);
 
-  /* Fallback: Force state to READY if an abort left it BUSY */
-  if (ret != HAL_OK && hspi->State != HAL_SPI_STATE_READY)
-  {
-      hspi->State = HAL_SPI_STATE_READY;
-  }
-
   return ret;
 }
 
@@ -425,43 +355,14 @@ static HAL_StatusTypeDef Receive(SPI_HandleTypeDef *hspi, uint8_t *rxdata, uint1
 {
   HAL_StatusTypeDef ret;
 
-  /* ENTERPRISE FIX: Ensure SPI is ready before starting, aborting previous stuck transfers. */
-  if (hspi->State != HAL_SPI_STATE_READY)
-  {
-      HAL_SPI_Abort(hspi);
-      hspi->State = HAL_SPI_STATE_READY;
-  }
-
-  /* ENTERPRISE FIX: If datalen is 0, return HAL_OK immediately.
-   * This prevents misleading HAL_ERRORs for zero-length transfers. */
-  if (datalen == 0)
-  {
-      return HAL_OK;
-  }
-
   DEBUG_LOG("\n%s()> %" PRIu32 "\n", __FUNCTION__, (uint32_t)datalen);
 
-  /* Proactively clear SPI flags to prevent polling aborts */
-#if defined(__HAL_SPI_CLEAR_OVRFLAG)
-  __HAL_SPI_CLEAR_OVRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_UDRFLAG)
-  __HAL_SPI_CLEAR_UDRFLAG(hspi);
-#endif
-#if defined(__HAL_SPI_CLEAR_MODFFLAG)
-  __HAL_SPI_CLEAR_MODFFLAG(hspi);
-#endif
-
 #if (defined(DMA_ON_USE) && (DMA_ON_USE == 1))
-  /* ENTERPRISE FIX: STM32U5 HAL_SPI_Receive suspends clock generation when TX FIFO is empty
-   * during full-duplex mode. Use TransmitReceive mapped over the rxdata buffer as a dummy
-   * TX payload to guarantee continuous SCK generation. */
-  ret = HAL_SPI_TransmitReceive_DMA(hspi, rxdata, rxdata, datalen);
+  ret = HAL_SPI_Receive_DMA(hspi, rxdata, datalen);
   SEM_WAIT(SpiTransferDoneSem, timeout, NULL);
 
 #else
-  /* ENTERPRISE FIX: Same for blocking mode. Supply rxdata as dummy txdata. */
-  ret = HAL_SPI_TransmitReceive(hspi, rxdata, rxdata, datalen, timeout);
+  ret = HAL_SPI_Receive(hspi, rxdata, datalen, timeout);
 #endif /* (DMA_ON_USE == 1) */
 
 #if 0
@@ -472,12 +373,6 @@ static HAL_StatusTypeDef Receive(SPI_HandleTypeDef *hspi, uint8_t *rxdata, uint1
 #endif /* 0 */
 
   DEBUG_LOG("\n%s()< %" PRIi32 "\n\n", __FUNCTION__, (int32_t)ret);
-
-  /* Fallback: Force state to READY if an abort left it BUSY */
-  if (ret != HAL_OK && hspi->State != HAL_SPI_STATE_READY)
-  {
-      hspi->State = HAL_SPI_STATE_READY;
-  }
 
   return ret;
 }
@@ -514,8 +409,8 @@ void process_txrx_poll(uint32_t timeout)
 
     LOCK(SpiTxLock);
     {
-      spi_header_t mheader = {0};
-      spi_header_t sheader = {0};
+      spi_header_t mheader = {0,0,0,{0}};
+      spi_header_t sheader = {0,0,0,{0}};
       uint8_t *txdata = NULL;
       bool is_continue = true;
 
@@ -530,13 +425,13 @@ void process_txrx_poll(uint32_t timeout)
 
           /* There nothing to do with the SPI. */
           /* Free allocated buffer, due to end of life being requested for the hosting thread. */
-#ifndef MX_WIFI_BARE_OS_H
+#ifndef MX_WIFI_BARE_OS
           if (SPITxRxTaskQuitFlag == true)
           {
             MX_NET_BUFFER_FREE(netb);
             netb = NULL;
           }
-#endif /* MX_WIFI_BARE_OS_H */
+#endif /* MX_WIFI_BARE_OS */
         }
       }
       else
@@ -636,14 +531,7 @@ void process_txrx_poll(uint32_t timeout)
                         }
                         else
                         {
-                          if (datalen > 0)
-                          {
-                            ret = Receive(HSpiMX, rxdata, datalen, timeout);
-                          }
-                          else
-                          {
-                            ret = HAL_OK;
-                          }
+                          ret = Receive(HSpiMX, rxdata, datalen, timeout);
                         }
 
                         if (HAL_OK != ret)
@@ -682,7 +570,7 @@ void process_txrx_poll(uint32_t timeout)
 }
 
 
-#ifndef MX_WIFI_BARE_OS_H
+#ifndef MX_WIFI_BARE_OS
 static void mx_wifi_spi_txrx_task(THREAD_CONTEXT_TYPE argument)
 {
   (void)argument;
@@ -702,7 +590,7 @@ static void mx_wifi_spi_txrx_task(THREAD_CONTEXT_TYPE argument)
   /* Delete the Thread. */
   THREAD_DEINIT(MX_WIFI_TxRxThreadId);
 }
-#endif /* MX_WIFI_BARE_OS_H */
+#endif /* MX_WIFI_BARE_OS */
 
 
 static int8_t mx_wifi_spi_txrx_start(void)
@@ -733,21 +621,21 @@ static int8_t mx_wifi_spi_txrx_start(void)
 
 static int8_t mx_wifi_spi_txrx_stop(void)
 {
-#ifndef MX_WIFI_BARE_OS_H
+#ifndef MX_WIFI_BARE_OS
   /* Set thread quit flag to TRUE. */
   SPITxRxTaskQuitFlag = true;
-#endif /* MX_WIFI_BARE_OS_H */
+#endif /* MX_WIFI_BARE_OS */
 
   /* Wake up the thread if it's sleeping. */
   SEM_SIGNAL(SpiTxRxSem);
 
-#ifndef MX_WIFI_BARE_OS_H
+#ifndef MX_WIFI_BARE_OS
   /* Wait for the thread to terminate. */
   while (SPITxRxTaskQuitFlag == true)
   {
     DELAY_MS(500);
   }
-#endif /* MX_WIFI_BARE_OS_H */
+#endif /* MX_WIFI_BARE_OS */
 
   /* Delete the Thread (depends on implementation). */
   THREAD_DEINIT(MX_WIFI_TxRxThreadId);

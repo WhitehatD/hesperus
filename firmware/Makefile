@@ -110,11 +110,33 @@ FIRMWARE_UPLOAD_TOKEN ?=
 
 # Upload chunk size — numeric, not a secret, so a real default (not empty
 # string) is required here; unlike the credentials above, an empty -D would
-# produce invalid C (`#define HTTP_UPLOAD_CHUNK_SIZE`, no value). 4096 is
-# resilient on high-latency links (cellular hotspot); the old 16384 was
-# tuned for low-latency home WiFi only — see firmware_config.h comment.
+# produce invalid C (`#define HTTP_UPLOAD_CHUNK_SIZE`, no value).
+#
+# This is the PER-SEND clamp inside _socket_send_all — NOT the HTTP chunk
+# size (that's UPLOAD_CHUNK_WIRE_SIZE, hardcoded in wifi.c). Overriding only
+# this variable without also changing that constant tests nothing real.
+#
+# 2026-08-23: 4096 -> 2048 (single MIPC frame) -> 1024, this last step from
+# tcpdump evidence, not a chunk-count theory. Packet capture on the server
+# (filtered to the board's IP) during a live upload showed the board's
+# OUTBOUND 1356-byte data segments (it advertises mss 1410) being lost, with
+# 6 retransmissions in a 235-packet capture and inter-packet gaps of 2.3s /
+# 4.000s x3 / 10.9s / 16.7s before the board's own resends — textbook TCP
+# exponential RTO backoff (1-2-4-8-16). Meanwhile RTT measured ~50ms and
+# 2-byte MQTT pings never missed. The loss is SIZE-SELECTIVE: on a phone
+# hotspot, carrier-side encapsulation commonly leaves less usable MTU than
+# the advertised 1410, so near-MSS segments get silently dropped.
+#
+# HISTORY, so nobody repeats the mistake: setting ONLY this to 1024 (while
+# UPLOAD_CHUNK_WIRE_SIZE stayed 2048) did NOT shrink the wire segments — a
+# tcpdump still showed 1356B. That was not Nagle beating us, it was simply
+# that the HTTP chunk was still 2048 bytes, so the module still had 2048 to
+# push per request regardless of how many send() calls we split it across.
+# This variable is ONLY the per-send() clamp; UPLOAD_CHUNK_WIRE_SIZE in
+# wifi.c is what actually sets the chunk/offset size. Both are now 1024 so
+# one chunk = one TCP segment at the 1410 MSS. Keep them equal.
 # make HTTP_UPLOAD_CHUNK_SIZE=16384 to restore the old benchmark config.
-HTTP_UPLOAD_CHUNK_SIZE ?= 4096
+HTTP_UPLOAD_CHUNK_SIZE ?= 1024
 
 C_DEFS = \
 -DSTM32U585xx \

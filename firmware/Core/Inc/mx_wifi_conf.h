@@ -24,8 +24,19 @@ extern "C" {
 /* ─── Transport: SPI (not UART) ──────────────────────── */
 #define MX_WIFI_USE_SPI                             (1)
 
-/* SPI DMA. Channels are set up in mx_wifi_hw.c (_spi2_dma_init). */
-#define DMA_ON_USE                                  (1)
+/* 2026-08-23: back to 0 (polled SPI). DMA was enabled in 6ccb0ea, a commit
+ * that self-flagged "NOT YET VALIDATED ON HARDWARE", and this project ran
+ * polled SPI reliably for its entire life before it. Measured tonight with
+ * the STOCK driver + DMA=1: a 2-byte MQTT PINGREQ/PINGRESP costs a
+ * metronomic ~1s (it was ~150ms on the patched build) and a 2KB HTTP chunk
+ * costs ~20s — a fixed per-transfer tax, not radio latency. In bare metal
+ * (MX_WIFI_USE_CMSIS_OS=0) the DMA path blocks on SpiTransferDoneSem with no
+ * RTOS to schedule the wake, which is exactly what the removed
+ * "ENTERPRISE FIX" hspi->State forcing was papering over. Polled SPI has
+ * none of that machinery: 2KB at 40MHz SCK is microseconds of real work.
+ * Channels for the DMA path (unused while this is 0) are still set up in
+ * mx_wifi_hw.c (_spi2_dma_init). */
+#define DMA_ON_USE                                  (0)
 
 /* ─── No RTOS — bare-metal ────────────────────────────── */
 #define MX_WIFI_USE_CMSIS_OS                        (0)
