@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import ErrorBanner from "./components/ErrorBanner";
+import { useAsyncResource } from "./hooks/useAsyncResource";
 import { useBoardTracker } from "./hooks/useMQTT";
 
 const FLEET_TOPICS = ["device/+/status"];
@@ -24,8 +26,6 @@ function rssiLabel(rssi: number): { text: string; cls: string } {
 export default function DashboardPage() {
 	const { boards, connectionStatus } = useBoardTracker(FLEET_TOPICS);
 	const [now, setNow] = useState(Date.now());
-	const [totalImages, setTotalImages] = useState<Record<string, number>>({});
-	const [scheduleCount, setScheduleCount] = useState(0);
 
 	const apiBase = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -34,29 +34,35 @@ export default function DashboardPage() {
 		return () => clearInterval(timer);
 	}, []);
 
-	// Fetch real stats from server
-	useEffect(() => {
-		fetch(`${apiBase}/api/images`)
-			.then((r) => r.json())
-			.then((data) => {
-				const images = data.images || [];
-				const counts: Record<string, number> = {};
-				for (const img of images) {
-					const bid = img.board_id || "stm32";
-					counts[bid] = (counts[bid] || 0) + 1;
-				}
-				setTotalImages(counts);
-			})
-			.catch(() => {});
-
-		fetch(`${apiBase}/api/schedules`)
-			.then((r) => r.json())
-			.then((data) => {
-				const scheds = data.schedules ?? data ?? [];
-				setScheduleCount(Array.isArray(scheds) ? scheds.length : 0);
-			})
-			.catch(() => {});
+	// Real per-board capture counts, fetched from server history. This is the
+	// ONLY source of truth for the "Images" stat — there is no MQTT-derived
+	// fallback anymore (see useMQTT.ts's `captures`, which is session-only and
+	// starts at 0 on every page load; silently substituting it here for a
+	// failed/pending fetch used to render a plausible-looking wrong zero).
+	const fetchTotalImages = useCallback(async () => {
+		const res = await fetch(`${apiBase}/api/images`);
+		if (!res.ok) throw new Error(`Failed to load images (${res.status})`);
+		const data = await res.json();
+		const images = data.images || [];
+		const counts: Record<string, number> = {};
+		for (const img of images) {
+			const bid = img.board_id || "stm32";
+			counts[bid] = (counts[bid] || 0) + 1;
+		}
+		return counts;
 	}, [apiBase]);
+	const imagesStats = useAsyncResource(fetchTotalImages);
+	const totalImages = imagesStats.data ?? {};
+
+	const fetchScheduleCount = useCallback(async () => {
+		const res = await fetch(`${apiBase}/api/schedules`);
+		if (!res.ok) throw new Error(`Failed to load schedules (${res.status})`);
+		const data = await res.json();
+		const scheds = data.schedules ?? data ?? [];
+		return Array.isArray(scheds) ? scheds.length : 0;
+	}, [apiBase]);
+	const scheduleStats = useAsyncResource(fetchScheduleCount);
+	const scheduleCount = scheduleStats.data ?? 0;
 
 	const boardList = Object.values(boards);
 
@@ -90,10 +96,40 @@ export default function DashboardPage() {
 					<span className="fleet-chip">
 						{boardList.length} node{boardList.length !== 1 ? "s" : ""}
 					</span>
-					<span className="fleet-chip">
-						{Object.values(totalImages).reduce((a, b) => a + b, 0)} images
-					</span>
-					<span className="fleet-chip">{scheduleCount} schedules</span>
+					{imagesStats.error ? (
+						<button
+							type="button"
+							className="fleet-chip fleet-chip-error"
+							onClick={imagesStats.refetch}
+							title={`Failed to load image count: ${imagesStats.error}. Click to retry.`}
+						>
+							⚠ images
+						</button>
+					) : (
+						<span className="fleet-chip">
+							{imagesStats.loading && imagesStats.data === null
+								? "\u2026"
+								: Object.values(totalImages).reduce((a, b) => a + b, 0)}{" "}
+							images
+						</span>
+					)}
+					{scheduleStats.error ? (
+						<button
+							type="button"
+							className="fleet-chip fleet-chip-error"
+							onClick={scheduleStats.refetch}
+							title={`Failed to load schedule count: ${scheduleStats.error}. Click to retry.`}
+						>
+							⚠ schedules
+						</button>
+					) : (
+						<span className="fleet-chip">
+							{scheduleStats.loading && scheduleStats.data === null
+								? "\u2026"
+								: scheduleCount}{" "}
+							schedules
+						</span>
+					)}
 					<div className="connection-badge">
 						<div
 							className={`connection-dot ${connectionStatus === "connected" ? "connected" : "disconnected"}`}
@@ -104,6 +140,22 @@ export default function DashboardPage() {
 					</div>
 				</div>
 			</header>
+
+			{(imagesStats.error || scheduleStats.error) && (
+				<ErrorBanner
+					message={
+						imagesStats.error && scheduleStats.error
+							? "Couldn't load image or schedule counts from the server."
+							: imagesStats.error
+								? "Couldn't load image counts from the server."
+								: "Couldn't load schedule counts from the server."
+					}
+					onRetry={() => {
+						if (imagesStats.error) imagesStats.refetch();
+						if (scheduleStats.error) scheduleStats.refetch();
+					}}
+				/>
+			)}
 
 			<section>
 				<div className="boards-grid">
@@ -125,7 +177,6 @@ export default function DashboardPage() {
 						const seenAgo = board.lastSeen
 							? Math.floor((now - board.lastSeen) / 1000)
 							: null;
-						const imgCount = totalImages[board.id] ?? board.captures;
 						const wifi = board.wifiRssi ? rssiLabel(board.wifiRssi) : null;
 						return (
 							<div key={board.id} className="board-card">
@@ -171,7 +222,20 @@ export default function DashboardPage() {
 									</div>
 									<div className="stat-item">
 										<span className="stat-label">Images</span>
-										<span className="stat-value highlight">{imgCount}</span>
+										{imagesStats.error ? (
+											<span
+												className="stat-value stat-value-error"
+												title={`Failed to load: ${imagesStats.error}`}
+											>
+												{"\u2014"}
+											</span>
+										) : imagesStats.loading && imagesStats.data === null ? (
+											<span className="stat-value">{"\u2026"}</span>
+										) : (
+											<span className="stat-value highlight">
+												{totalImages[board.id] ?? 0}
+											</span>
+										)}
 									</div>
 									<div className="stat-item">
 										<span className="stat-label">Uptime</span>

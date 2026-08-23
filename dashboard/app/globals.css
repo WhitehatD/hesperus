@@ -215,6 +215,18 @@ body {
 	border-radius: var(--radius-sm);
 }
 
+.fleet-chip-error {
+	font-family: var(--font-mono);
+	cursor: pointer;
+	color: var(--rose);
+	background: var(--rose-glow);
+	border: 1px solid color-mix(in srgb, var(--rose) 30%, transparent);
+}
+
+.fleet-chip-error:hover {
+	border-color: var(--rose);
+}
+
 /* ── RSSI Colors ── */
 .rssi-good {
 	color: var(--emerald) !important;
@@ -432,6 +444,14 @@ body {
 
 .stat-value.highlight {
 	color: var(--accent);
+}
+
+.stat-value-error {
+	font-family: var(--font-mono);
+	font-size: var(--text-md);
+	font-weight: 500;
+	color: var(--rose);
+	cursor: help;
 }
 
 /* ── Telemetry Box ── */
@@ -1562,6 +1582,34 @@ body {
 	background: var(--accent-glow);
 }
 
+.header-chip-error {
+	font-family: var(--font-mono);
+	cursor: pointer;
+	color: var(--rose);
+	background: var(--rose-glow);
+	border: 1px solid color-mix(in srgb, var(--rose) 30%, transparent);
+}
+
+.header-chip-error:hover {
+	border-color: var(--rose);
+}
+
+/* Tiny uppercase tag distinguishing the NET (connectivity) status pill from
+   the PWR (MCU power-saving mode) chip in the header — the two used to look
+   like redundant/overlapping indicators. */
+.status-cluster-tag {
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	color: var(--text-tertiary);
+	margin-right: 3px;
+}
+
+.header-chip.power-chip .status-cluster-tag {
+	color: inherit;
+	opacity: 0.65;
+}
+
 /* ── Header Action Buttons ── */
 .agent-header-actions {
 	display: flex;
@@ -1774,6 +1822,29 @@ body {
 	transform: scale(1.01);
 }
 
+/* A live-arriving image (pushed via the dashboard/images/new MQTT topic)
+   flashes this state for a few seconds so it reads as an EVENT, not just
+   a row that silently appeared on the next re-render. */
+.sidebar-image-card.is-new {
+	border-color: var(--border-accent);
+	box-shadow: var(--shadow-glow);
+}
+
+.new-badge {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 2;
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	color: var(--accent);
+	background: var(--accent-glow);
+	border: 1px solid var(--border-accent);
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+}
+
 .sidebar-image-wrapper {
 	aspect-ratio: 4 / 3;
 	background: var(--media-bg);
@@ -1950,6 +2021,71 @@ body {
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
+}
+
+/* Visible, retryable error state for the shared useAsyncResource pattern —
+   replaces the old silent `.catch(console.error)` / `.catch(() => {})`. */
+.error-banner {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-2);
+	min-width: 0;
+	padding: var(--space-2) var(--space-3);
+	margin-bottom: var(--space-2);
+	background: var(--rose-glow);
+	border: 1px solid color-mix(in srgb, var(--rose) 30%, transparent);
+	border-radius: var(--radius-md);
+}
+
+.error-banner-compact {
+	padding: 6px var(--space-2);
+	font-size: var(--text-xs);
+}
+
+.error-banner-text {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--rose);
+	font-size: var(--text-sm);
+}
+
+.error-banner-retry {
+	flex-shrink: 0;
+	font-size: var(--text-xs);
+	font-weight: 600;
+	color: var(--rose);
+	background: transparent;
+	border: 1px solid color-mix(in srgb, var(--rose) 40%, transparent);
+	border-radius: var(--radius-sm);
+	padding: 2px 8px;
+	cursor: pointer;
+}
+
+.error-banner-retry:hover {
+	background: var(--rose-glow);
+}
+
+/* Inline success/failure feedback next to the control that triggered an
+   action (activate/deactivate a schedule, capture, power mode, ...) — the
+   log console alone is a separate tab the user may not be looking at. */
+.action-feedback {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	font-size: var(--text-xs);
+	font-weight: 500;
+	margin-left: var(--space-2);
+}
+
+.action-feedback-success {
+	color: var(--emerald);
+}
+
+.action-feedback-error {
+	color: var(--rose);
 }
 
 .schedule-progress {

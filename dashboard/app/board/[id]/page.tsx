@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { use, useCallback, useEffect, useRef, useState } from "react";
 import AgentChat from "../../components/AgentChat";
+import ErrorBanner from "../../components/ErrorBanner";
+import { useAsyncResource } from "../../hooks/useAsyncResource";
 import { useMQTT } from "../../hooks/useMQTT";
 
 type ConnectionState = "online" | "sleeping" | "offline";
@@ -14,7 +16,6 @@ interface BoardState {
 	firmware: string | null;
 	lastSeen: number | null;
 	status: string;
-	captures: number;
 	lastImageSize: number | null;
 	lastLatencyMs: number | null;
 	connection: ConnectionState;
@@ -69,18 +70,24 @@ export default function BoardPage({
 		firmware: null,
 		lastSeen: null,
 		status: "idle",
-		captures: 0,
 		lastImageSize: null,
 		lastLatencyMs: null,
 		connection: "sleeping",
 		logs: [],
 	});
-	const [images, setImages] = useState<ImageCapture[]>([]);
 	const [selectedImage, setSelectedImage] = useState<ImageCapture | null>(null);
 	const [activeTab, setActiveTab] = useState<
 		"gallery" | "schedules" | "energy"
 	>("gallery");
-	const [schedules, setSchedules] = useState<any[]>([]);
+	// Filename of the most recently MQTT-pushed image, used only to flash the
+	// "just arrived" indicator on its gallery card for a few seconds — not part
+	// of the fetched data itself, so a failed/slow refetch can never desync it.
+	const [justArrivedFilename, setJustArrivedFilename] = useState<string | null>(
+		null,
+	);
+	const justArrivedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+		null,
+	);
 	const [taskStatuses, setTaskStatuses] = useState<
 		Record<number, { status: string; updatedAt: number }>
 	>({});
@@ -148,163 +155,204 @@ export default function BoardPage({
 		[],
 	);
 
-	const fetchImages = useCallback(() => {
-		fetch(`${apiBase}/api/images?board_id=${boardId}`)
-			.then((res) => {
-				if (!res.ok) throw new Error(res.statusText);
-				return res.json();
-			})
-			.then((data) => {
-				if (data.images) {
-					setImages(
-						data.images.map((img: any) => ({
-							taskId: img.task_id,
-							filename: img.filename,
-							url: `${apiBase}${img.url}`,
-							date: img.date,
-							timestamp: img.timestamp,
-							isNew: false,
-							analysis: img.analysis
-								? {
-										objective: img.analysis.objective ?? "",
-										findings: img.analysis.findings ?? "",
-										recommendation: img.analysis.recommendation ?? "",
-										model: img.analysis.model ?? "",
-										inferenceMs: img.analysis.inference_ms ?? 0,
-									}
-								: undefined,
-						})),
-					);
-				}
-			})
-			.catch(console.error);
+	// Inline success/failure feedback for user-triggered actions (capture, ping,
+	// schedule activate/deactivate, power mode, energy reset, ...), rendered right
+	// next to the control that triggered it — addLog() alone only reaches the log
+	// console, a separate tab the user isn't necessarily looking at when they click.
+	const [actionFeedback, setActionFeedback] = useState<
+		Record<string, { type: "success" | "error"; message: string }>
+	>({});
+	const feedbackTimersRef = useRef<
+		Record<string, ReturnType<typeof setTimeout>>
+	>({});
+	const showFeedback = useCallback(
+		(key: string, type: "success" | "error", message: string) => {
+			setActionFeedback((prev) => ({ ...prev, [key]: { type, message } }));
+			if (feedbackTimersRef.current[key]) {
+				clearTimeout(feedbackTimersRef.current[key]);
+			}
+			feedbackTimersRef.current[key] = setTimeout(
+				() => {
+					setActionFeedback((prev) => {
+						if (!(key in prev)) return prev;
+						const next = { ...prev };
+						delete next[key];
+						return next;
+					});
+				},
+				type === "error" ? 6000 : 3000,
+			);
+		},
+		[],
+	);
+	useEffect(() => {
+		const timers = feedbackTimersRef.current;
+		return () => {
+			for (const t of Object.values(timers)) clearTimeout(t);
+			if (justArrivedTimeoutRef.current) {
+				clearTimeout(justArrivedTimeoutRef.current);
+			}
+		};
+	}, []);
+
+	// Every resource on this page shares ONE async pattern: {data, loading,
+	// error, refetch} from useAsyncResource. A failed fetch used to be either
+	// swallowed entirely (`.catch(() => {})`) or only logged to devtools
+	// (`.catch(console.error)`) — on a hotspot with real multi-second dead-air
+	// windows that reads as silent data loss. Every panel below renders a
+	// visible <ErrorBanner> with retry when its resource errors.
+	const fetchImagesData = useCallback(async (): Promise<ImageCapture[]> => {
+		const res = await fetch(`${apiBase}/api/images?board_id=${boardId}`);
+		if (!res.ok) throw new Error(`Failed to load images (${res.status})`);
+		const data = await res.json();
+		const raw = data.images ?? [];
+		return raw.map((img: any) => ({
+			taskId: img.task_id,
+			filename: img.filename,
+			url: `${apiBase}${img.url}`,
+			date: img.date,
+			timestamp: img.timestamp,
+			isNew: false,
+			analysis: img.analysis
+				? {
+						objective: img.analysis.objective ?? "",
+						findings: img.analysis.findings ?? "",
+						recommendation: img.analysis.recommendation ?? "",
+						model: img.analysis.model ?? "",
+						inferenceMs: img.analysis.inference_ms ?? 0,
+					}
+				: undefined,
+		}));
 	}, [apiBase, boardId]);
+	const imagesResource = useAsyncResource<ImageCapture[]>(fetchImagesData);
+	const images = imagesResource.data ?? [];
 
-	const fetchSchedules = useCallback(() => {
-		fetch(`${apiBase}/api/schedules`)
-			.then((r) => r.json())
-			.then((data) => {
-				const fresh = data.schedules ?? data ?? [];
-				setSchedules((prev) => {
-					// Merge: keep completed_at from previous state if HTTP response is stale
-					if (prev.length === 0) return fresh;
-					const prevMap = new Map(
-						prev.flatMap((s: any) =>
-							(s.tasks || []).map((t: any) => [t.id, t.completed_at]),
-						),
-					);
-					return fresh.map((s: any) => ({
-						...s,
-						tasks: (s.tasks || []).map((t: any) => ({
-							...t,
-							completed_at: t.completed_at || prevMap.get(t.id) || null,
-						})),
-					}));
-				});
-			})
-			.catch(() => {});
+	const fetchSchedulesData = useCallback(
+		async (current: any[] | null) => {
+			const res = await fetch(`${apiBase}/api/schedules`);
+			if (!res.ok) throw new Error(`Failed to load schedules (${res.status})`);
+			const data = await res.json();
+			const fresh = data.schedules ?? data ?? [];
+			// Merge: keep completed_at from previous state if HTTP response is stale
+			const prev = current ?? [];
+			if (prev.length === 0) return fresh;
+			const prevMap = new Map(
+				prev.flatMap((s: any) =>
+					(s.tasks || []).map((t: any) => [t.id, t.completed_at]),
+				),
+			);
+			return fresh.map((s: any) => ({
+				...s,
+				tasks: (s.tasks || []).map((t: any) => ({
+					...t,
+					completed_at: t.completed_at || prevMap.get(t.id) || null,
+				})),
+			}));
+		},
+		[apiBase],
+	);
+	const schedulesResource = useAsyncResource<any[]>(fetchSchedulesData);
+	const schedules = schedulesResource.data ?? [];
+
+	// Seed cumulative energy totals from the server on mount. Live updates
+	// after that come from MQTT "energy" status windows (see handleMessage).
+	const fetchEnergySeed = useCallback(async () => {
+		const r = await fetch(`${apiBase}/api/benchmark/energy`);
+		if (!r.ok) throw new Error(`Failed to load energy totals (${r.status})`);
+		return await r.json();
 	}, [apiBase]);
+	const energySeedResource = useAsyncResource<any>(fetchEnergySeed);
 
 	useEffect(() => {
-		fetchImages();
-		fetchSchedules();
-	}, [fetchImages, fetchSchedules]);
-
-	// Seed cumulative energy totals from the server on mount
-	useEffect(() => {
-		fetch(`${apiBase}/api/benchmark/energy`)
-			.then((r) => {
-				if (!r.ok) return null;
-				return r.json();
-			})
-			.then((data) => {
-				if (!data) return;
-				setEnergy({
-					windows: data.windows ?? 0,
-					totalWindowMs: data.total_window_ms ?? 0,
-					totalPsRestMs: data.total_ps_rest_ms ?? 0,
-					totalCaptureMs: data.total_capture_ms ?? 0,
-					lastWindowMs: 0,
-					lastUpdate: data.windows > 0 ? Date.now() : null,
-				});
-			})
-			.catch(() => {});
-	}, [apiBase]);
+		const data = energySeedResource.data;
+		if (!data) return;
+		setEnergy({
+			windows: data.windows ?? 0,
+			totalWindowMs: data.total_window_ms ?? 0,
+			totalPsRestMs: data.total_ps_rest_ms ?? 0,
+			totalCaptureMs: data.total_capture_ms ?? 0,
+			lastWindowMs: 0,
+			lastUpdate: data.windows > 0 ? Date.now() : null,
+		});
+	}, [energySeedResource.data]);
 
 	// Hydrate board state from the server snapshot — the single source of truth
 	// for power mode + connection. Runs on mount AND polls every 5 s, so a page
 	// refresh reflects real board state immediately instead of blanking until the
 	// next MQTT heartbeat (sparse in PS-REST — the board sleeps ~97% of the time).
-	useEffect(() => {
-		let cancelled = false;
-		const applySnapshot = async () => {
-			try {
-				const r = await fetch(`${apiBase}/api/board/state`);
-				if (!r.ok) return;
-				const snap = await r.json();
-				if (cancelled || !snap) return;
-
-				// Derive power mode from the board's reported state. Sleep (deep
-				// dormant, or armed-but-awake when no schedule) wins, then PS-REST,
-				// then Active. lp_mode and sleep_mode are exclusive on the board.
-				if (snap.state === "deep_dormant" || snap.sleep_mode === true) {
-					setPowerMode("sleep");
-				} else if (snap.lp_mode === "ps_rest") {
-					setPowerMode("ps_rest");
-				} else if (snap.lp_mode === "normal") {
-					setPowerMode("active");
-				} // else: leave as-is (unknown until the board reports)
-
-				setBoard((prev) => {
-					const lastSeenMs = snap.last_seen
-						? new Date(snap.last_seen).getTime()
-						: prev.lastSeen;
-					const ageMs =
-						lastSeenMs != null
-							? Date.now() - lastSeenMs
-							: Number.POSITIVE_INFINITY;
-					let connection: ConnectionState = prev.connection;
-					if (snap.state === "deep_dormant") {
-						connection = "sleeping";
-					} else if (snap.state === "online") {
-						connection =
-							ageMs < 15000
-								? "online"
-								: ageMs < 120000
-									? "sleeping"
-									: "offline";
-					}
-					return {
-						...prev,
-						firmware: snap.firmware ?? prev.firmware,
-						lastSeen: lastSeenMs,
-						connection,
-					};
-				});
-			} catch {
-				/* transient — next poll retries */
-			}
-		};
-		applySnapshot();
-		const interval = setInterval(applySnapshot, 5000);
-		return () => {
-			cancelled = true;
-			clearInterval(interval);
-		};
+	const fetchBoardSnapshot = useCallback(async () => {
+		const r = await fetch(`${apiBase}/api/board/state`);
+		if (!r.ok) throw new Error(`Failed to load board state (${r.status})`);
+		return await r.json();
 	}, [apiBase]);
+	const boardSnapshotResource = useAsyncResource<any>(fetchBoardSnapshot);
+
+	useEffect(() => {
+		const snap = boardSnapshotResource.data;
+		if (!snap) return;
+
+		// Derive power mode from the board's reported state. Sleep (deep
+		// dormant, or armed-but-awake when no schedule) wins, then PS-REST,
+		// then Active. lp_mode and sleep_mode are exclusive on the board.
+		if (snap.state === "deep_dormant" || snap.sleep_mode === true) {
+			setPowerMode("sleep");
+		} else if (snap.lp_mode === "ps_rest") {
+			setPowerMode("ps_rest");
+		} else if (snap.lp_mode === "normal") {
+			setPowerMode("active");
+		} // else: leave as-is (unknown until the board reports)
+
+		setBoard((prev) => {
+			const lastSeenMs = snap.last_seen
+				? new Date(snap.last_seen).getTime()
+				: prev.lastSeen;
+			const ageMs =
+				lastSeenMs != null ? Date.now() - lastSeenMs : Number.POSITIVE_INFINITY;
+			let connection: ConnectionState = prev.connection;
+			if (snap.state === "deep_dormant") {
+				connection = "sleeping";
+			} else if (snap.state === "online") {
+				connection =
+					ageMs < 15000 ? "online" : ageMs < 120000 ? "sleeping" : "offline";
+			}
+			return {
+				...prev,
+				firmware: snap.firmware ?? prev.firmware,
+				lastSeen: lastSeenMs,
+				connection,
+			};
+		});
+	}, [boardSnapshotResource.data]);
+
+	useEffect(() => {
+		const interval = setInterval(boardSnapshotResource.refetch, 5000);
+		return () => clearInterval(interval);
+	}, [boardSnapshotResource.refetch]);
 
 	// Poll schedules as fallback (MQTT push is primary, poll catches reconnects)
 	useEffect(() => {
-		const interval = setInterval(fetchSchedules, 30000);
+		const interval = setInterval(schedulesResource.refetch, 30000);
 		return () => clearInterval(interval);
-	}, [fetchSchedules]);
+	}, [schedulesResource.refetch]);
 
 	const handleMessage = useCallback(
 		(topic: string, data: Record<string, any>, sourceBoardId: string) => {
 			// Dashboard image notification
 			if (topic === "dashboard/images/new") {
-				fetchImages();
-				fetchSchedules();
+				imagesResource.refetch();
+				schedulesResource.refetch();
+				// Flash a "just arrived" indicator on this image's gallery card once
+				// the refetch lands it in `images` — cleared after a few seconds so
+				// it reads as an event, not a permanent state.
+				if (data.filename) {
+					setJustArrivedFilename(data.filename);
+					if (justArrivedTimeoutRef.current) {
+						clearTimeout(justArrivedTimeoutRef.current);
+					}
+					justArrivedTimeoutRef.current = setTimeout(() => {
+						setJustArrivedFilename(null);
+					}, 5000);
+				}
 				addLog(
 					"upload",
 					"IMG",
@@ -316,8 +364,8 @@ export default function BoardPage({
 
 			// AI analysis result
 			if (topic === "dashboard/analysis/new") {
-				setImages((prev) =>
-					prev.map((img) =>
+				imagesResource.setData((prev) =>
+					(prev ?? []).map((img) =>
 						img.filename === data.filename
 							? {
 									...img,
@@ -344,10 +392,11 @@ export default function BoardPage({
 			// Real-time schedule/task updates
 			if (topic === "dashboard/schedules/updated") {
 				if (data.schedules) {
-					setSchedules((prev) => {
-						if (prev.length === 0) return data.schedules;
+					schedulesResource.setData((prev) => {
+						const p = prev ?? [];
+						if (p.length === 0) return data.schedules;
 						const prevMap = new Map(
-							prev.flatMap((s: any) =>
+							p.flatMap((s: any) =>
 								(s.tasks || []).map((t: any) => [t.id, t.completed_at]),
 							),
 						);
@@ -410,7 +459,6 @@ export default function BoardPage({
 				if (data.firmware) update.firmware = data.firmware;
 				if (data.status) update.status = data.status;
 				if (data.status === "captured" || data.status === "uploaded") {
-					update.captures += 1;
 					if (data.size) update.lastImageSize = data.size;
 					if (data.latency_ms) update.lastLatencyMs = data.latency_ms;
 				}
@@ -593,7 +641,14 @@ export default function BoardPage({
 					}
 			}
 		},
-		[boardId, fetchImages, fetchSchedules, addLog],
+		[
+			boardId,
+			imagesResource.refetch,
+			imagesResource.setData,
+			schedulesResource.refetch,
+			schedulesResource.setData,
+			addLog,
+		],
 	);
 
 	const topics = [
@@ -636,13 +691,18 @@ export default function BoardPage({
 	const deleteImage = async (img: ImageCapture) => {
 		if (!confirm("Delete this capture permanently?")) return;
 		try {
-			await fetch(`${apiBase}/api/images/${img.date}/${img.filename}`, {
-				method: "DELETE",
-			});
-			setImages((prev) => prev.filter((i) => i.filename !== img.filename));
+			const res = await fetch(
+				`${apiBase}/api/images/${img.date}/${img.filename}`,
+				{ method: "DELETE" },
+			);
+			if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+			imagesResource.setData((prev) =>
+				(prev ?? []).filter((i) => i.filename !== img.filename),
+			);
 			setSelectedImage(null);
 		} catch (err) {
 			addLog("error", "HTTP", `Delete failed: ${err}`);
+			showFeedback("gallery", "error", `Delete failed: ${err}`);
 		}
 	};
 
@@ -654,8 +714,10 @@ export default function BoardPage({
 			if (!res.ok) throw new Error(await res.text());
 			const data = await res.json();
 			addLog("success", "CMD", "Capture command sent", `task #${data.task_id}`);
+			showFeedback("capture", "success", "Capture command sent");
 		} catch (err) {
 			addLog("error", "CMD", `Capture failed: ${err}`);
+			showFeedback("capture", "error", `Capture failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -668,8 +730,10 @@ export default function BoardPage({
 			const res = await fetch(`${apiBase}/api/ping`, { method: "POST" });
 			if (!res.ok) throw new Error(await res.text());
 			addLog("success", "CMD", "Ping sent — LED sequence triggered");
+			showFeedback("ping", "success", "Ping sent");
 		} catch (err) {
 			addLog("error", "CMD", `Ping failed: ${err}`);
+			showFeedback("ping", "error", `Ping failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -686,8 +750,10 @@ export default function BoardPage({
 				"CMD",
 				"Setup mode activated — board starting AP at 192.168.10.1",
 			);
+			showFeedback("setup", "success", "Setup mode activated");
 		} catch (err) {
 			addLog("error", "CMD", `Setup mode failed: ${err}`);
+			showFeedback("setup", "error", `Setup mode failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -695,8 +761,8 @@ export default function BoardPage({
 
 	const handleRefresh = () => {
 		addLog("info", "CMD", "Refreshing images & schedules...");
-		fetchImages();
-		fetchSchedules();
+		imagesResource.refetch();
+		schedulesResource.refetch();
 	};
 
 	// Single mutually-exclusive power-mode switch. Active/PS-REST/Sleep map to the
@@ -737,9 +803,11 @@ export default function BoardPage({
 					"Power mode → Active (always awake & connected)",
 				);
 			}
+			showFeedback("power", "success", `Power mode → ${mode}`);
 		} catch (err) {
 			setPowerMode(prev); // revert on failure
 			addLog("error", "PWR", `Power mode change failed: ${err}`);
+			showFeedback("power", "error", `Power mode change failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -766,8 +834,10 @@ export default function BoardPage({
 				"PWR",
 				`Energy windows reset (${body.deleted ?? 0} cleared) — fresh run`,
 			);
+			showFeedback("energy-reset", "success", "Energy run reset");
 		} catch (err) {
 			addLog("error", "PWR", `Energy reset failed: ${err}`);
+			showFeedback("energy-reset", "error", `Reset failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -782,9 +852,15 @@ export default function BoardPage({
 			);
 			if (!res.ok) throw new Error(await res.text());
 			addLog("success", "SCHED", `Schedule activated`, `id=${scheduleId}`);
-			fetchSchedules();
+			showFeedback(`schedule-${scheduleId}`, "success", "Activated");
+			schedulesResource.refetch();
 		} catch (err) {
 			addLog("error", "SCHED", `Activate failed: ${err}`);
+			showFeedback(
+				`schedule-${scheduleId}`,
+				"error",
+				`Activate failed: ${err}`,
+			);
 		} finally {
 			setActionLoading(null);
 		}
@@ -799,9 +875,15 @@ export default function BoardPage({
 			);
 			if (!res.ok) throw new Error(await res.text());
 			addLog("info", "SCHED", `Schedule deactivated`, `id=${scheduleId}`);
-			fetchSchedules();
+			showFeedback(`schedule-${scheduleId}`, "success", "Deactivated");
+			schedulesResource.refetch();
 		} catch (err) {
 			addLog("error", "SCHED", `Deactivate failed: ${err}`);
+			showFeedback(
+				`schedule-${scheduleId}`,
+				"error",
+				`Deactivate failed: ${err}`,
+			);
 		} finally {
 			setActionLoading(null);
 		}
@@ -815,10 +897,13 @@ export default function BoardPage({
 				method: "DELETE",
 			});
 			if (!res.ok) throw new Error(await res.text());
-			setSchedules((prev) => prev.filter((s: any) => s.id !== scheduleId));
+			schedulesResource.setData((prev) =>
+				(prev ?? []).filter((s: any) => s.id !== scheduleId),
+			);
 			addLog("info", "SCHED", `Schedule "${name}" deleted`);
 		} catch (err) {
 			addLog("error", "SCHED", `Delete failed: ${err}`);
+			showFeedback(`schedule-${scheduleId}`, "error", `Delete failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -847,10 +932,12 @@ export default function BoardPage({
 			);
 			if (!res.ok) throw new Error(await res.text());
 			addLog("success", "SCHED", `Schedule "${editingSchedule.name}" updated`);
+			showFeedback("save-schedule", "success", "Schedule saved");
 			setEditingSchedule(null);
-			fetchSchedules();
+			schedulesResource.refetch();
 		} catch (err) {
 			addLog("error", "SCHED", `Save failed: ${err}`);
+			showFeedback("save-schedule", "error", `Save failed: ${err}`);
 		} finally {
 			setActionLoading(null);
 		}
@@ -894,9 +981,25 @@ export default function BoardPage({
 					<button className="btn-action" onClick={handleRefresh}>
 						Refresh
 					</button>
+					<ActionFeedback
+						feedback={
+							actionFeedback.capture ??
+							actionFeedback.ping ??
+							actionFeedback.setup
+						}
+					/>
 				</div>
 				<div className="agent-header-stats">
-					<div className={`status-indicator ${board.connection}`}>
+					{/* Two distinct indicators, tagged so they don't read as redundant:
+					    NET = network/connectivity (MQTT reachability), PWR = the MCU's
+					    own power-saving mode. A board can be NET online while PWR is
+					    PS-REST (radio still checks in periodically), or NET sleeping
+					    while PWR is Sleep (deep dormant, silent by design). */}
+					<div
+						className={`status-indicator ${board.connection}`}
+						title="Network — is the board currently reachable over MQTT/Wi-Fi?"
+					>
+						<span className="status-cluster-tag">NET</span>
 						<div className="dot" />
 						{board.connection === "online"
 							? "Online"
@@ -906,8 +1009,9 @@ export default function BoardPage({
 					</div>
 					<span
 						className={`header-chip power-chip power-${powerMode}`}
-						title="Current power mode — change it in the Power tab"
+						title="Power — the MCU's current power-saving mode, set from the Power tab"
 					>
+						<span className="status-cluster-tag">PWR</span>
 						{powerMode === "ps_rest"
 							? "PS-REST"
 							: powerMode === "sleep"
@@ -922,7 +1026,33 @@ export default function BoardPage({
 					<span className="header-chip">
 						<span className={getStatusClass(board.status)}>{board.status}</span>
 					</span>
-					<span className="header-chip highlight">{board.captures} caps</span>
+					{imagesResource.error ? (
+						<button
+							type="button"
+							className="header-chip header-chip-error"
+							onClick={imagesResource.refetch}
+							title={`Failed to load capture count: ${imagesResource.error}. Click to retry.`}
+						>
+							⚠ caps
+						</button>
+					) : (
+						<span className="header-chip highlight">
+							{imagesResource.loading && imagesResource.data === null
+								? "\u2026"
+								: images.length}{" "}
+							caps
+						</span>
+					)}
+					{boardSnapshotResource.error && (
+						<button
+							type="button"
+							className="header-chip header-chip-error"
+							onClick={boardSnapshotResource.refetch}
+							title={`Board state sync failed: ${boardSnapshotResource.error}. Click to retry.`}
+						>
+							⚠ sync
+						</button>
+					)}
 					<div className="connection-badge">
 						<div
 							className={`connection-dot ${connectionStatus === "connected" ? "connected" : "disconnected"}`}
@@ -993,43 +1123,76 @@ export default function BoardPage({
 
 					<div className="panel-content">
 						{activeTab === "gallery" && (
-							<div className="sidebar-gallery">
-								{sortedImages.length === 0 ? (
-									<div className="empty-state-sm">
-										No captures yet. Ask the agent to take a picture.
-									</div>
-								) : (
-									sortedImages.map((img) => (
-										<div
-											key={img.filename}
-											className="sidebar-image-card"
-											onClick={() => setSelectedImage(img)}
-										>
-											{img.analysis && <div className="analysis-indicator" />}
-											<div className="sidebar-image-wrapper">
-												<img
-													src={img.url}
-													alt={`Task ${img.taskId}`}
-													loading="lazy"
-												/>
-											</div>
-											<div className="sidebar-image-meta">
-												<span>#{img.taskId}</span>
-												<span className="image-time">
-													{new Date(img.timestamp * 1000).toLocaleTimeString()}
-												</span>
-											</div>
-										</div>
-									))
+							<>
+								{imagesResource.error && (
+									<ErrorBanner
+										compact
+										message={`Couldn't load images: ${imagesResource.error}`}
+										onRetry={imagesResource.refetch}
+									/>
 								)}
-							</div>
+								<ActionFeedback feedback={actionFeedback.gallery} />
+								<div className="sidebar-gallery">
+									{sortedImages.length === 0 ? (
+										<div className="empty-state-sm">
+											{imagesResource.loading && imagesResource.data === null
+												? "Loading captures\u2026"
+												: "No captures yet. Ask the agent to take a picture."}
+										</div>
+									) : (
+										sortedImages.map((img) => {
+											const isJustArrived =
+												img.filename === justArrivedFilename;
+											return (
+												<div
+													key={img.filename}
+													className={`sidebar-image-card${isJustArrived ? " is-new" : ""}`}
+													onClick={() => setSelectedImage(img)}
+												>
+													{isJustArrived && (
+														<div className="new-badge">NEW</div>
+													)}
+													{img.analysis && (
+														<div className="analysis-indicator" />
+													)}
+													<div className="sidebar-image-wrapper">
+														<img
+															src={img.url}
+															alt={`Task ${img.taskId}`}
+															loading="lazy"
+														/>
+													</div>
+													<div className="sidebar-image-meta">
+														<span>#{img.taskId}</span>
+														<span className="image-time">
+															{new Date(
+																img.timestamp * 1000,
+															).toLocaleTimeString()}
+														</span>
+													</div>
+												</div>
+											);
+										})
+									)}
+								</div>
+							</>
 						)}
 
 						{activeTab === "schedules" && (
 							<div className="schedules-list">
+								{schedulesResource.error && (
+									<ErrorBanner
+										compact
+										message={`Couldn't load schedules: ${schedulesResource.error}`}
+										onRetry={schedulesResource.refetch}
+									/>
+								)}
 								{schedules.length === 0 ? (
 									<div className="empty-state-sm">
-										No schedules yet. Ask the agent to create one.
+										{schedulesResource.loading &&
+										schedulesResource.data === null
+											? "Loading schedules\u2026"
+											: "No schedules yet. Ask the agent to create one."}
 									</div>
 								) : (
 									schedules.map((sched: any) => {
@@ -1187,6 +1350,9 @@ export default function BoardPage({
 															: "Delete"}
 													</button>
 												</div>
+												<ActionFeedback
+													feedback={actionFeedback[`schedule-${sched.id}`]}
+												/>
 											</div>
 										);
 									})
@@ -1202,6 +1368,10 @@ export default function BoardPage({
 								actionLoading={actionLoading}
 								onSetPowerMode={handleSetPowerMode}
 								onReset={handleEnergyReset}
+								energyError={energySeedResource.error}
+								onRetryEnergy={energySeedResource.refetch}
+								feedbackPower={actionFeedback.power}
+								feedbackReset={actionFeedback["energy-reset"]}
 							/>
 						)}
 					</div>
@@ -1418,6 +1588,7 @@ export default function BoardPage({
 						</div>
 
 						<div className="modal-footer">
+							<ActionFeedback feedback={actionFeedback["save-schedule"]} />
 							<button
 								className="btn btn-secondary"
 								onClick={() => setEditingSchedule(null)}
@@ -1520,6 +1691,10 @@ interface EnergyPanelProps {
 	actionLoading: string | null;
 	onSetPowerMode: (mode: "active" | "ps_rest" | "sleep") => void;
 	onReset: () => void;
+	energyError: string | null;
+	onRetryEnergy: () => void;
+	feedbackPower?: { type: "success" | "error"; message: string };
+	feedbackReset?: { type: "success" | "error"; message: string };
 }
 
 const POWER_MODES = [
@@ -1535,6 +1710,10 @@ function EnergyPanel({
 	actionLoading,
 	onSetPowerMode,
 	onReset,
+	energyError,
+	onRetryEnergy,
+	feedbackPower,
+	feedbackReset,
 }: EnergyPanelProps) {
 	const m = measuredDailyEnergy(
 		energy.totalWindowMs,
@@ -1559,6 +1738,13 @@ function EnergyPanel({
 
 	return (
 		<div className="energy-panel">
+			{energyError && (
+				<ErrorBanner
+					compact
+					message={`Couldn't load energy totals: ${energyError}`}
+					onRetry={onRetryEnergy}
+				/>
+			)}
 			{/* Power mode — mutually exclusive segmented control */}
 			<fieldset className="power-mode-control">
 				<legend className="energy-label">Power mode</legend>
@@ -1581,6 +1767,7 @@ function EnergyPanel({
 						? "Switching power mode\u2026"
 						: modeDesc[powerMode]}
 				</div>
+				<ActionFeedback feedback={feedbackPower} />
 				{powerMode === "sleep" && !hasSchedule && (
 					<div className="power-mode-warn">
 						⚠ No schedule set — the board will stay dormant until you press the
@@ -1602,6 +1789,7 @@ function EnergyPanel({
 					>
 						{actionLoading === "energy-reset" ? "Resetting…" : "Reset run"}
 					</button>
+					<ActionFeedback feedback={feedbackReset} />
 				</div>
 			)}
 
@@ -1792,4 +1980,19 @@ function getStatusClass(status: string): string {
 		return "status-active";
 	if (status.includes("ota") || status.includes("ping")) return "status-ota";
 	return "status-idle";
+}
+
+/** Inline success/failure feedback rendered right next to the control that
+ * triggered an action — self-clearing (see showFeedback's setTimeout). */
+function ActionFeedback({
+	feedback,
+}: {
+	feedback?: { type: "success" | "error"; message: string };
+}) {
+	if (!feedback) return null;
+	return (
+		<span className={`action-feedback action-feedback-${feedback.type}`}>
+			{feedback.type === "success" ? "\u2713" : "\u26a0"} {feedback.message}
+		</span>
+	);
 }
