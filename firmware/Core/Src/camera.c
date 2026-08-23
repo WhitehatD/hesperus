@@ -691,6 +691,43 @@ CameraStatus_t Camera_Init(CameraResolution_t resolution)
     val = 0x00;  /* bit 0=0: AEC auto, bit 1=0: AGC auto */
     BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3503, &val, 1);
 
+#if CAMERA_NIGHT_MODE_ENABLE
+    /* ── Night mode: give AEC headroom beyond one frame period ───────────
+     *
+     * See CAMERA_NIGHT_MODE_ENABLE in firmware_config.h for the full
+     * rationale. Short version: ST's OV5640_Common[] caps max exposure to
+     * ~984 lines (~1 frame at VTS=1088) and never enables night mode
+     * (0x3A00 stays at its POR default, night-mode bit clear), so in a dim
+     * room the AEC loop hits the exposure ceiling almost immediately and
+     * can only fight darkness with gain — adding noise instead of light.
+     * This block is purely additive to the AUTO AEC loop: it does not
+     * disable AUTO, does not touch the gain ceiling (already generous at
+     * ~15.5x from 0x3A18/0x3A19), and does not touch the AEC target band.
+     * A bright scene simply never needs the extra headroom, so it should
+     * be a no-op there. UNVALIDATED ON HARDWARE — see the config comment
+     * for the required daylight/lit-room check before the BNAIC demo. */
+    {
+        uint8_t reg3a00 = 0;
+        BSP_I2C1_ReadReg16(OV5640_I2C_ADDR, 0x3A00, &reg3a00, 1);
+        reg3a00 |= 0x04;  /* bit2 = NightModeOn; preserve banding (bit5) and other bits as read */
+        BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A00, &reg3a00, 1);
+
+        /* Max exposure ceiling, both 50Hz and 60Hz pairs kept consistent
+         * per datasheet guidance. 984 * 4 = 3936 = 0x0F60. */
+        val = 0x0F;
+        BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A02, &val, 1);  /* 60Hz max exposure high */
+        val = 0x60;
+        BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A03, &val, 1);  /* 60Hz max exposure low */
+        val = 0x0F;
+        BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A14, &val, 1);  /* 50Hz max exposure high */
+        val = 0x60;
+        BSP_I2C1_WriteReg16(OV5640_I2C_ADDR, 0x3A15, &val, 1);  /* 50Hz max exposure low */
+
+        LOG_INFO(TAG_CAM, "Night mode enabled: 0x3A00=0x%02X, max-expo ceiling 984->3936 lines (~4x frame)",
+                 reg3a00);
+    }
+#endif
+
 #if CAMERA_JPEG_MODE
     /* ── Enable OV5640 JPEG output + DCMI JPEG mode ──────────────────────
      *

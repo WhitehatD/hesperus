@@ -723,6 +723,7 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
     uint32_t zero_sends = 0;   /* module said "buffer full" (backpressure) */
     uint32_t neg_sends  = 0;   /* module reported an actual error */
     uint32_t start_tick = HAL_GetTick();
+    uint32_t last_mqtt_service_tick = start_tick;
 
     while (offset < len)
     {
@@ -830,6 +831,26 @@ static int _socket_send_all(int32_t sock, const uint8_t *data, int32_t len)
              * the real bound. */
             zero_sends++;
             MX_WIFI_IO_YIELD(wifi_obj_get(), 20);
+
+            /* 2026-08-23: service MQTT/board-status during a SUSTAINED
+             * stall, not every 20ms retry. This is deliberately DIFFERENT
+             * from the sent>0 branch above (which still refuses to touch
+             * MQTT at all, for the reason documented there): here the
+             * module has already said "no" — the SPI/IPC channel is idle
+             * from the upload's perspective, not mid-transfer, so spending
+             * some of that dead time on MQTT costs nothing. Rate-limited to
+             * once per 500ms so a normal 20-40ms backpressure blip (which
+             * resolves before this ever fires) is completely unaffected —
+             * only a real stall borrows cycles. This closes the gap that
+             * let capture command task_id 28 get silently dropped
+             * (MQTT QoS 0, no redelivery) while task_id 27's upload was
+             * wedged in this exact loop. */
+            if ((HAL_GetTick() - last_mqtt_service_tick) >= 500)
+            {
+                BoardStatus_Tick();
+                MQTT_ProcessLoop();
+                last_mqtt_service_tick = HAL_GetTick();
+            }
         }
         else
         {
@@ -1319,6 +1340,24 @@ WiFiStatus_t WiFi_HttpPostImage(const char *url, uint32_t task_id,
              * before: ProcessLoop's 1s recv timeout would stall chunk
              * sends, so ping only, don't run the full loop here. */
             MQTT_SendPing();
+
+            /* 2026-08-23: publish per-chunk progress so the dashboard can
+             * show a real bar instead of a static "uploading" label — the
+             * per-chunk numbers already existed in the serial log (above)
+             * but never left the board. Same cost profile as MQTT_SendPing
+             * just above (one small QoS0 PUBLISH, fire-and-forget, no
+             * recv/wait), so this doesn't reopen the backpressure-stall
+             * gap that _socket_send_all's own MQTT servicing exists for. */
+            {
+                char progress_msg[128];
+                uint32_t pct = (data_len > 0) ? (offset * 100UL) / data_len : 100UL;
+                snprintf(progress_msg, sizeof(progress_msg),
+                         "{\"status\":\"uploading\",\"task_id\":%lu,\"bytes_sent\":%lu,"
+                         "\"bytes_total\":%lu,\"progress\":%lu}",
+                         (unsigned long)resolved_task_id, (unsigned long)offset,
+                         (unsigned long)data_len, (unsigned long)pct);
+                MQTT_PublishStatus(progress_msg);
+            }
             continue;
         }
 

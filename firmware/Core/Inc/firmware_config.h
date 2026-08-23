@@ -300,9 +300,44 @@
 
 /* ── Fast-Capture Tuning ──────────────────────────────── */
 #define CAMERA_WARMUP_FRAMES        3                 /* Frames to discard for AEC convergence (cold start only) */
-#define CAMERA_AEC_SETTLE_TIMEOUT_MS 1500             /* Max wait for AEC register convergence — now polled before EVERY capture, not just cold start (2026-08-21) */
+#define CAMERA_AEC_SETTLE_TIMEOUT_MS 3000             /* Max wait for AEC register convergence — now polled before EVERY capture, not just cold start (2026-08-21). Raised 1500->3000 on 2026-08-23: with CAMERA_NIGHT_MODE_ENABLE, dim-scene AEC needs several extended-integration frames to ramp, not just one. */
 #define CAMERA_INTER_FRAME_DELAY_MS 10                /* Brief ISP settle between snapshots */
 #define CAMERA_WARM_CAPTURE_RETRIES 3                 /* Max snapshot attempts before declaring failure */
+
+/* ── Night Mode (extended integration for dim scenes) ────
+ * 2026-08-23 investigation (VLM flagged tasks 17/18/20/21 as consistently
+ * underexposed after the 2026-08-21 AEC revert to pure vendor defaults).
+ * Root cause identified by register audit, NOT yet hardware-validated
+ * (board only available at night — camera needs daylight/lit-room testing):
+ *
+ * ST's OV5640_Common[] table sets max-exposure ceiling registers
+ * (0x3A02/0x3A03 = 60Hz, 0x3A14/0x3A15 = 50Hz) to 0x03D8 = 984 lines, while
+ * TIMING_VTS is 0x0440 = 1088 lines — i.e. max exposure is capped to ~90%
+ * of ONE frame period. Night mode (0x3A00 bit 2) is never enabled anywhere
+ * in this codebase (0x3A00 is absent from OV5640_Common[], so it sits at
+ * its POR default 0x78 = night mode OFF). Result: no matter how dark the
+ * scene, the sensor can never integrate longer than ~1 frame — it can only
+ * compensate with gain (which adds noise, matching the VLM's "high noise"
+ * reports) instead of exposure time. This is a deliberate vendor default
+ * for smooth live video (constant frame rate); it actively hurts a
+ * snapshot-only monitoring device that doesn't care about frame rate.
+ *
+ * Fix (additive, AUTO-mode only — does not touch gain ceiling or the AEC
+ * target band, so bright-scene behavior is unchanged; the loop simply gets
+ * more headroom to use only when it needs it): enable night mode and raise
+ * both max-exposure pairs to 4x a single frame (984*4 = 3936 = 0x0F60),
+ * matching the datasheet's documented night-mode ceiling mechanism
+ * (OV5640 datasheet §4.6; i.MX/Linux mainline ov5640.c banding-filter
+ * derivation). 4x chosen deliberately conservative vs. e.g. 6x/8x seen in
+ * some vendor tables, to bound motion blur risk (also VLM-flagged) on a
+ * device that may capture rooms with movement.
+ *
+ * VALIDATE ON HARDWARE before trusting for the BNAIC demo: confirm no
+ * regression in daylight/bright-room captures (must stay AUTO, gain ceiling
+ * untouched, so expected: none), and confirm materially brighter captures
+ * in dim rooms without unacceptable added motion blur. Flip to 0 to fully
+ * revert to the vendor baseline if either check fails. */
+#define CAMERA_NIGHT_MODE_ENABLE    1
 
 /* ── Diagnostics ──────────────────────────────────────── */
 #define CAMERA_DIAG_ENABLED         0                 /* 1 = verbose hex dump + pixel scan */

@@ -4,6 +4,21 @@
  * @author  Alexandru-Ionut Cioc
  * @date    2026
  *
+ * STALE — DO NOT WIRE IN AS-IS (2026-08-23). This implements a single-POST
+ * multipart/form-data upload against `SERVER_UPLOAD_PATH?task_id=N`. The
+ * live protocol in wifi.c (WiFi_HttpPostImage) has since moved to a
+ * chunked-POST + `/complete` design with CRC32, a resume probe
+ * (`GET /api/upload/resume`), and stall-detection/keep-alive-socket tuning
+ * that took three separate hardware-debugging sessions to get right on a
+ * real 4G hotspot. Wiring this file in unmodified would silently regress
+ * all of that. The main-loop-blocks-during-upload problem this file was
+ * meant to solve is instead being closed incrementally inside
+ * _socket_send_all()/WiFi_HttpPostImage() in wifi.c (periodic
+ * MQTT_ProcessLoop() servicing during backpressure stalls) — see the
+ * 2026-08-23 comment there. If this file is ever revived, it must first be
+ * re-ported onto wifi.c's current wire protocol, then hardware-validated
+ * exactly like every other change to this upload path.
+ *
  * Each call to Upload_Poll() advances the state machine by sending
  * up to one chunk of data (~16KB). The main loop remains responsive
  * for MQTT, watchdog, and new commands between polls.

@@ -86,6 +86,15 @@ export default function BoardPage({
 	>({});
 	const [actionLoading, setActionLoading] = useState<string | null>(null);
 	const [powerMode, setPowerMode] = useState<PowerMode>("unknown");
+	// Live per-chunk upload progress (device/{id}/status, status="uploading").
+	// null when no upload is in flight. Cleared on "uploaded"/"error"/timeout.
+	const [uploadProgress, setUploadProgress] = useState<{
+		taskId: number;
+		bytesSent: number;
+		bytesTotal: number;
+		percent: number;
+		updatedAt: number;
+	} | null>(null);
 	// After sending a power-mode command the board still sends heartbeats with the
 	// OLD state until the MQTT command propagates (~2-10 s). Suppress heartbeat-
 	// based powerMode updates for 15 s to prevent the optimistic state from
@@ -494,9 +503,44 @@ export default function BoardPage({
 					);
 					break;
 				case "uploading":
-					addLog("upload", "HTTP", "Uploading image to server...", taskMeta);
+					// Per-chunk progress (firmware publishes on every chunk send,
+					// task 3 of the 2026-08-23 session — see wifi.c). Only log
+					// once per task (on the 0%->first-chunk transition) so the
+					// log panel doesn't get flooded with a line per chunk; the
+					// progress bar itself updates on every message.
+					if (
+						typeof data.bytes_total === "number" &&
+						typeof data.bytes_sent === "number" &&
+						typeof data.task_id === "number"
+					) {
+						setUploadProgress((prev) => {
+							if (!prev || prev.taskId !== data.task_id) {
+								addLog(
+									"upload",
+									"HTTP",
+									"Uploading image to server...",
+									taskMeta,
+								);
+							}
+							return {
+								taskId: data.task_id,
+								bytesSent: data.bytes_sent,
+								bytesTotal: data.bytes_total,
+								percent:
+									typeof data.progress === "number"
+										? data.progress
+										: Math.round(
+												(data.bytes_sent / Math.max(1, data.bytes_total)) * 100,
+											),
+								updatedAt: Date.now(),
+							};
+						});
+					} else {
+						addLog("upload", "HTTP", "Uploading image to server...", taskMeta);
+					}
 					break;
 				case "uploaded":
+					setUploadProgress(null);
 					addLog(
 						"success",
 						"HTTP",
@@ -504,7 +548,12 @@ export default function BoardPage({
 						data.latency_ms ? `${data.latency_ms}ms` : taskMeta,
 					);
 					break;
+				case "error":
+					setUploadProgress(null);
+					addLog("error", "ERR", "error", data.reason || taskMeta);
+					break;
 				case "cycle_complete":
+					setUploadProgress(null);
 					addLog("success", "SCHED", "All scheduled tasks completed for today");
 					break;
 				case "ota_checking":
@@ -882,6 +931,27 @@ export default function BoardPage({
 					</div>
 				</div>
 			</header>
+
+			{uploadProgress && (
+				<div
+					className="upload-progress-bar-wrap"
+					title={`Task ${uploadProgress.taskId}: ${(uploadProgress.bytesSent / 1024).toFixed(1)} / ${(uploadProgress.bytesTotal / 1024).toFixed(1)} KB`}
+				>
+					<div className="upload-progress-bar-track">
+						<div
+							className="upload-progress-bar-fill"
+							style={{
+								width: `${Math.min(100, Math.max(0, uploadProgress.percent))}%`,
+							}}
+						/>
+					</div>
+					<span className="upload-progress-bar-label">
+						Uploading task {uploadProgress.taskId} — {uploadProgress.percent}% (
+						{(uploadProgress.bytesSent / 1024).toFixed(1)} /{" "}
+						{(uploadProgress.bytesTotal / 1024).toFixed(1)} KB)
+					</span>
+				</div>
+			)}
 
 			{/* Left: Agent Chat */}
 			<main className="agent-main">

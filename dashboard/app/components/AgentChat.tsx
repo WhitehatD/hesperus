@@ -534,7 +534,7 @@ function BlockRenderer({ block }: { block: Block }) {
 							? "\u2705"
 							: "\u274C"}
 				</span>
-				<div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+				<div className="step-content">
 					<span className="step-label">
 						{block.status === "done" && block.summary
 							? block.summary
@@ -544,12 +544,7 @@ function BlockRenderer({ block }: { block: Block }) {
 						<img
 							src={block.imageUrl}
 							alt="Captured"
-							style={{
-								maxWidth: "280px",
-								borderRadius: "6px",
-								border: "1px solid #333",
-								cursor: "pointer",
-							}}
+							className="chat-image"
 							onClick={() => window.open(block.imageUrl, "_blank")}
 						/>
 					)}
@@ -629,14 +624,7 @@ function parseMarkdown(text: string): React.ReactNode[] {
 					key={`img-${i}`}
 					src={imgSrc}
 					alt={imgMatch[1] || "Captured"}
-					style={{
-						maxWidth: "280px",
-						borderRadius: "6px",
-						border: "1px solid #333",
-						cursor: "pointer",
-						display: "block",
-						margin: "6px 0",
-					}}
+					className="chat-image chat-image-block"
 					onClick={() => window.open(imgSrc, "_blank")}
 				/>,
 			);
