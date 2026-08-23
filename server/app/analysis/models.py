@@ -24,6 +24,8 @@ class AnalysisResult(Base):
     recommendation: Mapped[str] = mapped_column(Text, default="")
     model_used: Mapped[str] = mapped_column(String(64), nullable=False)
     inference_time_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    flagged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    flag_reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

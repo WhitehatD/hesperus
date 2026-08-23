@@ -31,14 +31,30 @@ Analyze the image and produce a JSON response with exactly these fields:
 {
   "description": "<2-3 sentence factual description of what is visible in the image>",
   "findings": "<specific observations related to the monitoring objective>",
-  "recommendation": "<one actionable recommendation based on what you see>"
+  "recommendation": "<one actionable recommendation based on what you see>",
+  "flagged": <true or false>,
+  "flag_reason": "<short reason this capture is notable, empty string if flagged is false>"
 }
 
 Rules:
 - Be specific and factual — describe what you actually see, not what you assume
 - If the image is blurry, dark, or unreadable, say so honestly
 - The recommendation should be practical and immediately actionable
-- Output ONLY the JSON, no markdown fences, no explanation"""
+- Output ONLY the JSON, no markdown fences, no explanation
+
+Flagging criteria (this decides whether a human gets pulled in):
+- flagged = true → the findings show something NOTABLE relative to the stated
+  objective: the watched-for event/condition is present, something changed or
+  moved compared to what the objective describes as normal, something looks
+  wrong/unsafe/anomalous, or the capture itself failed in a way that defeats
+  monitoring (fully black, fully blown out, lens obstructed).
+- flagged = false → routine: nothing notable, matches the expected baseline,
+  the watched-for condition is absent. Uneventful captures are the norm — do
+  NOT flag just because an image contains objects or people if that is exactly
+  what the objective describes as normal.
+- flag_reason must be ONE short sentence (max ~15 words) naming the specific
+  trigger, e.g. "package left on the doorstep" — never a restatement of the
+  whole description. Use "" when flagged is false."""
 
 
 async def analyze_image(
@@ -311,12 +327,16 @@ def _parse_analysis(raw_output: str) -> dict:
             "description": text[:500],
             "findings": text,
             "recommendation": "Unable to parse structured analysis — review image manually.",
+            "flagged": False,
+            "flag_reason": "",
         }
 
     return {
         "description": data.get("description", ""),
         "findings": data.get("findings", ""),
         "recommendation": data.get("recommendation", ""),
+        "flagged": bool(data.get("flagged", False)),
+        "flag_reason": data.get("flag_reason", "") or "",
     }
 
 

@@ -50,6 +50,14 @@ def _migrate_columns(conn):
         if "completed_at" not in cols:
             conn.execute(sa.text("ALTER TABLE schedule_tasks ADD COLUMN completed_at DATETIME"))
             print("[MIGRATE] Added schedule_tasks.completed_at")
+    if insp.has_table("analysis_results"):
+        cols = [c["name"] for c in insp.get_columns("analysis_results")]
+        if "flagged" not in cols:
+            conn.execute(sa.text("ALTER TABLE analysis_results ADD COLUMN flagged BOOLEAN DEFAULT 0 NOT NULL"))
+            print("[MIGRATE] Added analysis_results.flagged")
+        if "flag_reason" not in cols:
+            conn.execute(sa.text("ALTER TABLE analysis_results ADD COLUMN flag_reason TEXT DEFAULT ''"))
+            print("[MIGRATE] Added analysis_results.flag_reason")
 
 
 async def get_db():

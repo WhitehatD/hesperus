@@ -10,6 +10,7 @@ UC5  — Active schedule preserved (always immune to cleanup)
 UC6  — Modify schedule (re-plans + replaces tasks atomically)
 UC7  — Deactivate schedule via _tool_deactivate_schedule
 UC8  — cleanup_stale_schedules returns correct deleted count
+UC9  — list_schedules tool + world-state snapshot (active schedule + flagged findings)
 """
 
 import os
@@ -488,3 +489,101 @@ async def test_cleanup_returns_count(db_session):
             select(Schedule).where(Schedule.id == expired_id)
         )
         assert r.scalar_one_or_none() is None, f"Quick: schedule {expired_id} should be deleted"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UC9 — list_schedules tool (Problem 1: agent world-state grounding)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def test_tool_list_schedules_returns_active_and_inactive(db_session):
+    """
+    UC9: _tool_list_schedules must return every schedule (active + inactive)
+    with a status marker, giving the agent a defense-in-depth inventory
+    beyond the compact world-state snapshot.
+    """
+    from app.scheduler.service import create_schedule
+
+    active = await create_schedule(
+        db_session,
+        name="Morning patrol",
+        description="",
+        tasks=[{"time": "07:00", "action": "CAPTURE_IMAGE", "objective": "check the yard"}],
+    )
+    active.is_active = True
+
+    inactive = await create_schedule(
+        db_session,
+        name="Old night watch",
+        description="",
+        tasks=[{"time": "22:00", "action": "CAPTURE_IMAGE", "objective": "check the gate"}],
+    )
+    inactive.is_active = False
+
+    await db_session.commit()
+
+    with patch("app.db.database.async_session") as mock_sess_factory:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _fake_ctx():
+            yield db_session
+
+        mock_sess_factory.return_value = _fake_ctx()
+
+        from app.api.agent_routes import _tool_list_schedules
+        result = await _tool_list_schedules()
+
+    assert result["success"] is True
+    assert "2 schedule" in result["summary"]
+    assert f"#{active.id}" in result["detail"]
+    assert "ACTIVE" in result["detail"]
+    assert f"#{inactive.id}" in result["detail"]
+    assert "Morning patrol" in result["detail"]
+    assert "Old night watch" in result["detail"]
+
+
+async def test_build_world_state_snapshot_reports_active_schedule_and_flags(db_session):
+    """
+    Problem 1 + Problem 2 integration: the ambient world-state snapshot must
+    surface the active schedule and call out flagged recent findings.
+    """
+    from app.scheduler.service import create_schedule
+    from app.analysis.models import AnalysisResult
+
+    active = await create_schedule(
+        db_session,
+        name="Doorstep watch",
+        description="",
+        tasks=[{"time": "09:00", "action": "CAPTURE_IMAGE", "objective": "watch for deliveries"}],
+    )
+    active.is_active = True
+
+    db_session.add(AnalysisResult(
+        task_id=1,
+        image_path="a.jpg",
+        objective="watch for deliveries",
+        analysis="a package appeared on the porch",
+        recommendation="check it",
+        model_used="test",
+        inference_time_ms=5.0,
+        flagged=True,
+        flag_reason="package left on the doorstep",
+    ))
+    await db_session.commit()
+
+    with patch("app.db.database.async_session") as mock_sess_factory:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _fake_ctx():
+            yield db_session
+
+        mock_sess_factory.return_value = _fake_ctx()
+
+        from app.api.agent_routes import _build_world_state_snapshot
+        snapshot = await _build_world_state_snapshot()
+
+    assert f"#{active.id}" in snapshot
+    assert "Doorstep watch" in snapshot
+    assert "FLAGGED" in snapshot
+    assert "package left on the doorstep" in snapshot

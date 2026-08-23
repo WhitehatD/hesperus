@@ -162,6 +162,100 @@ async def _load_history(session_id: int, limit: int = 20) -> list[dict]:
 
     return history
 
+
+# ── World-state snapshot (ambient grounding, injected every chat turn) ──
+
+async def _build_world_state_snapshot() -> str:
+    """Assemble a compact, CURRENT snapshot of the system's state.
+
+    This is injected fresh into every chat call (see agent_chat), independent
+    of session_id, so the agent is always grounded in live reality even in a
+    brand-new chat session — no cross-session chat-history merging needed.
+    Kept intentionally compact (a few hundred tokens): it's grounding context,
+    not a data dump. Deep dives still go through tools (list_schedules,
+    analyze_latest, synthesize_schedule, get_board_status).
+    """
+    from sqlalchemy import func
+    from app.analysis.models import AnalysisResult
+    from app.scheduler.service import list_schedules as _list_schedules
+    from app.mqtt.client import get_board_snapshot
+    from app.db.database import async_session
+
+    lines: list[str] = []
+
+    # ── Board connectivity/power state ──
+    try:
+        board = get_board_snapshot()
+        state = board.get("state", "unknown")
+        lp_mode = board.get("lp_mode")
+        sleep_mode = board.get("sleep_mode")
+        power_bits = []
+        if lp_mode:
+            power_bits.append(f"lp_mode={lp_mode}")
+        if sleep_mode:
+            power_bits.append("sleeping")
+        power_str = f" ({', '.join(power_bits)})" if power_bits else ""
+        lines.append(f"Board: {state}{power_str}")
+    except Exception as e:
+        lines.append(f"Board: unknown (status lookup failed: {e})")
+
+    async with async_session() as db:
+        # ── Active schedule(s) ──
+        try:
+            schedules = await _list_schedules(db)
+        except Exception:
+            schedules = []
+        active = [s for s in schedules if s.is_active]
+        if active:
+            for s in active:
+                times = [t.time for t in s.tasks]
+                time_range = f"{times[0]}–{times[-1]}" if len(times) > 1 else (times[0] if times else "—")
+                objective = s.tasks[0].objective if s.tasks else ""
+                lines.append(
+                    f"Active schedule: #{s.id} \"{s.name}\" — {len(s.tasks)} task(s), {time_range}"
+                    + (f", objective: {objective}" if objective else "")
+                )
+        else:
+            lines.append("Active schedule: none")
+
+        if schedules:
+            lines.append(f"Total schedules in DB: {len(schedules)} (use list_schedules for the full list)")
+
+        # ── Recent captures (last 24h) + last few findings ──
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            count_result = await db.execute(
+                select(func.count(AnalysisResult.id)).where(AnalysisResult.created_at >= cutoff)
+            )
+            recent_count = count_result.scalar() or 0
+        except Exception:
+            recent_count = 0
+        lines.append(f"Captures in last 24h: {recent_count}")
+
+        try:
+            recent_result = await db.execute(
+                select(AnalysisResult).order_by(AnalysisResult.created_at.desc()).limit(5)
+            )
+            recent = list(recent_result.scalars().all())
+        except Exception:
+            recent = []
+
+        if recent:
+            flagged = [a for a in recent if a.flagged]
+            if flagged:
+                reasons = "; ".join(a.flag_reason or "notable" for a in flagged[:3])
+                lines.append(f"{len(flagged)} of the last {len(recent)} captures were FLAGGED: {reasons}")
+            lines.append("Recent findings (newest first):")
+            for a in recent:
+                flag_tag = " [FLAGGED]" if a.flagged else ""
+                findings = (a.analysis or "")[:140]
+                lines.append(f"  - task #{a.task_id}{flag_tag}: {findings}")
+        else:
+            lines.append("Recent findings: none yet")
+
+    return "\n".join(lines)
+
+
 # ── Tool Definitions (Claude tool_use format) ────────────
 
 AGENT_TOOLS = [
@@ -410,6 +504,22 @@ AGENT_TOOLS = [
             "required": ["date", "filename"],
         },
     },
+    {
+        "name": "list_schedules",
+        "description": (
+            "List ALL monitoring schedules in the database — id, name, active status, "
+            "task count, and time range — regardless of whether they're active. "
+            "Use when the user asks 'what schedules do I have', 'list my schedules', "
+            "'show all schedules', or needs to look further back than the schedules already "
+            "summarized in your context. The active schedule and a summary are already visible "
+            "to you at all times — only call this for a fuller inventory or to resolve an "
+            "ambiguous reference to an inactive/older schedule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -470,6 +580,19 @@ Other tools:
 - get_board_status: "status" / "health" / "firmware" / "uptime"
 - analyze_latest: ONLY when user explicitly says "last" / "previous" / "show the old analysis"
 - synthesize_schedule: "summarize all" / "conclusions" / "what did you learn"
+- list_schedules: "what schedules do I have" / "list schedules" / user refers to a schedule not
+  covered by the world-state snapshot below (e.g. an older/inactive one)
+
+## World state
+
+Below your instructions you will also receive a WORLD STATE block, refreshed on every message,
+showing the currently active schedule(s), recent capture counts, the last few analysis findings
+(with any FLAGGED as notable), and live board connectivity/power state. ALWAYS use it FIRST to
+resolve ambiguous references ("that schedule", "the active one", "the morning monitor", "stop it")
+before asking the user to repeat an ID — the active schedule's id is right there. If a flagged
+finding is relevant to what the user is asking, mention it. Only call list_schedules or
+analyze_latest when the world state doesn't have enough detail (e.g. an inactive schedule from
+days ago, or the user wants the FULL finding text).
 
 ## Rules
 
@@ -478,6 +601,7 @@ Other tools:
 3. CONCISE: The streaming pipeline shows progress. Don't narrate what will happen. After results arrive, give a 1-2 sentence human summary.
 4. MULTI-TOOL: You can call multiple tools in one response when appropriate.
 5. NO EXCUSES: Every user intent maps to a tool. Execute it.
+6. GROUND YOURSELF: Use the WORLD STATE block to resolve "which schedule"/"the active one" instead of guessing or asking — it's always current.
 """
 
 
@@ -545,9 +669,19 @@ async def agent_chat(request: Request):
             )
             tools_schema = _agent_tools_openai_format()
 
+            # ── World-state snapshot: fresh grounding for EVERY chat call, not
+            # just once — this is what lets a brand-new session (or a mid-session
+            # ambiguous reference like "that schedule") resolve against current
+            # reality instead of guessing. See _build_world_state_snapshot().
+            try:
+                world_state = await _build_world_state_snapshot()
+            except Exception as _e:
+                world_state = f"(world state unavailable: {_e})"
+            system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n## WORLD STATE (live, refreshed this turn)\n\n{world_state}"
+
             # ── Multi-turn agentic loop ───────────────────────────────────────
             MAX_AGENT_TURNS = 8
-            messages_list = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + list(history)
+            messages_list = [{"role": "system", "content": system_prompt}] + list(history)
             loop_count = 0
             final_reply_parts: list[str] = []
             _t_plan_start = time.time()
@@ -711,6 +845,7 @@ def _tool_label(name: str, inp: dict) -> str:
         "analyze_latest": "Fetching latest AI analysis...",
         "get_board_status": "Checking board status...",
         "synthesize_schedule": "Synthesizing schedule...",
+        "list_schedules": "Listing schedules...",
     }
     return labels.get(name, f"Executing {name}...")
 
@@ -846,6 +981,8 @@ async def _capture_pipeline(
                 recommendation=analysis_result.get("recommendation", ""),
                 model_used=analysis_result.get("model_used", model_key),
                 inference_time_ms=analysis_result.get("inference_time_ms", 0),
+                flagged=analysis_result.get("flagged", False),
+                flag_reason=analysis_result.get("flag_reason", ""),
             )
             db.add(db_row)
             await db.commit()
@@ -1108,6 +1245,8 @@ async def _execute_tool(name: str, inp: dict, session_id: str, model_key: str = 
         return await _tool_delete_schedule(inp)
     elif name == "delete_image":
         return await _tool_delete_image(inp)
+    elif name == "list_schedules":
+        return await _tool_list_schedules()
     else:
         return {"success": False, "summary": f"Unknown tool: {name}", "detail": ""}
 
@@ -1512,17 +1651,28 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
     # kept for benchmark/manual model_key selection, plain aggregation last.
     if settings.openrouter_api_key or settings.anthropic_api_key:
         entries = []
+        flagged_count = 0
         for a in reversed(analyses):  # chronological order
+            flag_tag = ""
+            if a.flagged:
+                flagged_count += 1
+                flag_tag = f" [FLAGGED: {a.flag_reason}]" if a.flag_reason else " [FLAGGED]"
             entries.append(
-                f"Task #{a.task_id} | {a.objective}\n"
+                f"Task #{a.task_id}{flag_tag} | {a.objective}\n"
                 f"Findings: {a.analysis}\n"
                 f"Recommendation: {a.recommendation}"
             )
 
+        flagged_note = (
+            f"\n\n{flagged_count} of {len(entries)} observations were FLAGGED as notable — "
+            "weight these more heavily in your synthesis and call them out explicitly."
+            if flagged_count else ""
+        )
         synthesis_prompt = (
             "You are analyzing a series of visual monitoring observations from an IoT camera over time.\n\n"
-            "Observations (chronological):\n\n" +
+            "Observations (chronological, [FLAGGED] marks ones the analysis engine judged notable):\n\n" +
             "\n---\n".join(entries) +
+            flagged_note +
             "\n\nSynthesize these observations into:\n"
             "1. **Pattern**: What patterns or trends do you see across observations?\n"
             "2. **Changes**: What changed between observations?\n"
@@ -1649,6 +1799,37 @@ async def _tool_delete_image(inp: dict) -> dict:
         "success": True,
         "summary": f"Deleted {filename}",
         "detail": f"**Image deleted:** `{filename}` ({date})",
+    }
+
+
+async def _tool_list_schedules() -> dict:
+    """Return all schedules (active and inactive) — defense-in-depth alongside
+    the ambient world-state snapshot, for when the agent needs to dig deeper
+    than the compact summary (e.g. an older/inactive schedule)."""
+    from app.db.database import async_session
+    from app.scheduler.service import list_schedules as _list_schedules
+
+    async with async_session() as db:
+        schedules = await _list_schedules(db)
+
+    if not schedules:
+        return {
+            "success": True,
+            "summary": "No schedules found",
+            "detail": "No schedules exist yet. Create one with a monitoring request.",
+        }
+
+    lines = ["**Schedules:**\n"]
+    for s in schedules:
+        times = [t.time for t in s.tasks]
+        time_range = f"{times[0]}–{times[-1]}" if len(times) > 1 else (times[0] if times else "—")
+        status = "ACTIVE" if s.is_active else "inactive"
+        lines.append(f"- **#{s.id}** \"{s.name}\" — {status}, {len(s.tasks)} task(s), {time_range}")
+
+    return {
+        "success": True,
+        "summary": f"{len(schedules)} schedule(s)",
+        "detail": "\n".join(lines),
     }
 
 

@@ -619,6 +619,8 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
                 recommendation=analysis.get("recommendation", ""),
                 model_used=analysis.get("model_used", model_key),
                 inference_time_ms=analysis.get("inference_time_ms", 0),
+                flagged=analysis.get("flagged", False),
+                flag_reason=analysis.get("flag_reason", ""),
             )
             db.add(db_result)
             await db.commit()
@@ -635,6 +637,8 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
             "recommendation": analysis.get("recommendation", ""),
             "model": analysis.get("model_used", model_key),
             "inference_ms": analysis.get("inference_time_ms", 0),
+            "flagged": analysis.get("flagged", False),
+            "flag_reason": analysis.get("flag_reason", ""),
             "timestamp": int(time.time()),
         }
         mqtt_client.publish(settings.mqtt_topic_dashboard_analysis, json.dumps(analysis_msg))
@@ -658,6 +662,8 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
                     recommendation="Check AI backend configuration (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or vLLM endpoint).",
                     model_used="error",
                     inference_time_ms=0,
+                    flagged=True,
+                    flag_reason=f"Analysis backend error: {err_msg[:100]}",
                 )
                 db.add(fallback)
                 await db.commit()
@@ -672,6 +678,8 @@ async def _run_analysis(task_id: int, image_path: str, date_dir: str, filename: 
                 "recommendation": "Check AI backend configuration.",
                 "model": "error",
                 "inference_ms": 0,
+                "flagged": True,
+                "flag_reason": f"Analysis backend error: {err_msg[:100]}",
                 "timestamp": int(time.time()),
             }))
         except Exception as fallback_err:
@@ -723,6 +731,8 @@ async def list_images(board_id: str | None = None, db: AsyncSession = Depends(ge
                     "recommendation": row.recommendation,
                     "model": row.model_used,
                     "inference_ms": row.inference_time_ms,
+                    "flagged": row.flagged,
+                    "flag_reason": row.flag_reason,
                 }
     for img in images:
         img["analysis"] = analysis_map.get(img["task_id"])
@@ -798,6 +808,8 @@ async def get_analysis(task_id: int, db: AsyncSession = Depends(get_db)):
         "recommendation": analysis.recommendation,
         "model_used": analysis.model_used,
         "inference_time_ms": analysis.inference_time_ms,
+        "flagged": analysis.flagged,
+        "flag_reason": analysis.flag_reason,
         "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
     }
 
@@ -824,6 +836,8 @@ async def list_analyses(board_id: str | None = None, limit: int = 50, db: AsyncS
                 "model_used": a.model_used,
                 "inference_time_ms": a.inference_time_ms,
                 "image_path": a.image_path,
+                "flagged": a.flagged,
+                "flag_reason": a.flag_reason,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
             }
             for a in analyses
