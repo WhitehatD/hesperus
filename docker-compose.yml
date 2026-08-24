@@ -25,6 +25,15 @@ services:
     container_name: hesperus-server
     ports:
       - "8000:8000"
+    # Local-dev-only hot reload. --reload-dir scopes the file-watcher to just
+    # the bind-mounted source (./server/app -> /app/app below) — NOT the
+    # server_data volume mounted at /app/data, which holds the SQLite DB and
+    # uploads. Without that scope, every capture/schedule/energy-telemetry
+    # write is a "file changed" event: uvicorn kills and respawns the worker,
+    # tearing down the MQTT connection (and everything else in-process —
+    # command queue, board snapshot) on every single write. The prod image
+    # (server/Dockerfile) ships with no --reload at all.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "app"]
     # Optional: server/.env is a LOCAL-DEV convenience file and is gitignored
     # (copy server/.env.example to create it). It must stay optional — prod
     # merges this file with docker-compose.prod.yml (see infra/deploy.sh), and

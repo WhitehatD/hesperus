@@ -50,6 +50,13 @@ services:
   server:
     image: ${SERVER_IMAGE:-ghcr.io/whitehatd/hesperus-server:latest}
     build: !reset null
+    # `command:` merges as a full array replace, not append — with no
+    # override here, prod would otherwise inherit docker-compose.yml's
+    # dev-only `--reload --reload-dir app` verbatim (confirmed via
+    # `docker compose -f docker-compose.yml -f docker-compose.prod.yml
+    # config server` before adding this line). Reset it so prod runs
+    # exactly the image's own CMD (server/Dockerfile — no reload, ever).
+    command: !reset null
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     volumes: !override
