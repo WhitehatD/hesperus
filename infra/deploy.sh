@@ -99,4 +99,37 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-o
 echo "== Reloading mosquitto config (SIGHUP, no restart, no dropped clients) =="
 docker compose -f docker-compose.yml -f docker-compose.prod.yml kill -s HUP mosquitto || true
 
+# SIGHUP tells mosquitto to re-read its config files — but a Docker
+# single-FILE bind mount (acl/passwd below) pins to the INODE that existed
+# when the container was created, not the host path. `git reset --hard`
+# replaces a changed file via unlink+rename (a new inode), so the host path
+# starts pointing at fresh content while the container's mount keeps
+# serving the orphaned old inode forever — SIGHUP faithfully re-reads that
+# same stale file over and over. Discovered 2026-08-24: an ACL fix (granting
+# hesperus-board write on dashboard/#) sat correctly on disk and was
+# "reloaded" every deploy for who knows how many deploys, silently inert
+# the whole time — mosquitto dropped every dashboard/* publish with no
+# error surfaced to the publisher, so the dashboard's gallery/schedule
+# panels never updated live and nothing in any log said why.
+#
+# Fix: verify actual convergence instead of trusting the signal fired.
+# Compare host content against what the running container currently serves;
+# if SIGHUP didn't actually pick up the new content (stale inode), force a
+# scoped recreate — this is the one case mosquitto SHOULD restart, since a
+# stale ACL/passwd is actively wrong, not merely momentarily behind.
+mosquitto_cid="$(docker compose -f docker-compose.yml -f docker-compose.prod.yml ps -q mosquitto)"
+if [ -n "$mosquitto_cid" ]; then
+  drifted=0
+  for f in acl passwd; do
+    if ! diff -q "mosquitto/$f" <(docker exec "$mosquitto_cid" cat "/mosquitto/config/$f" 2>/dev/null) >/dev/null 2>&1; then
+      echo "!! mosquitto/$f drifted from the running container (stale bind-mount inode) — will recreate"
+      drifted=1
+    fi
+  done
+  if [ "$drifted" = "1" ]; then
+    echo "== Recreating mosquitto to pick up current config (drops board connections briefly; unavoidable, config was actively stale) =="
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --no-deps mosquitto
+  fi
+fi
+
 echo "== Hesperus deploy complete =="
