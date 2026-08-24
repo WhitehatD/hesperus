@@ -1,29 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { PlusIcon, XIcon } from "./Icons";
-
-/* ── Block-based message model ───────────────────────────── */
-
-type Block =
-	| { type: "thinking"; text: string }
-	| {
-			type: "step";
-			id: string;
-			label: string;
-			status: "running" | "done" | "error";
-			summary?: string;
-			imageUrl?: string;
-	  }
-	| { type: "text"; text: string }
-	| { type: "error"; text: string };
-
-interface Message {
-	role: "user" | "assistant";
-	text?: string;
-	blocks: Block[];
-	streaming?: boolean;
-}
+import styles from "./AgentChat.module.css";
+import type { Block } from "./BlockRenderer";
+import BlockRenderer from "./BlockRenderer";
+import SessionTabs, { type DbSession } from "./SessionTabs";
 
 /* Server-persisted block shape (ChatMessage.blocks_json — see
  * _mirror() in agent_routes.py). Snake_case, wire-format field names,
@@ -37,6 +18,13 @@ interface RawPersistedBlock {
 	summary?: string;
 	image_url?: string;
 	text?: string;
+}
+
+interface Message {
+	role: "user" | "assistant";
+	text?: string;
+	blocks: Block[];
+	streaming?: boolean;
 }
 
 /**
@@ -70,13 +58,6 @@ function reconstructBlocks(
 		}
 		return { type: "text", text: b.text || "" };
 	});
-}
-
-interface DbSession {
-	id: number;
-	name: string;
-	boardId: string;
-	createdAt: string;
 }
 
 interface AgentChatProps {
@@ -187,9 +168,7 @@ export default function AgentChat({
 	const deleteSession = async (id: number) => {
 		if (sessions.length <= 1) return;
 		try {
-			await fetch(`${apiBase}/api/agent/sessions/${id}`, {
-				method: "DELETE",
-			});
+			await fetch(`${apiBase}/api/agent/sessions/${id}`, { method: "DELETE" });
 			setSessions((prev) => prev.filter((s) => s.id !== id));
 			if (activeId === id) {
 				const remaining = sessions.filter((s) => s.id !== id);
@@ -265,7 +244,7 @@ export default function AgentChat({
 		}
 
 		setInput("");
-		await sendMessage(msg, activeId!);
+		await sendMessage(msg, activeId as number);
 	};
 
 	const sendMessage = async (msg: string, sessionId: number) => {
@@ -275,21 +254,14 @@ export default function AgentChat({
 		abortControllerRef.current = controller;
 
 		const userMsg: Message = { role: "user", text: msg, blocks: [] };
-		const botMsg: Message = {
-			role: "assistant",
-			blocks: [],
-			streaming: true,
-		};
+		const botMsg: Message = { role: "assistant", blocks: [], streaming: true };
 		setMessages((prev) => [...prev, userMsg, botMsg]);
 
 		try {
 			const res = await fetch(`${apiBase}/api/agent/chat`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					message: msg,
-					sessionId: sessionId,
-				}),
+				body: JSON.stringify({ message: msg, sessionId }),
 				signal: controller.signal,
 			});
 
@@ -330,15 +302,9 @@ export default function AgentChat({
 									(b) => b.type === "thinking",
 								);
 								if (thinkIdx >= 0) {
-									bot.blocks[thinkIdx] = {
-										type: "thinking",
-										text: data.text,
-									};
+									bot.blocks[thinkIdx] = { type: "thinking", text: data.text };
 								} else {
-									bot.blocks.push({
-										type: "thinking",
-										text: data.text,
-									});
+									bot.blocks.push({ type: "thinking", text: data.text });
 								}
 							} else if (event === "tool_call") {
 								bot.blocks.push({
@@ -379,15 +345,9 @@ export default function AgentChat({
 									};
 								}
 							} else if (event === "reply") {
-								bot.blocks.push({
-									type: "text",
-									text: data.text,
-								});
+								bot.blocks.push({ type: "text", text: data.text });
 							} else if (event === "error") {
-								bot.blocks.push({
-									type: "error",
-									text: data.text,
-								});
+								bot.blocks.push({ type: "error", text: data.text });
 								bot.streaming = false;
 							} else if (event === "done") {
 								bot.streaming = false;
@@ -408,10 +368,7 @@ export default function AgentChat({
 				const updated = [...prev];
 				const last = updated[updated.length - 1];
 				if (last?.streaming) {
-					updated[updated.length - 1] = {
-						...last,
-						streaming: false,
-					};
+					updated[updated.length - 1] = { ...last, streaming: false };
 				}
 				return updated;
 			});
@@ -455,58 +412,38 @@ export default function AgentChat({
 	};
 
 	return (
-		<div className={`agent-chat ${fullSize ? "agent-chat-full" : ""}`}>
-			{/* Session tabs */}
-			<div className="session-tabs">
-				{sessions.map((s) => (
-					<button
-						key={s.id}
-						className={`session-tab ${s.id === activeId ? "active" : ""}`}
-						onClick={() => switchSession(s.id)}
-					>
-						<span className="session-tab-name">{s.name}</span>
-						{sessions.length > 1 && (
-							<span
-								className="session-tab-close"
-								onClick={(e) => {
-									e.stopPropagation();
-									deleteSession(s.id);
-								}}
-							>
-								<XIcon size={10} />
-							</span>
-						)}
-					</button>
-				))}
-				<button
-					className="session-tab session-tab-add"
-					onClick={createSession}
-					title="New session"
-				>
-					<PlusIcon size={12} />
-				</button>
-			</div>
+		<div
+			className={`${styles.agentChat} ${fullSize ? styles.agentChatFull : ""}`}
+		>
+			<SessionTabs
+				sessions={sessions}
+				activeId={activeId}
+				fullSize={fullSize}
+				onSwitch={switchSession}
+				onDelete={deleteSession}
+				onCreate={createSession}
+			/>
 
-			{/* Messages */}
-			<div className="agent-messages">
+			<div className={styles.agentMessages}>
 				{loading && messages.length === 0 && (
-					<div className="agent-welcome">
-						<div className="agent-typing">
-							<span className="typing-dot" />
-							<span className="typing-dot" />
-							<span className="typing-dot" />
+					<div className={styles.agentWelcome}>
+						<div className={styles.agentTyping}>
+							<span className={styles.typingDot} />
+							<span className={styles.typingDot} />
+							<span className={styles.typingDot} />
 						</div>
 					</div>
 				)}
 
 				{!loading && messages.length === 0 && (
-					<div className="agent-welcome">
+					<div className={styles.agentWelcome}>
 						<p>What would you like to monitor?</p>
-						<div className="agent-quick-actions">
+						<div className={styles.agentQuickActions}>
 							{QUICK_ACTIONS.map((qa) => (
 								<button
+									type="button"
 									key={qa}
-									className="agent-quick-btn"
+									className={styles.agentQuickBtn}
 									onClick={() => handleSend(qa)}
 								>
 									{qa}
@@ -517,19 +454,24 @@ export default function AgentChat({
 				)}
 
 				{messages.map((msg, i) => (
-					<div key={i} className={`agent-msg agent-msg-${msg.role}`}>
+					<div
+						key={i}
+						className={`${styles.agentMsg} ${msg.role === "user" ? styles.agentMsgUser : styles.agentMsgAssistant}`}
+					>
 						{msg.role === "user" ? (
-							<div className="agent-bubble user-bubble">{msg.text}</div>
+							<div className={`${styles.agentBubble} ${styles.userBubble}`}>
+								{msg.text}
+							</div>
 						) : (
-							<div className="agent-bubble bot-bubble">
+							<div className={`${styles.agentBubble} ${styles.botBubble}`}>
 								{msg.blocks.map((block, bi) => (
 									<BlockRenderer key={`${i}-${bi}`} block={block} />
 								))}
 								{msg.streaming && msg.blocks.length === 0 && (
-									<div className="agent-typing">
-										<span className="typing-dot" />
-										<span className="typing-dot" />
-										<span className="typing-dot" />
+									<div className={styles.agentTyping}>
+										<span className={styles.typingDot} />
+										<span className={styles.typingDot} />
+										<span className={styles.typingDot} />
 									</div>
 								)}
 							</div>
@@ -539,11 +481,10 @@ export default function AgentChat({
 				<div ref={messagesEndRef} />
 			</div>
 
-			{/* Input */}
-			<div className="agent-input-area">
+			<div className={styles.agentInputArea}>
 				<textarea
 					ref={textareaRef}
-					className="agent-textarea"
+					className={styles.agentTextarea}
 					placeholder="Ask the agent... (/clear to reset)"
 					value={input}
 					onChange={(e) => setInput(e.target.value)}
@@ -552,7 +493,8 @@ export default function AgentChat({
 					disabled={isStreaming}
 				/>
 				<button
-					className="agent-send-btn"
+					type="button"
+					className={styles.agentSendBtn}
 					onClick={() => (isStreaming ? stopStreaming() : handleSend())}
 					disabled={!isStreaming && !input.trim()}
 					title={isStreaming ? "Stop" : "Send"}
@@ -588,169 +530,4 @@ export default function AgentChat({
 			</div>
 		</div>
 	);
-}
-
-/* ── Block Renderer ─────────────────────────────────────── */
-
-function BlockRenderer({ block }: { block: Block }) {
-	if (block.type === "thinking") {
-		return (
-			<div className="block-thinking">
-				<span className="thinking-icon">&bull;</span>
-				<span className="thinking-text">{block.text}</span>
-			</div>
-		);
-	}
-
-	if (block.type === "step") {
-		return (
-			<div className={`block-step step-${block.status}`}>
-				<span className="step-icon">
-					{block.status === "running"
-						? "\u23F3"
-						: block.status === "done"
-							? "\u2705"
-							: "\u274C"}
-				</span>
-				<div className="step-content">
-					<span className="step-label">
-						{block.status === "done" && block.summary
-							? block.summary
-							: block.label}
-					</span>
-					{block.status === "done" && block.imageUrl && (
-						<img
-							src={block.imageUrl}
-							alt="Captured"
-							className="chat-image"
-							onClick={() => window.open(block.imageUrl, "_blank")}
-						/>
-					)}
-				</div>
-			</div>
-		);
-	}
-
-	if (block.type === "error") {
-		return (
-			<div className="block-error">
-				<MarkdownContent text={block.text} />
-			</div>
-		);
-	}
-
-	return (
-		<div className="block-text">
-			<MarkdownContent text={block.text} />
-		</div>
-	);
-}
-
-/* ── Markdown Renderer ──────────────────────────────────── */
-
-function MarkdownContent({ text }: { text: string }) {
-	const parts = parseMarkdown(text);
-	return <div className="agent-reply">{parts}</div>;
-}
-
-function parseMarkdown(text: string): React.ReactNode[] {
-	const nodes: React.ReactNode[] = [];
-	const lines = text.split("\n");
-	let tableRows: string[][] = [];
-
-	const flushTable = () => {
-		if (tableRows.length === 0) return;
-		const rows = tableRows.filter(
-			(row) => !row.every((cell) => /^-+$/.test(cell.trim())),
-		);
-		nodes.push(
-			<table key={`t-${nodes.length}`} className="agent-table">
-				<tbody>
-					{rows.map((row, ri) => (
-						<tr key={ri}>
-							{row.map((cell, ci) => (
-								<td key={ci}>{inlineFormat(cell.trim())}</td>
-							))}
-						</tr>
-					))}
-				</tbody>
-			</table>,
-		);
-		tableRows = [];
-	};
-
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
-
-		if (line.startsWith("|") && line.endsWith("|")) {
-			const cells = line
-				.slice(1, -1)
-				.split("|")
-				.map((c) => c.trim());
-			tableRows.push(cells);
-			continue;
-		}
-
-		flushTable();
-
-		// Markdown image: ![alt](url)
-		const imgMatch = line.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
-		if (imgMatch) {
-			const imgSrc = imgMatch[2];
-			nodes.push(
-				<img
-					key={`img-${i}`}
-					src={imgSrc}
-					alt={imgMatch[1] || "Captured"}
-					className="chat-image chat-image-block"
-					onClick={() => window.open(imgSrc, "_blank")}
-				/>,
-			);
-			continue;
-		}
-
-		if (line.trim() === "") {
-			nodes.push(<br key={`br-${i}`} />);
-		} else {
-			nodes.push(
-				<span key={`l-${i}`}>
-					{inlineFormat(line)}
-					{i < lines.length - 1 && <br />}
-				</span>,
-			);
-		}
-	}
-
-	flushTable();
-	return nodes;
-}
-
-function inlineFormat(text: string): React.ReactNode[] {
-	const parts: React.ReactNode[] = [];
-	const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)/g;
-	let lastIndex = 0;
-	let match: RegExpExecArray | null = regex.exec(text);
-
-	while (match !== null) {
-		if (match.index > lastIndex) {
-			parts.push(text.slice(lastIndex, match.index));
-		}
-
-		if (match[2]) {
-			parts.push(<strong key={`b-${match.index}`}>{match[2]}</strong>);
-		} else if (match[3]) {
-			parts.push(<em key={`i-${match.index}`}>{match[3]}</em>);
-		} else if (match[4]) {
-			parts.push(<code key={`c-${match.index}`}>{match[4]}</code>);
-		}
-
-		lastIndex = regex.lastIndex;
-		match = regex.exec(text);
-	}
-
-	if (lastIndex < text.length) {
-		parts.push(text.slice(lastIndex));
-	}
-
-	return parts.length > 0 ? parts : [text];
 }

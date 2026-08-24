@@ -1,0 +1,15 @@
+/* Maps lib/format.ts's getStatusVariant() output to a color. Shared by
+ * BoardCard's telemetry value and BoardHeader's status chip — both display
+ * the board's raw MQTT status string colored by the same rule. */
+.idle {
+	color: var(--text-secondary);
+}
+.active {
+	color: var(--emerald);
+}
+.error {
+	color: var(--rose);
+}
+.ota {
+	color: var(--amber);
+}

@@ -6,7 +6,7 @@
 #                        topics: it must publish status/telemetry AND
 #                        subscribe to commands.
 #
-#   hesperus-dashboard — the browser client (dashboard/app/hooks/useMQTT.ts).
+#   hesperus-dashboard — the browser client (dashboard/hooks/useMQTT.ts).
 #                        READ ONLY. Its credentials are compiled into the
 #                        public JS bundle and are therefore effectively
 #                        public — anyone can read them out of devtools. That

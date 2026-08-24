@@ -65,7 +65,7 @@ rm -f "$DEPLOY_DIR/mosquitto/passwd"
 docker run --rm --user root -v "$DEPLOY_DIR/mosquitto:/mosquitto/config" eclipse-mosquitto:2 \
   mosquitto_passwd -b -c /mosquitto/config/passwd "$MQTT_USERNAME" "$MQTT_PASSWORD"
 
-# Second identity: the browser dashboard (dashboard/app/hooks/useMQTT.ts).
+# Second identity: the browser dashboard (dashboard/hooks/useMQTT.ts).
 # Separate user because its credentials ship inside the public JS bundle —
 # mosquitto/acl restricts it to `topic read`, so a leak can only watch
 # telemetry, never publish a board command. Giving the browser the board's

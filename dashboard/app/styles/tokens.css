@@ -1,0 +1,102 @@
+/* Design tokens — the Linear-grade system established and approved by the
+ * user in the previous session. Carried over verbatim; not re-litigated by
+ * this rewrite. Global (CSS custom properties must cascade across every
+ * CSS Module), imported once in app/layout.tsx. */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+	/* Surfaces — flat, near-black, elevation felt via 2-4% lightness steps
+	   rather than borders/shadows. */
+	--bg-primary: #08090a;
+	--bg-secondary: #0d0e10;
+	--bg-elevated: #121315;
+	--bg-surface: rgba(255, 255, 255, 0.026);
+	--bg-surface-hover: rgba(255, 255, 255, 0.045);
+
+	/* Text — 3 real steps. --text-secondary is the workhorse: most UI text
+	   (labels, body copy, secondary values) uses it, not --text-primary. */
+	--text-primary: #f7f8f8;
+	--text-secondary: #8a8f98;
+	--text-tertiary: #62666d;
+	/* Disabled-only. Real UI copy should never sit this dark. */
+	--text-muted: #4a4d53;
+
+	--accent: #5e6ad2;
+	--accent-hover: #6e79d6;
+	--accent-glow: rgba(94, 106, 210, 0.14);
+	--emerald: #4cb782;
+	--emerald-glow: rgba(76, 183, 130, 0.1);
+	--amber: #f2c94c;
+	--amber-glow: rgba(242, 201, 76, 0.1);
+	--rose: #eb5757;
+	--rose-glow: rgba(235, 87, 87, 0.1);
+
+	--border: rgba(255, 255, 255, 0.055);
+	--border-hover: rgba(255, 255, 255, 0.09);
+	/* Focused-input border — one step brighter than --border-hover. */
+	--border-strong: rgba(255, 255, 255, 0.13);
+	--border-accent: rgba(94, 106, 210, 0.35);
+
+	/* Secondary hue — used ONLY for log-level / power-state differentiation
+	   (e.g. the "sleep" power chip), never as a general UI accent. Kept
+	   visually distinct from --accent so the two don't get confused. */
+	--indigo: #818cf8;
+	--indigo-glow: rgba(129, 140, 248, 0.15);
+
+	/* Log console tag colors — one token per log source so the console stays
+	   scannable at a glance. --log-ota intentionally reuses --amber rather
+	   than a near-duplicate hex. */
+	--log-mqtt: #a78bfa;
+	--log-camera: #f472b6;
+	--log-upload: #38bdf8;
+	--log-ota: var(--amber);
+	--log-system: #94a3b8;
+
+	/* True black backdrop for letterboxed captures/photos — deliberately NOT
+	   --bg-primary so images always sit on pure black regardless of theme. */
+	--media-bg: #000;
+
+	--font-sans:
+		"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	--font-mono: "JetBrains Mono", "Cascadia Code", monospace;
+
+	/* Radii — collapsed downward. --radius-xl is reserved for surfaces that
+	   genuinely float (modal, lightbox); everything else lives at xs–lg. */
+	--radius-xs: 4px;
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 12px;
+
+	/* Spacing scale — an 8px rhythm. Not every existing rule has been
+	   rewritten onto this literally, but anything touched in this pass
+	   snaps onto it. */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 24px;
+	--space-6: 32px;
+
+	/* Type scale — small and explicit. --text-base (13px) is the body
+	   default; most UI text lives at base or sm. */
+	--text-xs: 11px;
+	--text-sm: 12px;
+	--text-base: 13px;
+	--text-md: 14px;
+	--text-lg: 16px;
+
+	/* Shadows — reserved for things that genuinely float. Cards/panels at
+	   rest use a border instead. --shadow-glow is a focus/hover
+	   micro-interaction only, never resting-state decoration. */
+	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.25);
+	--shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
+	--shadow-glow: 0 0 0 3px var(--accent-glow);
+
+	--transition-fast: 100ms cubic-bezier(0.25, 0.1, 0.25, 1);
+	--transition-base: 140ms cubic-bezier(0.25, 0.1, 0.25, 1);
+	--transition-slow: 240ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}

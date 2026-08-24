@@ -1,0 +1,219 @@
+/* Shared button primitives — imported by any component that needs a
+ * button, instead of each one re-declaring its own variant. Cross-cutting
+ * on purpose: there is no <Button> React component in this codebase (each
+ * call site is a plain <button>/<a> with one of these classes), so the
+ * shared surface is the CSS module, not a component wrapper. */
+
+.btn {
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+	color: var(--text-primary);
+	padding: 0 var(--space-3);
+	height: 30px;
+	border-radius: var(--radius-sm);
+	font-family: var(--font-sans);
+	font-weight: 500;
+	font-size: var(--text-sm);
+	cursor: pointer;
+	transition:
+		background var(--transition-fast),
+		border-color var(--transition-fast);
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	flex: 1;
+	text-decoration: none;
+	line-height: 1.4;
+}
+
+.btn:hover:not(:disabled) {
+	background: var(--bg-surface-hover);
+	border-color: var(--border-hover);
+}
+
+.btn:active:not(:disabled) {
+	transform: scale(0.98);
+}
+
+.btn:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+.btnPrimary {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #fff;
+}
+
+.btnPrimary:hover:not(:disabled) {
+	background: var(--accent-hover);
+	border-color: var(--accent-hover);
+}
+
+.btnSecondary {
+	background: var(--bg-surface);
+	border-color: var(--border);
+}
+
+.btnSecondary:hover:not(:disabled) {
+	background: var(--bg-surface-hover);
+	border-color: var(--border-hover);
+}
+
+.btnDanger {
+	background: var(--rose-glow);
+	border-color: rgba(235, 87, 87, 0.25);
+	color: var(--rose);
+}
+
+.btnDanger:hover:not(:disabled) {
+	background: rgba(235, 87, 87, 0.16);
+	border-color: rgba(235, 87, 87, 0.4);
+}
+
+.btnExplore {
+	width: 100%;
+	justify-content: center;
+	text-decoration: none;
+	font-weight: 500;
+	letter-spacing: 0;
+}
+
+.btnExplore .arrow {
+	transition: transform var(--transition-fast);
+}
+
+.btnExplore:hover .arrow {
+	transform: translateX(3px);
+}
+
+.btnText {
+	background: none;
+	border: none;
+	color: var(--accent);
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	cursor: pointer;
+	opacity: 0.8;
+	font-weight: 500;
+	transition: opacity var(--transition-fast);
+	padding: 0;
+}
+
+.btnText:hover {
+	opacity: 1;
+}
+
+.btnBack {
+	background: var(--bg-surface);
+	color: var(--text-secondary);
+	border: 1px solid var(--border);
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	border-radius: var(--radius-sm);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	transition:
+		background var(--transition-fast),
+		border-color var(--transition-fast);
+	margin-right: var(--space-3);
+	flex-shrink: 0;
+}
+
+.btnBack:hover {
+	background: var(--bg-surface-hover);
+	color: var(--text-primary);
+	border-color: var(--border-hover);
+}
+
+/* ── Board-header action buttons (Capture/Ping/Setup/Refresh) ── */
+.btnAction {
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	height: 28px;
+	padding: 0 var(--space-3);
+	border-radius: var(--radius-sm);
+	border: 1px solid var(--border);
+	background: var(--bg-surface);
+	color: var(--text-secondary);
+	cursor: pointer;
+	transition:
+		background var(--transition-fast),
+		border-color var(--transition-fast),
+		color var(--transition-fast);
+}
+
+.btnAction:hover:not(:disabled) {
+	background: var(--bg-surface-hover);
+	border-color: var(--border-hover);
+	color: var(--text-primary);
+}
+
+.btnAction:active:not(:disabled) {
+	transform: scale(0.96);
+}
+
+.btnAction:disabled {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+.btnAction.accent {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #fff;
+}
+
+.btnAction.accent:hover:not(:disabled) {
+	background: var(--accent-hover);
+	border-color: var(--accent-hover);
+}
+
+.btnAction.active {
+	border-color: var(--accent);
+	color: var(--accent);
+}
+
+/* ── Small inline actions inside a schedule card (Activate/Edit/Delete) ── */
+.btnSchedAction {
+	padding: 2px 8px;
+	font-size: var(--text-xs);
+	border-radius: var(--radius-xs);
+	border: 1px solid var(--border);
+	background: transparent;
+	color: var(--text-secondary);
+	cursor: pointer;
+	transition:
+		color 0.15s,
+		border-color 0.15s;
+}
+.btnSchedAction:hover {
+	color: var(--text-primary);
+	border-color: var(--text-primary);
+}
+.btnSchedAction.accent {
+	color: var(--accent);
+	border-color: var(--accent);
+}
+.btnSchedAction.accent:hover {
+	background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.btnSchedAction.danger {
+	color: var(--rose);
+	border-color: var(--rose);
+}
+.btnSchedAction.danger:hover {
+	background: var(--rose-glow);
+}
+.btnSchedAction:disabled {
+	opacity: 0.35;
+	cursor: not-allowed;
+}

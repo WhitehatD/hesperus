@@ -1,0 +1,94 @@
+/* Reset, base typography, global scrollbar theming, and the handful of
+ * animation keyframes reused across genuinely unrelated feature areas
+ * (fade-in/scale-in appear in the lightbox, gallery, log console and agent
+ * chat blocks; pulse-dot appears in the fleet connection badge AND the
+ * agent chat thinking indicator). Everything feature-specific lives in that
+ * feature's own *.module.css instead. */
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+/* Dark-theme scrollbars everywhere by default, so no scrollable container
+ * (lightbox, chat panels, tab content, future additions) can accidentally
+ * show the OS's light/white scrollbar against this dark theme. Module-
+ * scoped overrides (e.g. the console body's thinner variant) take
+ * precedence via normal specificity where wanted. */
+html {
+	scrollbar-color: var(--border-hover) transparent;
+	scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+	background: var(--border-hover);
+	border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+	background: var(--text-muted);
+}
+
+body {
+	background: var(--bg-primary);
+	color: var(--text-primary);
+	font-family: var(--font-sans);
+	font-size: var(--text-base);
+	line-height: 1.5;
+	min-height: 100vh;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+/* Page shell — shared by the fleet page and the board detail page (the
+ * latter overrides most of it via its own .agentLayout, which composes
+ * on top of this class). */
+.app-container {
+	max-width: 1440px;
+	margin: 0 auto;
+	padding: var(--space-5) var(--space-5);
+}
+
+@media (max-width: 768px) {
+	.app-container {
+		padding: var(--space-4);
+	}
+}
+
+@keyframes fade-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@keyframes scale-in {
+	from {
+		opacity: 0;
+		transform: scale(0.95);
+	}
+	to {
+		opacity: 1;
+		transform: scale(1);
+	}
+}
+
+@keyframes pulse-dot {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.5;
+	}
+}

@@ -1,0 +1,65 @@
+/* Success/failure feedback next to the control that triggered an action
+ * (activate/deactivate a schedule, capture, power mode, ...) — the log
+ * console alone is a separate tab the user may not be looking at.
+ * .actionFeedbackAnchor is a zero-footprint span always present in the
+ * flex row; the actual message is position:absolute INSIDE it, so it
+ * floats over the layout instead of inserting a flex sibling — appearing/
+ * disappearing must never reflow the buttons next to it. */
+.actionFeedbackAnchor {
+	position: relative;
+	display: inline-block;
+	width: 0;
+	height: 0;
+	overflow: visible;
+}
+
+.actionFeedback {
+	position: absolute;
+	top: calc(100% + 6px);
+	z-index: 20;
+	display: inline-flex;
+	align-items: flex-start;
+	gap: 5px;
+	padding: 4px 9px;
+	border-radius: var(--radius-sm);
+	background: var(--bg-elevated);
+	border: 1px solid var(--border-hover);
+	box-shadow: var(--shadow-md);
+	font-size: var(--text-xs);
+	font-weight: 500;
+	max-width: min(280px, calc(100vw - 32px));
+	white-space: normal;
+	animation: fade-in-up 0.12s ease-out;
+}
+
+.actionFeedback svg {
+	flex-shrink: 0;
+	margin-top: 1px;
+}
+
+.left {
+	left: 0;
+}
+
+.right {
+	right: 0;
+}
+
+.success {
+	color: var(--emerald);
+}
+
+.error {
+	color: var(--rose);
+}
+
+@keyframes fade-in-up {
+	from {
+		opacity: 0;
+		transform: translateY(-2px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}

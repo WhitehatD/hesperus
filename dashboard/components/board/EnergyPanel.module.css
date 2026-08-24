@@ -1,0 +1,298 @@
+.energyPanel {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 12px;
+}
+
+.energyLabel {
+	font-size: var(--text-sm);
+	font-weight: 600;
+	color: var(--text-secondary);
+}
+
+.energyEmpty {
+	text-align: center;
+	padding: var(--space-5) var(--space-4);
+	color: var(--text-secondary);
+	font-size: var(--text-base);
+	line-height: 1.5;
+}
+
+.energySummaryRow {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-2);
+}
+
+.energyStat {
+	flex: 1 1 90px;
+	min-width: 90px;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	padding: var(--space-2) 4px;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	gap: 2px;
+}
+
+.energyStatValue {
+	font-family: var(--font-mono);
+	font-size: var(--text-md);
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.energyStatLabel {
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.energySectionTitle {
+	font-size: var(--text-xs);
+	font-weight: 700;
+	color: var(--text-tertiary);
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	margin-top: 2px;
+}
+
+.energySectionNote {
+	font-weight: 400;
+	text-transform: none;
+	letter-spacing: 0;
+	color: var(--text-muted);
+}
+
+.energySectionNote code {
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+}
+
+.energySectionSub {
+	font-size: var(--text-xs);
+	line-height: 1.45;
+	color: var(--text-tertiary);
+	margin: -2px 0 2px;
+}
+
+.energySectionSub code {
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+}
+
+.energyHelp {
+	font-size: var(--text-xs);
+	line-height: 1.35;
+	color: var(--text-tertiary);
+	text-align: center;
+}
+
+/* ── Power-mode segmented control (Active / PS-REST / Sleep) ── */
+.powerModeControl {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 0 0 14px;
+	border: 0;
+	padding: 0;
+	min-inline-size: 0;
+}
+
+.powerModeControl > .energyLabel {
+	padding: 0;
+	margin-bottom: 2px;
+}
+
+.powerModeSegments {
+	display: flex;
+	gap: 4px;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 3px;
+}
+
+.powerSeg {
+	flex: 1 1 0;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 1px;
+	padding: 7px 4px;
+	border: none;
+	border-radius: calc(var(--radius-sm) - 2px);
+	background: transparent;
+	color: var(--text-secondary);
+	cursor: pointer;
+	transition:
+		background 0.12s ease,
+		color 0.12s ease;
+}
+
+.powerSeg:hover:not(:disabled):not(.active) {
+	background: var(--bg-surface-hover);
+	color: var(--text-primary);
+}
+
+.powerSeg.active {
+	background: var(--accent);
+	color: white;
+}
+
+.powerSeg:disabled {
+	cursor: default;
+}
+
+.powerSegLabel {
+	font-size: var(--text-sm);
+	font-weight: 600;
+}
+
+.powerSegCurrent {
+	font-size: var(--text-xs);
+	opacity: 0.85;
+	font-family: var(--font-mono);
+}
+
+.powerModeDesc {
+	font-size: var(--text-xs);
+	line-height: 1.45;
+	color: var(--text-secondary);
+}
+
+.powerModeWarn {
+	font-size: var(--text-xs);
+	line-height: 1.4;
+	color: var(--amber);
+	background: var(--amber-glow);
+	border: 1px solid color-mix(in srgb, var(--amber) 25%, transparent);
+	border-radius: var(--radius-sm);
+	padding: 6px 8px;
+}
+
+.energyActionsRow {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin-bottom: 8px;
+}
+
+.rqLabel {
+	margin: 0;
+}
+
+/* Stacked duty-cycle bar */
+.energyDutyBar {
+	display: flex;
+	height: 10px;
+	border-radius: 5px;
+	overflow: hidden;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+}
+
+.energyDutySeg {
+	height: 100%;
+	transition: width var(--transition-base);
+}
+
+.energyDutyRest {
+	background: var(--emerald);
+}
+
+.energyDutyCap {
+	background: var(--accent);
+}
+
+.energyDutyOther {
+	background: var(--amber);
+}
+
+.energyDutyLegend {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.energyLegendItem {
+	font-size: var(--text-xs);
+	color: var(--text-secondary);
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	flex-wrap: wrap;
+}
+
+.energyLegendItem::before {
+	content: "";
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	border-radius: 2px;
+	flex: 0 0 auto;
+}
+
+.energyLegendHelp {
+	flex-basis: 100%;
+	margin-left: 12px;
+	font-size: var(--text-xs);
+	line-height: 1.35;
+	color: var(--text-tertiary);
+}
+
+.energyLegendRest::before {
+	background: var(--emerald);
+}
+.energyLegendCap::before {
+	background: var(--accent);
+}
+.energyLegendOther::before {
+	background: var(--amber);
+}
+
+/* Projection grid */
+.energyProjectionGrid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+	gap: 6px;
+}
+
+.energyProjItem {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	padding: 8px 6px;
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	gap: 2px;
+}
+
+.energyProjValue {
+	font-family: var(--font-mono);
+	font-size: var(--text-md);
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.energyProjValue.energySavings {
+	color: var(--emerald);
+}
+
+.energyProjLabel {
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	text-align: center;
+}

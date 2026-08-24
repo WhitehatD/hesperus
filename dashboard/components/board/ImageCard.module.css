@@ -1,0 +1,77 @@
+.imageCard {
+	border-radius: var(--radius-sm);
+	overflow: hidden;
+	border: 1px solid var(--border);
+	background: var(--bg-elevated);
+	cursor: pointer;
+	position: relative;
+	transition:
+		border-color var(--transition-fast),
+		transform var(--transition-fast);
+}
+
+.imageCard:hover {
+	border-color: var(--border-hover);
+	transform: scale(1.01);
+}
+
+/* A live-arriving image (pushed via the dashboard/images/new MQTT topic)
+ * flashes this state for a few seconds so it reads as an EVENT, not just
+ * a row that silently appeared on the next re-render. */
+.isNew {
+	border-color: var(--border-accent);
+	box-shadow: var(--shadow-glow);
+}
+
+.newBadge {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 2;
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	color: var(--accent);
+	background: var(--accent-glow);
+	border: 1px solid var(--border-accent);
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+}
+
+.analysisIndicator {
+	position: absolute;
+	top: 8px;
+	left: 8px;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--text-tertiary);
+	z-index: 2;
+}
+
+.imageWrapper {
+	aspect-ratio: 4 / 3;
+	background: var(--media-bg);
+	overflow: hidden;
+}
+
+.imageWrapper img {
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+}
+
+.imageMeta {
+	padding: 4px 8px;
+	display: flex;
+	justify-content: space-between;
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+	font-family: var(--font-mono);
+}
+
+.imageTime {
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+}

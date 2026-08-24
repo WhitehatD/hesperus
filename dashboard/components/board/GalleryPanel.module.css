@@ -1,0 +1,20 @@
+.sidebarGallery {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: var(--space-2);
+	padding: var(--space-2);
+}
+
+.emptyStateSm {
+	grid-column: 1 / -1;
+	text-align: center;
+	padding: var(--space-5) var(--space-4);
+	color: var(--text-muted);
+	font-size: var(--text-sm);
+}
+
+@media (max-width: 380px) {
+	.sidebarGallery {
+		grid-template-columns: 1fr;
+	}
+}

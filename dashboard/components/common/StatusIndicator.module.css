@@ -1,0 +1,76 @@
+.statusIndicator {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	padding: 3px 8px;
+	border-radius: var(--radius-sm);
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+}
+
+.dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+}
+
+.online {
+	color: var(--emerald);
+	border-color: rgba(76, 183, 130, 0.2);
+}
+
+.online .dot {
+	background: var(--emerald);
+	box-shadow: 0 0 6px var(--emerald);
+	animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.sleeping {
+	color: var(--amber);
+	border-color: rgba(242, 201, 76, 0.2);
+}
+
+.sleeping .dot {
+	background: var(--amber);
+	animation: pulse-sleep 3s ease-in-out infinite;
+}
+
+@keyframes pulse-sleep {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.3;
+	}
+}
+
+.offline {
+	color: var(--text-tertiary);
+}
+
+.offline .dot {
+	background: var(--text-muted);
+}
+
+@keyframes pulse-glow {
+	0%,
+	100% {
+		box-shadow: 0 0 4px rgba(76, 183, 130, 0.3);
+	}
+	50% {
+		box-shadow: 0 0 8px rgba(76, 183, 130, 0.6);
+	}
+}
+
+/* Tiny uppercase tag distinguishing this indicator from an adjacent chip
+ * (e.g. NET vs PWR in the board-detail header) when `tag` is passed. */
+.statusClusterTag {
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	color: var(--text-tertiary);
+	margin-right: 3px;
+}

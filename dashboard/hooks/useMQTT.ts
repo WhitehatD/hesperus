@@ -2,23 +2,11 @@
 
 import mqtt from "mqtt";
 import { useEffect, useRef, useState } from "react";
+import type { BoardTelemetry } from "@/lib/types";
 
-export interface BoardTelemetry {
-	id: string;
-	name: string;
-	firmware: string | null;
-	lastSeen: number | null;
-	status: string;
-	captures: number;
-	lastImageSize: number | null;
-	lastLatencyMs: number | null;
-	isOnline: boolean;
-	uptimeSeconds: number | null;
-	wifiRssi: number | null;
-}
-
-type MessageHandler = (
+export type MessageHandler = (
 	topic: string,
+	// biome-ignore lint/suspicious/noExplicitAny: MQTT payloads are arbitrary JSON from firmware/server, shape varies per topic
 	data: Record<string, any>,
 	boardId: string,
 ) => void;
@@ -33,6 +21,7 @@ function getMqttUrl(): string {
 	);
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: see MessageHandler
 function extractBoardId(topic: string, data: Record<string, any>): string {
 	let boardId = "stm32";
 	if (topic.startsWith("device/")) {
@@ -85,6 +74,7 @@ export function useMQTT(topics: string[], onMessage?: MessageHandler) {
 
 		client.on("message", (topic, payload) => {
 			const raw = payload.toString();
+			// biome-ignore lint/suspicious/noExplicitAny: see MessageHandler
 			let data: Record<string, any>;
 			try {
 				data = JSON.parse(raw);
@@ -109,11 +99,7 @@ export function useMQTT(topics: string[], onMessage?: MessageHandler) {
 export function useBoardTracker(topics: string[]) {
 	const [boards, setBoards] = useState<Record<string, BoardTelemetry>>({});
 
-	const handleMessage = (
-		topic: string,
-		data: Record<string, any>,
-		boardId: string,
-	) => {
+	const handleMessage: MessageHandler = (topic, data, boardId) => {
 		setBoards((prev) => {
 			const curr = prev[boardId] || {
 				id: boardId,
@@ -154,12 +140,13 @@ export function useBoardTracker(topics: string[]) {
 				const next = { ...prev };
 				const now = Date.now();
 				for (const id in next) {
+					const board = next[id];
 					if (
-						next[id].isOnline &&
-						next[id].lastSeen &&
-						now - next[id].lastSeen! > OFFLINE_TIMEOUT_MS
+						board.isOnline &&
+						board.lastSeen &&
+						now - board.lastSeen > OFFLINE_TIMEOUT_MS
 					) {
-						next[id] = { ...next[id], isOnline: false };
+						next[id] = { ...board, isOnline: false };
 						changed = true;
 					}
 				}

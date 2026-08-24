@@ -1,0 +1,46 @@
+.overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 1100;
+	background: rgba(0, 0, 0, 0.85);
+	backdrop-filter: blur(8px);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: var(--space-5);
+	animation: fade-in 0.2s ease-out;
+}
+
+.dialog {
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xl);
+	box-shadow: var(--shadow-lg);
+	padding: var(--space-5);
+	width: 360px;
+	max-width: 95vw;
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-3);
+	animation: scale-in 0.2s ease-out;
+}
+
+.title {
+	font-size: var(--text-md);
+	font-weight: 510;
+	color: var(--text-primary);
+}
+
+.message {
+	font-size: var(--text-base);
+	color: var(--text-secondary);
+	line-height: 1.5;
+}
+
+.actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	padding-top: 8px;
+	border-top: 1px solid var(--border);
+}

@@ -1,0 +1,109 @@
+.blockThinking {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 0;
+	color: var(--text-muted);
+	font-size: var(--text-sm);
+	font-style: italic;
+	animation: fade-in 0.2s ease-out;
+}
+
+.thinkingIcon {
+	color: var(--accent);
+	animation: pulse-dot 1s ease-in-out infinite;
+}
+
+.blockStep {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	padding: 6px 0;
+	font-size: var(--text-sm);
+	font-family: var(--font-mono);
+	animation: fade-in 0.15s ease-out;
+	border-left: 2px solid transparent;
+	padding-left: 8px;
+	margin-left: -8px;
+}
+
+.blockStep + .blockStep {
+	border-top: 1px solid var(--border);
+	padding-top: 8px;
+}
+
+.stepIcon {
+	font-size: var(--text-base);
+	flex-shrink: 0;
+	margin-top: 1px;
+	display: inline-flex;
+	align-items: center;
+}
+
+/* Running-step indicator — a real spinner instead of a bare "hourglass"
+ * emoji, matching the same task-spinner pattern already used for a
+ * schedule task's running state (see ScheduleCard.module.css). */
+.spinner {
+	display: inline-block;
+	width: 11px;
+	height: 11px;
+	border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+	border-top-color: var(--accent);
+	border-radius: 50%;
+	animation: step-spin 0.8s linear infinite;
+}
+
+@keyframes step-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.stepContent {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	min-width: 0;
+	flex: 1;
+}
+
+.stepLabel {
+	color: var(--text-secondary);
+	overflow-wrap: break-word;
+}
+
+.stepRunning {
+	border-left-color: var(--accent);
+}
+
+.stepRunning .stepLabel {
+	color: var(--accent);
+}
+
+.stepDone {
+	border-left-color: var(--emerald);
+}
+
+.stepDone .stepLabel {
+	color: var(--emerald);
+}
+
+.stepError {
+	border-left-color: var(--rose);
+}
+
+.stepError .stepLabel {
+	color: var(--rose);
+}
+
+.blockText {
+	padding: 8px 0;
+	border-top: 1px solid var(--border);
+	margin-top: 4px;
+	animation: fade-in 0.2s ease-out;
+}
+
+.blockError {
+	padding: 8px 0;
+	color: var(--rose);
+}

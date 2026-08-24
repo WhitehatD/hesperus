@@ -1,0 +1,134 @@
+.agentLayout {
+	display: grid;
+	/* "upload" is a real named row (not an afterthought): the bar is a
+	   conditionally-rendered grid child in the JSX between <header> and
+	   <main> with no position/z-index tricks, so it needs an explicit
+	   auto-height row here or CSS Grid's default auto-placement would drop
+	   it into an unrelated implicit cell. Empty/no-content rows collapse
+	   to 0 height, so this costs nothing when no upload is in flight. */
+	grid-template-areas:
+		"header header"
+		"upload upload"
+		"main   panel";
+	grid-template-columns: 1fr 1fr;
+	grid-template-rows: auto auto 1fr;
+	gap: 0;
+	/* 100vh fallback for browsers without dvh support (older iOS Safari);
+	   the @supports block below wins where dvh is supported and accounts
+	   for mobile browser chrome instead of clipping content underneath it. */
+	height: 100vh;
+	max-width: none;
+	padding: 0;
+	overflow: hidden;
+}
+
+@supports (height: 100dvh) {
+	.agentLayout {
+		height: 100dvh;
+	}
+}
+
+.agentMain {
+	grid-area: main;
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+}
+
+.agentPanel {
+	grid-area: panel;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	background: var(--bg-secondary);
+}
+
+.panelUpper {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	border-bottom: 1px solid var(--border);
+}
+
+.panelTabs {
+	display: flex;
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-secondary);
+	flex-shrink: 0;
+}
+
+.panelTab {
+	flex: 1;
+	height: 36px;
+	padding: 0 var(--space-3);
+	background: none;
+	border: none;
+	border-bottom: 2px solid transparent;
+	color: var(--text-tertiary);
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	cursor: pointer;
+	transition:
+		color var(--transition-fast),
+		background var(--transition-fast);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+}
+
+.panelTab:hover {
+	color: var(--text-secondary);
+	background: var(--bg-surface);
+}
+
+.panelTab.active {
+	color: var(--accent);
+	border-bottom-color: var(--accent);
+}
+
+.tabCount {
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	background: var(--bg-surface);
+	padding: 1px 6px;
+	border-radius: var(--radius-xs);
+	color: var(--text-tertiary);
+}
+
+.panelTab.active .tabCount {
+	background: var(--accent-glow);
+	color: var(--accent);
+}
+
+.panelContent {
+	flex: 1;
+	overflow-y: auto;
+}
+
+@media (max-width: 1024px) {
+	.agentLayout {
+		grid-template-areas:
+			"header"
+			"upload"
+			"main"
+			"panel";
+		grid-template-columns: 1fr;
+		grid-template-rows: auto auto 1fr 340px;
+	}
+}
+
+@media (max-width: 768px) {
+	.agentLayout {
+		grid-template-rows: auto auto 1fr 300px;
+	}
+}
+
+@media (max-width: 380px) {
+	.agentLayout {
+		grid-template-rows: auto auto 1fr 270px;
+	}
+}

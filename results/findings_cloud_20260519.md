@@ -104,7 +104,7 @@ For a thesis writeup, the conclusion is straightforward: **gemini-3-flash-previe
 
 ## Methodology notes
 
-- All calls land on the production VPS, so latency includes network RTT from `vpn.maastrichtuniversity.nl` ↔ `89.167.11.147` over the public internet (typically 20–60 ms).
+- All calls land on the production VPS, so latency includes network RTT from the university VPN client to `89.167.11.147` over the public internet (typically 20–60 ms).
 - Server-side image normalization (`Image.open → convert RGB → JPEG q92`) is done before any cloud call so palette-mode JPEGs in MIT Indoor Scenes don't bias the comparison.
 - The runner is sequential per the response order in the output log; a future concurrent runner would reduce wall-clock time but would not change per-call latency (which is what we measure).
 - Latencies measured **server-side**: from the moment the request hits FastAPI to the moment the response is ready. The runner-side `time_total` was not used because it would include the client-server upload time, which varies with VPN routing.
@@ -112,11 +112,11 @@ For a thesis writeup, the conclusion is straightforward: **gemini-3-flash-previe
 
 ## Pending work (Ernis phase)
 
-The same 90-call benchmark will be re-run against the open-weight models hosted on Ernis (Maastricht University GPU server). Once the SSH tunnel is up:
+The same 90-call benchmark will be re-run against the open-weight models hosted on Ernis (a self-hosted GPU server, VPN-gated). Once the SSH tunnel is up:
 
 ```bash
 # Terminal 1: open the tunnel (must stay running)
-ssh -N -L 8001:localhost:8001 I6365661@ernis.dacs.maastrichtuniversity.nl
+ssh -N -L 8001:localhost:8001 <your-account>@<ernis-hostname>   # VPN required
 
 # Terminal 2: run the full 4-way benchmark
 python scripts/run_benchmark.py --server http://89.167.11.147:8000

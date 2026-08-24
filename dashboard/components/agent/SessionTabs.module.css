@@ -1,0 +1,80 @@
+.sessionTabs {
+	display: flex;
+	background: var(--bg-elevated);
+	border-bottom: 1px solid var(--border);
+	overflow-x: auto;
+	flex-shrink: 0;
+}
+
+.sessionTabs::-webkit-scrollbar {
+	height: 0;
+}
+
+.sessionTab {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 12px;
+	background: none;
+	border: none;
+	border-bottom: 2px solid transparent;
+	border-right: 1px solid var(--border);
+	color: var(--text-tertiary);
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	cursor: pointer;
+	transition:
+		color var(--transition-fast),
+		background var(--transition-fast);
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+
+.sessionTab:hover {
+	color: var(--text-secondary);
+	background: var(--bg-surface);
+}
+
+.sessionTab.active {
+	color: var(--text-primary);
+	border-bottom-color: var(--accent);
+	background: var(--bg-primary);
+}
+
+.sessionTabName {
+	max-width: 100px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.sessionTabClose {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	color: var(--text-muted);
+	cursor: pointer;
+	padding: 0 2px;
+	line-height: 1;
+}
+
+.sessionTabClose:hover {
+	color: var(--rose);
+}
+
+.sessionTabAdd {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 6px 10px;
+	color: var(--text-muted);
+	border-right: none;
+}
+
+.sessionTabAdd:hover {
+	color: var(--accent);
+}
+
+/* Full-size session tabs (board detail page) */
+.sessionTabs.full {
+	padding: 0 4px;
+}

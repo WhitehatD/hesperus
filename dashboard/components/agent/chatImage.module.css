@@ -1,0 +1,17 @@
+/* Inline preview images in chat — tool-result captures (BlockRenderer) and
+ * markdown ![]() images (Markdown) both route through this so no component
+ * hardcodes a border color. */
+.chatImage {
+	max-width: 280px;
+	border-radius: var(--radius-xs);
+	border: 1px solid var(--border-hover);
+	cursor: pointer;
+	transition: border-color var(--transition-fast);
+}
+.chatImage:hover {
+	border-color: var(--accent);
+}
+.chatImageBlock {
+	display: block;
+	margin: 6px 0;
+}

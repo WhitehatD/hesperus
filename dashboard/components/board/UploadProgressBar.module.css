@@ -1,0 +1,34 @@
+.wrap {
+	grid-area: upload;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-width: 0;
+	padding: 4px var(--space-4);
+	background: var(--bg-secondary);
+	border-bottom: 1px solid var(--border);
+}
+
+.track {
+	flex: 1;
+	max-width: 240px;
+	height: 2px;
+	background: var(--bg-surface);
+	border-radius: 1px;
+	overflow: hidden;
+}
+
+.fill {
+	height: 100%;
+	background: var(--accent);
+	border-radius: 1px;
+	transition: width 0.2s ease;
+}
+
+.label {
+	font-size: var(--text-xs);
+	color: var(--text-tertiary);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}

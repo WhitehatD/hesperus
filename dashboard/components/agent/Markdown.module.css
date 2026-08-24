@@ -1,0 +1,35 @@
+.agentReply {
+	color: var(--text-secondary);
+}
+.agentReply strong {
+	color: var(--text-primary);
+}
+
+.agentReply code {
+	background: var(--bg-surface);
+	padding: 1px 5px;
+	border-radius: var(--radius-xs);
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+}
+
+.agentTable {
+	width: 100%;
+	table-layout: fixed;
+	border-collapse: collapse;
+	margin: 6px 0;
+	font-size: var(--text-xs);
+}
+
+.agentTable td {
+	padding: 4px 8px;
+	border: 1px solid var(--border);
+	word-break: break-word;
+	overflow-wrap: anywhere;
+}
+
+.agentTable tr:first-child td {
+	font-weight: 600;
+	color: var(--text-primary);
+	background: var(--bg-surface);
+}

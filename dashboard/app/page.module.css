@@ -1,0 +1,60 @@
+.boardsGrid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr));
+	gap: var(--space-3);
+}
+
+.emptyState {
+	text-align: center;
+	padding: var(--space-6) var(--space-4);
+	color: var(--text-tertiary);
+	border: 1px dashed var(--border);
+	border-radius: var(--radius-lg);
+	font-size: var(--text-sm);
+	grid-column: 1 / -1;
+}
+
+.loadingCard {
+	padding: 24px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-lg);
+	background: var(--bg-elevated);
+	grid-column: 1 / -1;
+}
+
+.skeleton {
+	background: linear-gradient(
+		90deg,
+		var(--bg-surface) 25%,
+		var(--bg-surface-hover) 50%,
+		var(--bg-surface) 75%
+	);
+	background-size: 200% 100%;
+	animation: shimmer 1.5s ease-in-out infinite;
+	border-radius: var(--radius-sm);
+}
+
+@keyframes shimmer {
+	0% {
+		background-position: 200% 0;
+	}
+	100% {
+		background-position: -200% 0;
+	}
+}
+
+.skeletonLine {
+	height: 12px;
+	margin-bottom: 12px;
+	border-radius: 4px;
+}
+
+.skeletonLine:first-child {
+	width: 60%;
+}
+.skeletonLine:nth-child(2) {
+	width: 80%;
+}
+.skeletonLine:nth-child(3) {
+	width: 40%;
+}

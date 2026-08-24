@@ -13,21 +13,21 @@ export interface AsyncResourceState<T> {
 /**
  * One shared async-resource pattern for the whole dashboard: {data, loading, error, refetch}.
  *
- * Every ad-hoc `fetch(...).then(...).catch(console.error)` / `.catch(() => {})` in this
- * codebase silently swallowed failures — on a hotspot with real multi-second dead-air
- * windows that reads as "the app is broken" with zero indication why. This hook makes
- * failure a first-class, visible state instead.
+ * Every ad-hoc `fetch(...).then(...).catch(console.error)` / `.catch(() => {})` used to
+ * silently swallow failures — on a hotspot with real multi-second dead-air windows that
+ * reads as "the app is broken" with zero indication why. This hook makes failure a
+ * first-class, visible state instead.
  *
  * `fetcher` receives the resource's current data so merge-with-previous logic (e.g.
  * "keep completed_at from the last good snapshot if this response is stale") can be
  * expressed without a second ref/effect — it must reject/throw on failure, never swallow.
- * `fetcher` identity is the effect's dependency, same convention as this file's other
- * useCallback-wrapped fetch functions (and useMQTT.ts's topicKey pattern): wrap the
- * fetcher passed in with useCallback and list its real deps there like a normal effect.
+ * `fetcher` identity is the effect's dependency, same convention as useMQTT.ts's topicKey
+ * pattern: wrap the fetcher passed in with useCallback and list its real deps there like
+ * a normal effect.
  *
- * Guards against out-of-order responses (a slow earlier request resolving after a
- * faster later one) with a request-id check, so a manual retry or a poll tick can never
- * clobber fresher data with stale data.
+ * Guards against out-of-order responses (a slow earlier request resolving after a faster
+ * later one) with a request-id check, so a manual retry or a poll tick can never clobber
+ * fresher data with stale data.
  */
 export function useAsyncResource<T>(
 	fetcher: (current: T | null) => Promise<T>,
