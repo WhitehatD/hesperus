@@ -36,6 +36,16 @@ class ChatMessage(Base):
     session_id: Mapped[int] = mapped_column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False)  # "user" or "assistant"
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 2026-08-24: JSON-serialized list of the SAME block shape the dashboard's
+    # live SSE stream renders (step/text/error, matching AgentChat.tsx's
+    # Block type) — NULL for user messages and for assistant rows written
+    # before this column existed. Without this, a page refresh only ever saw
+    # `content` (the model's own terse "1-2 sentence" follow-up per the
+    # system prompt's CONCISE rule), never the rich capture/analysis/image
+    # cards the user actually watched stream in live — those blocks only
+    # ever existed in the browser's in-memory React state. See
+    # _build_assistant_blocks() in agent_routes.py for how this is built.
+    blocks_json: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")

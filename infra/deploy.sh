@@ -74,4 +74,29 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml pull --quiet ser
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate --no-deps server dashboard
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
 
+# mosquitto itself is never restarted (see above — it holds live MQTT
+# session state), but that means an mosquitto/acl or mosquitto/passwd change
+# on disk was previously NEVER applied by this pipeline at all: the broker
+# only reads those files at process start. Discovered 2026-08-24 when an ACL
+# fix (granting hesperus-board write on dashboard/#) sat on disk, correctly
+# bind-mounted, silently inert, because nothing ever told the running broker
+# to re-read it.
+#
+# Fix: mosquitto reloads its password file and ACL file on SIGHUP WITHOUT
+# dropping existing client connections (documented mosquitto behavior —
+# SIGHUP is a config reload, not a restart; only listener-level changes need
+# a full restart). Send it unconditionally on every deploy rather than
+# gating on "did acl/passwd change this run" — a git-diff-based gate can't
+# reliably tell whether the CURRENTLY RUNNING deploy.sh process is the old
+# or new version of itself (a script mid-execution keeps running from its
+# already-buffered content even after `git reset --hard` rewrites the file
+# on disk), so a conditional check could silently skip the one deploy that
+# actually needed it. Unconditional SIGHUP has no such failure mode: safe
+# and idempotent every time, whether or not anything changed. If mosquitto
+# isn't up yet (first-ever deploy) this fails harmlessly and is ignored,
+# since `docker compose up -d --remove-orphans` above already started it
+# fresh with current files in that case.
+echo "== Reloading mosquitto config (SIGHUP, no restart, no dropped clients) =="
+docker compose -f docker-compose.yml -f docker-compose.prod.yml kill -s HUP mosquitto || true
+
 echo "== Hesperus deploy complete =="

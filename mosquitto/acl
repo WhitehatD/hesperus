@@ -23,6 +23,23 @@
 
 user hesperus-board
 topic readwrite device/stm32/#
+# 2026-08-24: the FastAPI server also connects as hesperus-board, and it is
+# the ONLY publisher of the dashboard/* feeds (routes.py publishes
+# dashboard/images/new + dashboard/analysis/new; scheduler/notify.py
+# publishes dashboard/schedules/updated). Without a write grant here every
+# one of those publishes was SILENTLY DENIED by the broker — mosquitto drops
+# an ACL-denied PUBLISH without returning an error to the publisher, and
+# paho/fastapi-mqtt therefore logs nothing, so the server looked like it was
+# publishing fine. Net effect: the gallery, the analysis panel, the schedule
+# list and the power state never updated live; only a manual page refresh
+# (REST, unaffected by MQTT ACLs) showed new data.
+#
+# This is the exact mirror of the 2026-08-19 bug documented in the
+# hesperus-dashboard section below: that one denied the browser's SUBSCRIBE,
+# this one denied the server's PUBLISH. Fixing the read side alone left the
+# feed dead from the other end. When adding a new dashboard/* topic, grant
+# BOTH: write here for the server, read below for the browser.
+topic write dashboard/#
 # $SYS read is required by the container healthcheck, which does
 # `mosquitto_sub -t '$SYS/#' -C 1 -W 3` (docker-compose.prod.yml). Without
 # this the subscribe is silently denied, no message ever arrives, the 3s

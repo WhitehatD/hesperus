@@ -24,6 +24,53 @@ interface Message {
 	streaming?: boolean;
 }
 
+/* Server-persisted block shape (ChatMessage.blocks_json — see
+ * _mirror() in agent_routes.py). Snake_case, wire-format field names,
+ * matching the raw SSE event data rather than the client's Block type —
+ * image_url is a relative API path, not yet prefixed with apiBase. */
+interface RawPersistedBlock {
+	type: "step" | "text" | "error";
+	id?: string;
+	label?: string;
+	status?: "running" | "done" | "error";
+	summary?: string;
+	image_url?: string;
+	text?: string;
+}
+
+/**
+ * Reconstruct the same Block[] shape the live SSE stream renders, from a
+ * persisted ChatMessage row. Sessions created before blocks_json existed
+ * (or a row that failed to persist blocks for some reason) have no
+ * `blocks` — fall back to wrapping the plain content string, same as
+ * before this fix, so old history doesn't break.
+ */
+function reconstructBlocks(
+	raw: RawPersistedBlock[] | null | undefined,
+	content: string,
+	apiBase: string,
+): Block[] {
+	if (!raw || raw.length === 0) {
+		return [{ type: "text", text: content }];
+	}
+	return raw.map((b): Block => {
+		if (b.type === "step") {
+			return {
+				type: "step",
+				id: b.id || "",
+				label: b.label || "",
+				status: b.status || "done",
+				summary: b.summary,
+				imageUrl: b.image_url ? `${apiBase}${b.image_url}` : undefined,
+			};
+		}
+		if (b.type === "error") {
+			return { type: "error", text: b.text || "" };
+		}
+		return { type: "text", text: b.text || "" };
+	});
+}
+
 interface DbSession {
 	id: number;
 	name: string;
@@ -94,14 +141,18 @@ export default function AgentChat({
 				setMessages([]);
 				return;
 			}
-			const data: { role: string; content: string }[] = await res.json();
+			const data: {
+				role: string;
+				content: string;
+				blocks?: RawPersistedBlock[] | null;
+			}[] = await res.json();
 			setMessages(
 				data.map((m) => ({
 					role: m.role as "user" | "assistant",
 					text: m.role === "user" ? m.content : undefined,
 					blocks:
 						m.role === "assistant"
-							? [{ type: "text" as const, text: m.content }]
+							? reconstructBlocks(m.blocks, m.content, apiBase)
 							: [],
 				})),
 			);

@@ -36,7 +36,21 @@ from sqlalchemy.orm import selectinload
 
 from app.agent.models import ChatMessage, ChatSession
 from app.config import settings
-from app.db.database import async_session
+# This module-level `async_session` binds a snapshot at first-import time and
+# is now UNUSED by every function body in this file on purpose — each one
+# re-imports it locally instead (see _persist_message's docstring for why: a
+# module-level import can't see app.db.database.async_session being
+# re-pointed later, e.g. by test fixtures). This was a real, previously
+# undetected gap fixed 2026-08-24: the whole session/message CRUD surface
+# (list_sessions, create_session, delete_session, get_session_messages,
+# clear_session_messages, _load_history, _persist_message,
+# _capture_sequence_pipeline) used to rely on this stale binding and had
+# simply never been exercised with a real session_id by any test before then.
+# Kept here (rather than removed) only because some existing tests patch
+# `app.api.agent_routes.async_session` by name — removing it turns those into
+# AttributeErrors. Do not add a NEW `async_session()` call site that relies on
+# this name; always import it locally in the function that needs it.
+from app.db.database import async_session  # noqa: F401 — kept for test patch compatibility, see above
 from app.mqtt.client import mqtt_client, send_board_command
 from app.planning.engine import generate_plan
 from app.benchmark import timing as _timing
@@ -50,6 +64,7 @@ router = APIRouter(prefix="/agent", tags=["Agent"])
 @router.get("/sessions")
 async def list_sessions(board_id: str = "stm32-iot-cam-01"):
     """List all chat sessions for a board."""
+    from app.db.database import async_session  # local: see _persist_message's comment
     async with async_session() as db:
         result = await db.execute(
             select(ChatSession)
@@ -71,6 +86,7 @@ async def create_session(request: Request):
     board_id = body.get("boardId", "stm32-iot-cam-01")
     name = body.get("name", f"Session {datetime.now().strftime('%H:%M')}")
 
+    from app.db.database import async_session  # local: see _persist_message's comment
     async with async_session() as db:
         session = ChatSession(board_id=board_id, name=name)
         db.add(session)
@@ -83,6 +99,7 @@ async def create_session(request: Request):
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: int):
     """Delete a chat session and all its messages."""
+    from app.db.database import async_session  # local: see _persist_message's comment
     async with async_session() as db:
         result = await db.execute(
             select(ChatSession).where(ChatSession.id == session_id)
@@ -99,6 +116,7 @@ async def delete_session(session_id: int):
 @router.get("/sessions/{session_id}/messages")
 async def get_session_messages(session_id: int):
     """Get all messages for a session."""
+    from app.db.database import async_session  # local: see _persist_message's comment
     async with async_session() as db:
         result = await db.execute(
             select(ChatSession)
@@ -110,7 +128,12 @@ async def get_session_messages(session_id: int):
             return JSONResponse(status_code=404, content={"detail": "Session not found"})
 
     return [
-        {"role": m.role, "content": m.content, "createdAt": m.created_at.isoformat()}
+        {
+            "role": m.role,
+            "content": m.content,
+            "createdAt": m.created_at.isoformat(),
+            "blocks": json.loads(m.blocks_json) if m.blocks_json else None,
+        }
         for m in session.messages
     ]
 
@@ -119,6 +142,7 @@ async def get_session_messages(session_id: int):
 async def clear_session_messages(session_id: int):
     """Clear all messages in a session (like /clear)."""
     from sqlalchemy import delete as sql_delete
+    from app.db.database import async_session  # local: see _persist_message's comment
 
     async with async_session() as db:
         await db.execute(
@@ -129,15 +153,41 @@ async def clear_session_messages(session_id: int):
     return {"ok": True}
 
 
-async def _persist_message(session_id: int, role: str, content: str):
-    """Save a message to the database."""
+async def _persist_message(
+    session_id: int, role: str, content: str, blocks: list[dict] | None = None
+):
+    """Save a message to the database.
+
+    blocks (assistant messages only): the same block shape the SSE stream
+    sent to the browser (step/text/error — see AgentChat.tsx's Block type),
+    captured by _build_assistant_blocks() as events are yielded. This is
+    what lets a page refresh show the same capture/analysis/image cards the
+    user watched live, instead of only the model's own terse follow-up text.
+    """
+    # Local import deliberately, not the module-level one at the top of this
+    # file: every _tool_* function in this module does the same, because
+    # `from app.db.database import async_session` at module scope binds a
+    # snapshot reference at IMPORT time. Tests patch app.db.database's
+    # attribute, which a module-level import can never see afterward — only
+    # a fresh import inside the function body re-resolves it per call. This
+    # was a real gap (not just a test artifact): _persist_message had never
+    # actually been exercised with a real session_id by any prior test,
+    # since callers used to only reach it after guarding on `if session_id`
+    # with session_id always None in the one test that touched this path.
+    from app.db.database import async_session
     async with async_session() as db:
-        db.add(ChatMessage(session_id=session_id, role=role, content=content))
+        db.add(ChatMessage(
+            session_id=session_id,
+            role=role,
+            content=content,
+            blocks_json=json.dumps(blocks) if blocks else None,
+        ))
         await db.commit()
 
 
 async def _load_history(session_id: int, limit: int = 20) -> list[dict]:
     """Load recent messages from DB for Claude's context."""
+    from app.db.database import async_session  # local: see _persist_message's comment
     async with async_session() as db:
         result = await db.execute(
             select(ChatMessage)
@@ -668,6 +718,48 @@ async def agent_chat(request: Request):
             session_id = None
 
     async def event_stream():
+        # Mirrors every outbound SSE event into the SAME block shape the
+        # dashboard renders live (AgentChat.tsx's Block type: step/text/
+        # error), so what gets persisted on session close/crash is exactly
+        # what the user watched stream in — not just the model's own terse
+        # follow-up sentence. Defined before the try block so it's always
+        # bound, even if an exception fires before the loop below starts.
+        assistant_blocks: list[dict] = []
+
+        def _mirror(ev_str: str) -> str:
+            try:
+                payload = ev_str.split("data: ", 1)[1].strip()
+                data = json.loads(payload)
+            except Exception:
+                return ev_str
+            event = data.get("event")
+            if event == "tool_call":
+                assistant_blocks.append({
+                    "type": "step", "id": data.get("id"), "label": data.get("label"),
+                    "status": "running",
+                })
+            elif event == "tool_result":
+                for b in assistant_blocks:
+                    if b.get("type") == "step" and b.get("id") == data.get("id") and b.get("status") == "running":
+                        b["status"] = "done" if data.get("success") else "error"
+                        b["summary"] = data.get("summary")
+                        if data.get("image_url"):
+                            b["image_url"] = data.get("image_url")
+                        break
+            elif event == "tool_update":
+                for b in assistant_blocks:
+                    if b.get("type") == "step" and b.get("id") == data.get("id") and b.get("status") == "running":
+                        b["label"] = data.get("label")
+                        break
+            elif event == "reply":
+                assistant_blocks.append({"type": "text", "text": data.get("text", "")})
+            elif event == "error":
+                assistant_blocks.append({"type": "error", "text": data.get("text", "")})
+            # "thinking" is deliberately never mirrored — the client filters
+            # thinking blocks out once streaming finishes too, so there is
+            # nothing there worth persisting.
+            return ev_str
+
         try:
             # Load conversation history from DB
             history = await _load_history(session_id) if session_id else []
@@ -677,7 +769,7 @@ async def agent_chat(request: Request):
             if session_id:
                 await _persist_message(session_id, "user", message)
 
-            yield _sse_event("thinking", {"text": f"Processing: \"{message}\""})
+            yield _mirror(_sse_event("thinking", {"text": f"Processing: \"{message}\""}))
 
             # ── Benchmark: generate run_id + pre-allocate task_id for capture_now ──
             # task_id is generated here (not in _capture_pipeline) so the planning
@@ -691,8 +783,14 @@ async def agent_chat(request: Request):
             # _fallback_dispatch), so images always stream back correctly.
             if not settings.openrouter_api_key:
                 async for ev in _fallback_dispatch(message, session_id):
-                    yield ev
-                yield _sse_event("done", {})
+                    yield _mirror(ev)
+                yield _mirror(_sse_event("done", {}))
+                if session_id:
+                    await _persist_message(
+                        session_id, "assistant",
+                        "\n\n".join(b["text"] for b in assistant_blocks if b.get("type") == "text") or "(no reply)",
+                        blocks=assistant_blocks,
+                    )
                 return
 
             from openai import AsyncOpenAI
@@ -755,7 +853,7 @@ async def agent_chat(request: Request):
 
                 if reply_msg.content and reply_msg.content.strip():
                     final_reply_parts.append(reply_msg.content)
-                    yield _sse_event("reply", {"text": reply_msg.content})
+                    yield _mirror(_sse_event("reply", {"text": reply_msg.content}))
 
                 if not tool_calls:
                     break  # No more tool calls — final turn
@@ -794,7 +892,7 @@ async def agent_chat(request: Request):
                             tool_input, model_key,
                             bench_task_id=_bench_task_id, bench_run_id=_bench_run_id,
                         ):
-                            yield ev
+                            yield _mirror(ev)
                             if '"event": "reply"' in ev:
                                 try:
                                     ev_data = json.loads(ev.split("data: ", 1)[1].strip())
@@ -814,7 +912,7 @@ async def agent_chat(request: Request):
                             bench_run_id=_bench_run_id,
                             model_key=model_key,
                         ):
-                            yield ev
+                            yield _mirror(ev)
                             if '"event": "reply"' in ev:
                                 try:
                                     ev_data = json.loads(ev.split("data: ", 1)[1].strip())
@@ -828,10 +926,10 @@ async def agent_chat(request: Request):
                         })
 
                     else:
-                        yield _sse_event("tool_call", {
+                        yield _mirror(_sse_event("tool_call", {
                             "id": tc.id,
                             "label": _tool_label(tool_name, tool_input),
-                        })
+                        }))
 
                         try:
                             result = await _execute_tool(tool_name, tool_input, session_id, model_key=model_key)
@@ -846,11 +944,11 @@ async def agent_chat(request: Request):
                                 "detail": "",
                             }
 
-                        yield _sse_event("tool_result", {
+                        yield _mirror(_sse_event("tool_result", {
                             "id": tc.id,
                             "success": result["success"],
                             "summary": result["summary"],
-                        })
+                        }))
 
                         messages_list.append({
                             "role": "tool",
@@ -859,14 +957,39 @@ async def agent_chat(request: Request):
                         })
 
             # ── Persist final reply (only once, after loop completes) ─────────
+            # blocks=assistant_blocks is what makes a refresh show the same
+            # capture/analysis/image cards the user watched stream in live,
+            # not just whatever terse sentence the model wrote last — see
+            # _mirror() above and ChatMessage.blocks_json.
             full_reply = "\n\n".join(p for p in final_reply_parts if p)
-            if full_reply and session_id:
-                await _persist_message(session_id, "assistant", full_reply)
+            if session_id and (full_reply or assistant_blocks):
+                await _persist_message(
+                    session_id, "assistant",
+                    full_reply or "(see capture/analysis above)",
+                    blocks=assistant_blocks,
+                )
 
-            yield _sse_event("done", {})
+            yield _mirror(_sse_event("done", {}))
 
         except Exception as e:
-            yield _sse_event("error", {"text": str(e)})
+            # A mid-stream crash shouldn't erase everything the turn already
+            # showed the user — persist whatever blocks/text accumulated
+            # before the failure, plus the error itself, so a refresh after
+            # a crash still shows something coherent instead of nothing.
+            err_ev = _sse_event("error", {"text": str(e)})
+            yield _mirror(err_ev)
+            try:
+                if session_id and assistant_blocks:
+                    partial_reply = "\n\n".join(
+                        b["text"] for b in assistant_blocks if b.get("type") == "text"
+                    )
+                    await _persist_message(
+                        session_id, "assistant",
+                        partial_reply or "(interrupted)",
+                        blocks=assistant_blocks,
+                    )
+            except Exception as _persist_err:
+                print(f"[AGENT] Failed to persist partial reply after crash: {_persist_err}")
 
     return StreamingResponse(
         event_stream(),
@@ -1114,6 +1237,7 @@ async def _capture_sequence_pipeline(tool_input: dict, bench_run_id: str | None 
     from app.analysis.models import AnalysisResult
     from app.scheduler.service import create_schedule, activate_schedule
     from app.scheduler.notify import notify_schedule_update
+    from app.db.database import async_session  # local: see _persist_message's comment
 
     count = max(2, min(tool_input.get("count", 3), 16))
     interval = max(500, tool_input.get("interval_ms", 2000))

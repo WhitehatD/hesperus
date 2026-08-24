@@ -58,6 +58,11 @@ def _migrate_columns(conn):
         if "flag_reason" not in cols:
             conn.execute(sa.text("ALTER TABLE analysis_results ADD COLUMN flag_reason TEXT DEFAULT ''"))
             print("[MIGRATE] Added analysis_results.flag_reason")
+    if insp.has_table("chat_messages"):
+        cols = [c["name"] for c in insp.get_columns("chat_messages")]
+        if "blocks_json" not in cols:
+            conn.execute(sa.text("ALTER TABLE chat_messages ADD COLUMN blocks_json TEXT"))
+            print("[MIGRATE] Added chat_messages.blocks_json")
 
 
 async def get_db():

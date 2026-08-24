@@ -343,3 +343,86 @@ def test_tool_exception_does_not_crash_sse_stream(client, monkeypatch):
     assert failed, f"Expected a failed tool_result for the raised exception: {tool_results}"
     assert "ping_board" in failed[0]["summary"]
     assert "boom" in failed[0]["summary"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Chat block persistence — a page refresh must show the same capture/analysis
+#  cards the user watched stream in live, not just the model's terse follow-up
+#  text. Root cause (2026-08-24): only the FINAL model-generated reply text was
+#  ever saved (ChatMessage.content); the rich tool_call/tool_result step blocks
+#  — including image thumbnails — only ever existed in the browser's in-memory
+#  React state and vanished on refresh. Fixed via ChatMessage.blocks_json,
+#  populated by _mirror() in event_stream() as SSE events are yielded.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def test_assistant_reply_persists_structured_blocks_for_reload(db_session):
+    """_persist_message + get_session_messages must round-trip a full block
+    list (step + text) through blocks_json, not just the flat content string
+    — this is the actual data-layer mechanism _mirror() in event_stream()
+    relies on to make a page refresh show the same capture/analysis cards
+    the user watched stream in live.
+
+    (Exercised at the db_session/ORM layer rather than through TestClient:
+    a pre-existing, unrelated aiosqlite+StaticPool+TestClient interaction
+    makes chat_sessions/chat_messages invisible to TestClient's request
+    thread specifically — reproduced in isolation with a bare
+    POST /api/agent/sessions and no chat/blocks code involved at all, so
+    it predates and is independent of this fix. db_session is the fixture
+    every other DB-touching test in this file already uses reliably.)
+    """
+    from app.agent.models import ChatSession
+    from app.api.agent_routes import _persist_message, get_session_messages
+
+    session = ChatSession(board_id="stm32", name="test session")
+    db_session.add(session)
+    await db_session.commit()
+    await db_session.refresh(session)
+
+    blocks = [
+        {"type": "step", "id": "call_1", "label": "Pinging board...",
+         "status": "done", "summary": "Ping sent — board LEDs will flash"},
+        {"type": "text", "text": "Board is alive."},
+    ]
+    await _persist_message(session.id, "assistant", "Board is alive.", blocks=blocks)
+
+    messages = await get_session_messages(session.id)
+    assistant = next(m for m in messages if m["role"] == "assistant")
+
+    assert assistant["blocks"] is not None, (
+        "blocks_json did not round-trip — reload would fall back to flat "
+        "text only, reproducing the original bug"
+    )
+    block_types = [b["type"] for b in assistant["blocks"]]
+    assert "step" in block_types
+    assert "text" in block_types
+
+    step = next(b for b in assistant["blocks"] if b["type"] == "step")
+    assert step["status"] == "done"
+    assert step["id"] == "call_1"
+    assert step["summary"] == "Ping sent — board LEDs will flash"
+
+    text_block = next(b for b in assistant["blocks"] if b["type"] == "text")
+    assert text_block["text"] == "Board is alive."
+
+
+async def test_legacy_message_without_blocks_json_falls_back_gracefully(db_session):
+    """A ChatMessage row written before this fix (blocks_json IS NULL) must
+    still round-trip through get_session_messages without erroring — the
+    dashboard client is responsible for falling back to a single text block
+    (reconstructBlocks() in AgentChat.tsx), but the server contract must not
+    choke on NULL, and must return None (not "[]" or an error) so the client
+    can tell "no blocks recorded" apart from "recorded as empty"."""
+    from app.agent.models import ChatSession
+    from app.api.agent_routes import _persist_message, get_session_messages
+
+    session = ChatSession(board_id="stm32", name="test session")
+    db_session.add(session)
+    await db_session.commit()
+    await db_session.refresh(session)
+
+    await _persist_message(session.id, "assistant", "Legacy plain-text reply.")
+
+    messages = await get_session_messages(session.id)
+    assistant = next(m for m in messages if m["role"] == "assistant")
+    assert assistant["content"] == "Legacy plain-text reply."
+    assert assistant["blocks"] is None
