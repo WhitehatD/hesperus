@@ -4,6 +4,13 @@ import Link from "next/link";
 import { use, useCallback, useEffect, useRef, useState } from "react";
 import AgentChat from "../../components/AgentChat";
 import ErrorBanner from "../../components/ErrorBanner";
+import {
+	ArrowLeftIcon,
+	CheckIcon,
+	CircleIcon,
+	WarningIcon,
+	XIcon,
+} from "../../components/Icons";
 import { useAsyncResource } from "../../hooks/useAsyncResource";
 import { useMQTT } from "../../hooks/useMQTT";
 
@@ -950,10 +957,10 @@ export default function BoardPage({
 			{/* Header */}
 			<header className="agent-header-bar">
 				<div className="agent-header-left">
-					<Link href="/" className="btn-back">
-						&larr;
+					<Link href="/" className="btn-back" title="Back to fleet">
+						<ArrowLeftIcon size={14} />
 					</Link>
-					<h1 className="agent-header-title">Monitoring Agent</h1>
+					<h1 className="agent-header-title">Hesperus</h1>
 					<span className="agent-header-node">{boardId}</span>
 				</div>
 				<div className="agent-header-actions">
@@ -982,6 +989,7 @@ export default function BoardPage({
 						Refresh
 					</button>
 					<ActionFeedback
+						align="right"
 						feedback={
 							actionFeedback.capture ??
 							actionFeedback.ping ??
@@ -1271,16 +1279,16 @@ export default function BoardPage({
 															>
 																<span className="schedule-check">
 																	{task.completed_at ? (
-																		"\u2713"
+																		<CheckIcon size={12} />
 																	) : isRunning ? (
 																		<span
 																			className="task-spinner"
 																			title={live.status}
 																		/>
 																	) : isFailed ? (
-																		"\u2717"
+																		<XIcon size={12} />
 																	) : (
-																		"\u25CB"
+																		<CircleIcon size={12} />
 																	)}
 																</span>
 																<span className="schedule-time">
@@ -1986,13 +1994,36 @@ function getStatusClass(status: string): string {
  * triggered an action — self-clearing (see showFeedback's setTimeout). */
 function ActionFeedback({
 	feedback,
+	align = "left",
 }: {
 	feedback?: { type: "success" | "error"; message: string };
+	/** Which edge of the zero-width anchor the popup grows from. "right"
+	 * for anchors near a container's right/trailing edge (e.g. the last
+	 * button in a row) so the popup can't overflow off-screen on mobile —
+	 * a "left"-grown popup anchored at the trailing edge of a narrow
+	 * viewport has nowhere to grow but off the right side of the screen. */
+	align?: "left" | "right";
 }) {
-	if (!feedback) return null;
+	// Zero-footprint anchor, always rendered (not just when feedback is
+	// present) — the message itself is `position: absolute` inside it, so
+	// it floats OVER the layout instead of inserting/removing a flex
+	// sibling every time feedback appears/clears. That in-flow insertion
+	// was the exact bug: clicking Ping made every button after it jump
+	// sideways because a new flex item had appeared in the row.
 	return (
-		<span className={`action-feedback action-feedback-${feedback.type}`}>
-			{feedback.type === "success" ? "\u2713" : "\u26a0"} {feedback.message}
+		<span className="action-feedback-anchor">
+			{feedback && (
+				<span
+					className={`action-feedback action-feedback-${feedback.type} action-feedback-${align}`}
+				>
+					{feedback.type === "success" ? (
+						<CheckIcon size={12} />
+					) : (
+						<WarningIcon size={12} />
+					)}
+					{feedback.message}
+				</span>
+			)}
 		</span>
 	);
 }

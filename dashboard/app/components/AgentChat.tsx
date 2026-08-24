@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { PlusIcon, XIcon } from "./Icons";
 
 /* ── Block-based message model ───────────────────────────── */
 
@@ -472,7 +473,7 @@ export default function AgentChat({
 									deleteSession(s.id);
 								}}
 							>
-								&times;
+								<XIcon size={10} />
 							</span>
 						)}
 					</button>
@@ -482,7 +483,7 @@ export default function AgentChat({
 					onClick={createSession}
 					title="New session"
 				>
-					+
+					<PlusIcon size={12} />
 				</button>
 			</div>
 

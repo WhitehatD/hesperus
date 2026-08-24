@@ -2,7 +2,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-	title: "Visual Monitor | Enterprise Edge AI",
+	title: "Hesperus — Autonomous IoT Visual Monitoring",
 	description: "Autonomous IoT Visual Monitoring System Dashboard",
 };
 

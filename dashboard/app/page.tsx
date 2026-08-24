@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import ErrorBanner from "./components/ErrorBanner";
+import { ArrowRightIcon } from "./components/Icons";
 import { useAsyncResource } from "./hooks/useAsyncResource";
 import { useBoardTracker } from "./hooks/useMQTT";
 
@@ -88,8 +89,10 @@ export default function DashboardPage() {
 						</svg>
 					</div>
 					<div>
-						<h1 className="header-title">Visual Monitor</h1>
-						<div className="header-subtitle">IoT Edge Fleet Dashboard</div>
+						<h1 className="header-title">Hesperus</h1>
+						<div className="header-subtitle">
+							Autonomous IoT Visual Monitoring
+						</div>
 					</div>
 				</div>
 				<div className="fleet-summary">
@@ -275,7 +278,8 @@ export default function DashboardPage() {
 										href={`/board/${board.id}`}
 										className="btn btn-primary btn-explore"
 									>
-										Open Dashboard <span className="arrow">&rarr;</span>
+										Open Dashboard
+										<ArrowRightIcon size={14} className="arrow" />
 									</Link>
 								</div>
 							</div>
