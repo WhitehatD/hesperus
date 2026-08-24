@@ -391,9 +391,24 @@ OTAStatus_t OTA_CheckForUpdate(OTAVersionInfo_t *info)
         return OTA_ERROR_NETWORK;
     }
 
-    /* Receive response (poll up to 8000ms) */
+    /* Receive response. 2026-08-24: was 8000ms — SMALLER than
+     * MX_WIFI_CMD_TIMEOUT (10000ms, the module's own ceiling for a single
+     * MX_WIFI_Socket_recv() poll — see _ota_safe_recv's header comment).
+     * _ota_safe_recv's outer while-loop only checks elapsed time BETWEEN
+     * polls, never during one — it cannot preempt a poll already in
+     * flight. So whenever the module actually hit its own ceiling on the
+     * FIRST poll, the call was structurally guaranteed to overshoot the
+     * requested budget and return after one poll regardless of what
+     * total_timeout_ms said: exactly the reproduced symptom ("recv
+     * timeout: 1 polls in 10078ms, last ret=-1" against an 8000ms ask).
+     * 12000ms gives a genuine 10s-ceiling poll room to finish, and a
+     * second, cheap poll after it if that one comes back fast. Same
+     * ceiling now used for the download-progress recv calls below
+     * (15000ms) for consistency, which were already comfortably above it.
+     * NOT hardware-validated tonight (board has no USB/ST-Link attached) —
+     * confirm the recv-timeout log line stops recurring next session. */
     uint8_t resp[512] = {0};
-    int32_t resp_len = _ota_safe_recv(sock, resp, sizeof(resp) - 1, 8000);
+    int32_t resp_len = _ota_safe_recv(sock, resp, sizeof(resp) - 1, 12000);
 
     MX_WIFI_Socket_close(wifi_obj_get(), sock);
 

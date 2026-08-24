@@ -556,7 +556,33 @@ export default function AgentChat({
 					disabled={!isStreaming && !input.trim()}
 					title={isStreaming ? "Stop" : "Send"}
 				>
-					{isStreaming ? "\u25A0" : "\u2191"}
+					{isStreaming ? (
+						<svg
+							width="12"
+							height="12"
+							viewBox="0 0 12 12"
+							fill="currentColor"
+							aria-hidden="true"
+						>
+							<rect x="1" y="1" width="10" height="10" rx="1.5" />
+						</svg>
+					) : (
+						<svg
+							width="16"
+							height="16"
+							viewBox="0 0 16 16"
+							fill="none"
+							aria-hidden="true"
+						>
+							<path
+								d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5"
+								stroke="currentColor"
+								strokeWidth="1.8"
+								strokeLinecap="round"
+								strokeLinejoin="round"
+							/>
+						</svg>
+					)}
 				</button>
 			</div>
 		</div>
