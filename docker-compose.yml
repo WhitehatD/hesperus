@@ -25,8 +25,15 @@ services:
     container_name: hesperus-server
     ports:
       - "8000:8000"
+    # Optional: server/.env is a LOCAL-DEV convenience file and is gitignored
+    # (copy server/.env.example to create it). It must stay optional — prod
+    # merges this file with docker-compose.prod.yml (see infra/deploy.sh), and
+    # on the VPS there is no server/.env at all: prod config comes from
+    # .env.prod via ${VAR} substitution in docker-compose.prod.yml. Without
+    # `required: false` the prod deploy aborts with "env file not found".
     env_file:
-      - ./server/.env
+      - path: ./server/.env
+        required: false
     environment:
       - MQTT_BROKER_HOST=mosquitto
       - MQTT_BROKER_PORT=1883
