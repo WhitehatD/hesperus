@@ -459,7 +459,37 @@
 #define __FW_VERSION_STR            "1.0.165"
 #define FW_VERSION                  __FW_VERSION_STR          /* Current firmware version string */
 #endif
-#define OTA_CHECK_INTERVAL_MS       (1 * 60 * 1000)   /* Check every 1 minute */
+/* 2026-08-25: was (1 * 60 * 1000) — 1 minute. This poll is NOT the primary
+ * OTA discovery path: main.c's MQTT command handler already sets
+ * s_ota_requested=1 directly on {"type":"firmware_update"} pushed from
+ * server/app/api/firmware_routes.py's /firmware/notify, going straight to
+ * download with zero calls into this raw-socket check. This interval only
+ * governs the safety-net "autonomous daemon" poll (main.c ~1759-1775) that
+ * exists to catch a board that was asleep/offline and missed that push —
+ * it does not need sub-minute latency to do that job.
+ *
+ * Root cause of "OTA fails almost every check" (2026-08-25 investigation):
+ * every poll opens a fresh TCP socket (_ota_socket_open -> WiFi_TcpConnect)
+ * and closes it (MX_WIFI_Socket_close) with no reuse or backoff. The
+ * EMW3080's socket/TIME_WAIT table is small (documented elsewhere in this
+ * file's OTA-download path, which already works around the same class of
+ * exhaustion for back-to-back checks via dummy-socket rotation). At 60s
+ * intervals that is 40+ open/close cycles per 40 minutes of uptime with no
+ * mitigation on this path at all — the failures observed ("recv timeout:
+ * 1000+ polls in 12000ms, last ret=-1", i.e. genuinely zero response, not a
+ * slow one) match resource exhaustion accumulating over exactly that many
+ * cycles, not a one-off transient.
+ *
+ * Fix: stop running the redundant path 40+ times as often as it needs to.
+ * 30 minutes still bounds "stranded on deprecated firmware" to a half hour
+ * worst case, and cuts socket churn ~30x, which should eliminate the
+ * exhaustion pattern outright since it no longer accumulates within a
+ * normal multi-hour demo/monitoring run. NOT hardware-validated — flash and
+ * soak-test over several hours of uptime before treating this as closed;
+ * if the failures still recur even at this interval, the actual socket
+ * lifecycle (not just its frequency) needs fixing next, e.g. reusing one
+ * connection instead of open/close per check. */
+#define OTA_CHECK_INTERVAL_MS       (30 * 60 * 1000)  /* Check every 30 minutes — safety net, not primary path */
 #define OTA_DOWNLOAD_CHUNK_SIZE     2048           /* 2KB chunks — fits in single MIPC frame (2494 payload max) */
 #define OTA_MAX_FW_SIZE             (896 * 1024)   /* 896KB max — leave room for vector table */
 #define OTA_DOWNLOAD_MAX_RETRIES    5              /* Full download attempts before giving up */
