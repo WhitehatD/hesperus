@@ -28,7 +28,6 @@ import re
 import time
 from datetime import datetime, timedelta
 
-import anthropic
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
@@ -36,6 +35,7 @@ from sqlalchemy.orm import selectinload
 
 from app.agent.models import ChatMessage, ChatSession
 from app.config import settings
+from app.llm_clients import get_anthropic_client, get_openai_client
 # This module-level `async_session` binds a snapshot at first-import time and
 # is now UNUSED by every function body in this file on purpose — each one
 # re-imports it locally instead (see _persist_message's docstring for why: a
@@ -793,13 +793,7 @@ async def agent_chat(request: Request):
                     )
                 return
 
-            from openai import AsyncOpenAI
-
-            client = AsyncOpenAI(
-                base_url=settings.openrouter_base_url,
-                api_key=settings.openrouter_api_key,
-                timeout=30.0,
-            )
+            client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key, timeout=30.0)
             tools_schema = _agent_tools_openai_format()
 
             # ── World-state snapshot: fresh grounding for EVERY chat call, not
@@ -1972,12 +1966,7 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
         )
 
         if settings.openrouter_api_key:
-            from openai import AsyncOpenAI
-
-            client = AsyncOpenAI(
-                base_url=settings.openrouter_base_url,
-                api_key=settings.openrouter_api_key,
-            )
+            client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key)
             response = await client.chat.completions.create(
                 model=settings.openrouter_planner_model,
                 max_tokens=1024,
@@ -1991,7 +1980,7 @@ async def _tool_synthesize(inp: dict, model_key: str = "claude-haiku") -> dict:
                 "claude-sonnet": settings.claude_sonnet_model,
             }
             resolved_synthesis_model = CLAUDE_MODEL_MAP.get(model_key) or settings.claude_haiku_model
-            client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            client = get_anthropic_client(settings.anthropic_api_key)
             response = await client.messages.create(
                 model=resolved_synthesis_model,
                 max_tokens=1024,

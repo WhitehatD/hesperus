@@ -24,6 +24,7 @@ from app.api.agent_routes import AGENT_TOOLS, AGENT_SYSTEM_PROMPT
 from app.analysis.engine import analyze_image
 from app.config import settings
 from app.planning import engine as planning_engine
+from app.llm_clients import get_anthropic_client, get_openai_client
 
 router = APIRouter(prefix="/benchmark", tags=["benchmark"])
 
@@ -243,7 +244,6 @@ async def _plan_with_claude(prompt: str, model_key: str) -> dict:
     temperature=1.0 in thinking mode; the benchmark accounts for this by
     repeating each (prompt, model) pair multiple times via --reps.
     """
-    import anthropic
 
     if not settings.anthropic_api_key:
         return {
@@ -279,7 +279,7 @@ async def _plan_with_claude(prompt: str, model_key: str) -> dict:
     else:
         create_kwargs["temperature"] = 0.1
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = get_anthropic_client(settings.anthropic_api_key)
     try:
         response = await client.messages.create(**create_kwargs)
     except Exception as e:
@@ -357,7 +357,6 @@ async def _plan_with_claude_nothink(prompt: str) -> dict:
     with model_key="claude-haiku" — NO, that would route to the wrong model.
     Easier: inline a stripped-down version.
     """
-    import anthropic
 
     if not settings.anthropic_api_key:
         return {
@@ -373,7 +372,7 @@ async def _plan_with_claude_nothink(prompt: str) -> dict:
             **_empty_chain_result("ANTHROPIC_API_KEY not configured"),
         }
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = get_anthropic_client(settings.anthropic_api_key)
     try:
         response = await client.messages.create(
             model=settings.claude_sonnet_model,
@@ -469,7 +468,6 @@ async def _plan_with_qwen(prompt: str) -> dict:
     The Qwen2.5-VL-3B variant does NOT support tool_use cleanly under the same
     setup and is excluded from planning evaluation.
     """
-    from openai import AsyncOpenAI
 
     if not settings.vllm_base_url:
         return {
@@ -487,10 +485,7 @@ async def _plan_with_qwen(prompt: str) -> dict:
 
     openai_tools = _anthropic_tools_to_openai(AGENT_TOOLS)
 
-    client = AsyncOpenAI(
-        base_url=settings.vllm_base_url,
-        api_key="not-needed",
-    )
+    client = get_openai_client(settings.vllm_base_url, "not-needed")
 
     try:
         response = await client.chat.completions.create(

@@ -16,11 +16,10 @@ import json
 import time
 from pathlib import Path
 
-import anthropic
-import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
+from app.llm_clients import get_anthropic_client, get_openai_client
 
 # Transient failure modes observed from the OpenRouter gateway/upstream
 # providers — production evidence (2026-08-18..24) shows these firing on
@@ -140,7 +139,7 @@ async def _analyze_with_claude(
     """
     image_b64 = _load_image_b64(image_path)
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = get_anthropic_client(settings.anthropic_api_key, timeout=60.0)
 
     create_kwargs: dict = {
         "model": model,
@@ -165,7 +164,6 @@ async def _analyze_with_claude(
                 ],
             }
         ],
-        "timeout": 60.0,
     }
     if enable_thinking:
         create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 2000}
@@ -205,8 +203,6 @@ async def _analyze_with_vllm(
     model is served by its own llama-server / vLLM instance so we can compare
     them apples-to-apples without one bottlenecking the other.
     """
-    from openai import AsyncOpenAI
-
     if model_key == "qwen3-vl":
         base_url = settings.vllm_base_url
         model_name = settings.vllm_model
@@ -218,11 +214,7 @@ async def _analyze_with_vllm(
 
     image_b64 = _load_image_b64(image_path)
 
-    client = AsyncOpenAI(
-        base_url=base_url,
-        api_key="not-needed",
-        timeout=httpx.Timeout(60.0),
-    )
+    client = get_openai_client(base_url, "not-needed", timeout=60.0)
 
     response = await client.chat.completions.create(
         model=model_name,
@@ -260,15 +252,9 @@ async def _analyze_with_openrouter(image_path: str, objective: str) -> dict:
     provider-agnostic). Production default as of 2026-08-19 — see config.py
     for the model choice rationale (hybrid routing: this uses
     openrouter_analysis_model, a vision-capable model)."""
-    from openai import AsyncOpenAI
-
     image_b64 = _load_image_b64(image_path)
 
-    client = AsyncOpenAI(
-        base_url=settings.openrouter_base_url,
-        api_key=settings.openrouter_api_key,
-        timeout=httpx.Timeout(60.0),
-    )
+    client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key, timeout=60.0)
 
     response = await client.chat.completions.create(
         model=settings.openrouter_analysis_model,

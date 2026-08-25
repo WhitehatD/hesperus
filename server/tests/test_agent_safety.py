@@ -314,7 +314,7 @@ def test_tool_exception_does_not_crash_sse_stream(client, monkeypatch):
     fake_openai_client.chat.completions = MagicMock()
     fake_openai_client.chat.completions.create = AsyncMock(side_effect=fake_create)
 
-    with patch("openai.AsyncOpenAI", return_value=fake_openai_client), \
+    with patch("app.llm_clients.AsyncOpenAI", return_value=fake_openai_client), \
          patch("app.api.agent_routes._execute_tool", new_callable=AsyncMock) as mock_exec:
         mock_exec.side_effect = RuntimeError("boom — simulated tool crash")
 

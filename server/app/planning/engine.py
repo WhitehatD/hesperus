@@ -12,11 +12,11 @@ import asyncio
 import json
 from datetime import datetime
 
-import anthropic
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
 from app.api.schemas import PlanResponse, ScheduledTask
+from app.llm_clients import get_anthropic_client, get_openai_client
 
 # See matching note in app/analysis/engine.py — same OpenRouter gateway,
 # same observed transient-failure profile.
@@ -113,7 +113,7 @@ async def generate_plan(prompt: str, model_key: str = "claude-sonnet") -> PlanRe
 
 async def _plan_with_claude(prompt: str, model: str) -> list[ScheduledTask]:
     """Generate schedule using Claude (Anthropic API)."""
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = get_anthropic_client(settings.anthropic_api_key)
 
     response = await client.messages.create(
         model=model,
@@ -121,7 +121,6 @@ async def _plan_with_claude(prompt: str, model: str) -> list[ScheduledTask]:
         system=PLANNING_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
-        timeout=30.0,
     )
 
     raw_text = response.content[0].text
@@ -159,8 +158,6 @@ async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
     analysis-engine routing pattern so qwen3-vl hits port 8001 and qwen2.5-vl
     hits port 8002.
     """
-    from openai import AsyncOpenAI
-
     if model_key == "qwen3-vl":
         base_url = settings.vllm_base_url
         model_name = settings.vllm_model
@@ -170,10 +167,7 @@ async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
     else:
         raise ValueError(f"Unknown vllm model_key for planning: {model_key}")
 
-    client = AsyncOpenAI(
-        base_url=base_url,
-        api_key="not-needed",
-    )
+    client = get_openai_client(base_url, "not-needed")
 
     response = await client.chat.completions.create(
         model=model_name,
@@ -191,13 +185,15 @@ async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
 async def _plan_with_openrouter(prompt: str) -> list[ScheduledTask]:
     """Generate schedule via OpenRouter. Production default as of 2026-08-19
     — uses openrouter_planner_model (cheap, tools-capable, text-only; schedule
-    generation never reasons about images)."""
-    from openai import AsyncOpenAI
+    generation never reasons about images).
 
-    client = AsyncOpenAI(
-        base_url=settings.openrouter_base_url,
-        api_key=settings.openrouter_api_key,
-    )
+    2026-08-25: this call site previously constructed its client with no
+    timeout at all (SDK default 600s), which combined with the 3-attempt
+    retry in _plan_with_openrouter_retrying meant a single hung upstream
+    call could leave "Generating schedule..." stuck for up to 30 minutes
+    with zero feedback in production. Now routed through get_openai_client,
+    which enforces DEFAULT_LLM_TIMEOUT_S — see app/llm_clients.py."""
+    client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key)
 
     response = await client.chat.completions.create(
         model=settings.openrouter_planner_model,
