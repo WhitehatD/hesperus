@@ -51,7 +51,7 @@ from app.llm_clients import get_anthropic_client, get_openai_client
 # AttributeErrors. Do not add a NEW `async_session()` call site that relies on
 # this name; always import it locally in the function that needs it.
 from app.db.database import async_session  # noqa: F401 — kept for test patch compatibility, see above
-from app.mqtt.client import mqtt_client, send_board_command
+from app.mqtt.client import get_upload_progress, mqtt_client, send_board_command
 from app.planning.engine import generate_plan
 from app.benchmark import timing as _timing
 from app.benchmark.ids import next_task_id
@@ -1088,7 +1088,16 @@ async def _capture_pipeline(
         await asyncio.sleep(1)
         elapsed = poll_idx + 1
 
-        if elapsed % 5 == 0:
+        live_progress = get_upload_progress(task_id)
+        if live_progress is not None and live_progress.get("bytes_total"):
+            pct = live_progress.get("progress")
+            sent_kb = (live_progress.get("bytes_sent") or 0) / 1024
+            total_kb = live_progress["bytes_total"] / 1024
+            yield _sse_event("tool_update", {
+                "id": "upload",
+                "label": f"Uploading... {pct}% ({sent_kb:.1f} / {total_kb:.1f} KB)",
+            })
+        elif elapsed % 5 == 0:
             yield _sse_event("tool_update", {"id": "upload", "label": f"{wait_label} ({elapsed}s)"})
 
         # Recompute date/dir on each poll so midnight rollovers are handled

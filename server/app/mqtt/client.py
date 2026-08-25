@@ -41,6 +41,7 @@ _board_snapshot: dict = {
     "dormant_until": None,
     "last_seen": None,         # ISO-8601 UTC of last status message
     "telemetry": {},           # wifi/mqtt reconnects, capture/ota failures
+    "upload_progress": None,   # {task_id, bytes_sent, bytes_total, progress} | None
 }
 
 
@@ -52,6 +53,18 @@ def get_board_state() -> str:
 def get_board_snapshot() -> dict:
     """Return the last-known aggregated board snapshot for dashboard hydration."""
     return dict(_board_snapshot)
+
+
+def get_upload_progress(task_id: int) -> dict | None:
+    """Return the latest known chunk-upload progress for *task_id*, or None
+    if no progress has been reported for it (older firmware without the
+    per-chunk "uploading" status publish, or the upload hasn't started yet).
+    Used by the chat SSE stream (agent_routes.py) to show real upload
+    percentage inline in the conversation instead of only elapsed seconds."""
+    prog = _board_snapshot.get("upload_progress")
+    if prog is not None and prog.get("task_id") == task_id:
+        return prog
+    return None
 
 
 def note_power_command(lp_mode: Optional[str] = None, sleep_mode: Optional[bool] = None) -> None:
@@ -215,6 +228,22 @@ async def on_message(client, topic, payload, qos, properties):
         }
         if _tele:
             _board_snapshot["telemetry"] = _tele
+
+    # ── Live chunk-upload progress (per task, for chat-inline display) ───────
+    # Consumed by app.api.agent_routes' capture SSE stream via
+    # get_upload_progress() so the chat conversation shows real bytes/percent
+    # instead of only elapsed seconds. Cleared once the task leaves the
+    # uploading phase so a stale percentage from a finished task can't bleed
+    # into the next capture's wait loop.
+    if status == "uploading" and data.get("task_id") is not None:
+        _board_snapshot["upload_progress"] = {
+            "task_id": data.get("task_id"),
+            "bytes_sent": data.get("bytes_sent"),
+            "bytes_total": data.get("bytes_total"),
+            "progress": data.get("progress"),
+        }
+    elif status in ("uploaded", "error", "cycle_complete"):
+        _board_snapshot["upload_progress"] = None
 
     # ── Energy phase-timer telemetry (RQ3 measured duty cycle) ───────────────
     if status == "energy":
