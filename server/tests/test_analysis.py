@@ -2,7 +2,9 @@
 Tests for the agentic analysis layer.
 """
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def test_analyses_empty(client):
@@ -72,6 +74,103 @@ def test_parse_analysis_malformed_json_defaults_flagged_false():
     result = _parse_analysis("not json at all")
     assert result["flagged"] is False
     assert result["flag_reason"] == ""
+
+
+# ── None-response backend gap (production AttributeError fix) ───────────
+#
+# Regression coverage for the bug where an OpenAI-compatible backend
+# (OpenRouter/vLLM) returns HTTP 200 with `choices[0].message.content`
+# set to None (no exception raised) — e.g. the upstream provider
+# soft-failed, hit a content filter, or a reasoning-capable model
+# exhausted max_tokens before emitting final content. Previously this
+# propagated straight into `_parse_analysis(None)` and crashed with
+# `AttributeError: 'NoneType' object has no attribute 'strip'`, which
+# surfaced on the dashboard as "Analysis unavailable — backend error:
+# AttributeError...".
+
+
+def test_parse_analysis_none_input_degrades_gracefully():
+    """_parse_analysis must not crash on None — it's the last line of
+    defense if a backend forgets to guard before calling it."""
+    from app.analysis.engine import _parse_analysis
+
+    result = _parse_analysis(None)
+    assert result["flagged"] is False
+    assert result["flag_reason"] == ""
+    assert "empty response" in result["findings"].lower()
+
+
+def test_parse_analysis_empty_string_degrades_gracefully():
+    """Whitespace-only output is treated the same as None."""
+    from app.analysis.engine import _parse_analysis
+
+    result = _parse_analysis("   ")
+    assert result["flagged"] is False
+    assert "empty response" in result["findings"].lower()
+
+
+def _make_chat_completion(content, finish_reason="stop", reasoning=None):
+    """Build a minimal object shaped like an OpenAI ChatCompletion response,
+    with a `choices[0].message.content` / `.finish_reason` for
+    _extract_completion_text to inspect."""
+    message = MagicMock()
+    message.content = content
+    message.reasoning = reasoning
+    message.reasoning_content = None
+
+    choice = MagicMock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+
+    response = MagicMock()
+    response.choices = [choice]
+    return response
+
+
+def test_extract_completion_text_raises_clear_error_on_none_content():
+    """The real root-cause fix: when the backend returns content=None (no
+    exception), _extract_completion_text must raise an informative
+    RuntimeError instead of letting the None reach _parse_analysis and
+    crash with an opaque AttributeError."""
+    from app.analysis.engine import _extract_completion_text
+
+    response = _make_chat_completion(content=None, finish_reason="length")
+
+    with pytest.raises(RuntimeError, match="OpenRouter returned empty content"):
+        _extract_completion_text(response, backend_label="OpenRouter")
+
+
+def test_extract_completion_text_error_mentions_reasoning_truncation_hint():
+    """When a reasoning trace is present but content is empty, the error
+    should hint at max_tokens truncation to make root-causing fast."""
+    from app.analysis.engine import _extract_completion_text
+
+    response = _make_chat_completion(
+        content=None, finish_reason="length", reasoning="thinking really hard..."
+    )
+
+    with pytest.raises(RuntimeError, match="truncated by max_tokens"):
+        _extract_completion_text(response, backend_label="OpenRouter")
+
+
+def test_extract_completion_text_raises_on_zero_choices():
+    """An empty choices list must also raise a clear error, not IndexError."""
+    from app.analysis.engine import _extract_completion_text
+
+    response = MagicMock()
+    response.choices = []
+
+    with pytest.raises(RuntimeError, match="zero choices"):
+        _extract_completion_text(response, backend_label="OpenRouter")
+
+
+def test_extract_completion_text_returns_content_when_present():
+    """Sanity check: the happy path still returns the content unchanged."""
+    from app.analysis.engine import _extract_completion_text
+
+    response = _make_chat_completion(content='{"description": "ok"}')
+
+    assert _extract_completion_text(response, backend_label="OpenRouter") == '{"description": "ok"}'
 
 
 def test_analysis_result_model_defaults_flagged_false():

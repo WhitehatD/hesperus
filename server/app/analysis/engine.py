@@ -10,6 +10,7 @@ Thesis multi-backend benchmark — all backends equal weight in evaluation:
   - Qwen3-VL-30B-A3B / Qwen2.5-VL-3B (local vLLM)
 """
 
+import asyncio
 import base64
 import json
 import time
@@ -17,8 +18,22 @@ from pathlib import Path
 
 import anthropic
 import httpx
+from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
+
+# Transient failure modes observed from the OpenRouter gateway/upstream
+# providers — production evidence (2026-08-18..24) shows these firing on
+# 3 of 67 analyses with no pattern (not token-budget related: successful
+# analyses peak at ~150 output tokens against a 1024-2048 cap), i.e. they
+# are retryable soft-failures, not a systematic bug in the request itself.
+_OPENROUTER_TRANSIENT_ERRORS = (
+    RuntimeError,  # our own _extract_completion_text guard: empty/None content
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    APIStatusError,  # non-2xx from the gateway, incl. 5xx
+)
 
 
 # ── System Prompt ────────────────────────────────────────
@@ -97,7 +112,7 @@ async def analyze_image(
     elif model_key == "gemini-3":
         result = await _analyze_with_gemini(image_path, objective)
     elif model_key == "openrouter":
-        result = await _analyze_with_openrouter(image_path, objective)
+        result = await _analyze_with_openrouter_retrying(image_path, objective)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -228,10 +243,11 @@ async def _analyze_with_vllm(
             },
         ],
         temperature=0.1,
-        max_tokens=1024,
+        max_tokens=2048,
     )
 
-    parsed = _parse_analysis(response.choices[0].message.content)
+    content = _extract_completion_text(response, backend_label=f"vLLM ({model_key})")
+    parsed = _parse_analysis(content)
     usage = getattr(response, "usage", None)
     if usage is not None:
         parsed["input_tokens"] = getattr(usage, "prompt_tokens", None)
@@ -273,15 +289,40 @@ async def _analyze_with_openrouter(image_path: str, objective: str) -> dict:
             },
         ],
         temperature=0.1,
-        max_tokens=1024,
+        max_tokens=2048,
     )
 
-    parsed = _parse_analysis(response.choices[0].message.content)
+    content = _extract_completion_text(response, backend_label="OpenRouter")
+    parsed = _parse_analysis(content)
     usage = getattr(response, "usage", None)
     if usage is not None:
         parsed["input_tokens"] = getattr(usage, "prompt_tokens", None)
         parsed["output_tokens"] = getattr(usage, "completion_tokens", None)
     return parsed
+
+
+async def _analyze_with_openrouter_retrying(
+    image_path: str, objective: str, max_attempts: int = 3
+) -> dict:
+    """Retry OpenRouter analysis on transient failures. Production evidence
+    (67 analyses, 2026-08-18..24): 3 transient failures, none repeating on
+    the very next capture of the same scene — so a bounded retry is the
+    whole fix. Deliberately does NOT fall back to a different backend: the
+    system's claim is that analysis runs on open-weight inference, so
+    silently answering from a cloud model would misreport what produced the
+    result and corrupt backend-comparison benchmark data. If all attempts
+    fail, the caller surfaces an honest error."""
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await _analyze_with_openrouter(image_path, objective)
+        except _OPENROUTER_TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _analyze_with_gemini(image_path: str, objective: str) -> dict:
@@ -305,6 +346,20 @@ async def _analyze_with_gemini(image_path: str, objective: str) -> dict:
         ],
     )
 
+    if response.text is None:
+        # The genai SDK returns None (rather than raising) when there are no
+        # candidates or the response was blocked — e.g. a safety filter on
+        # the image, or the API silently returning an empty candidate list.
+        finish_reason = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            finish_reason = getattr(candidates[0], "finish_reason", None)
+        raise RuntimeError(
+            f"Gemini returned no text content (finish_reason={finish_reason}). "
+            "This usually means the response was blocked by a safety filter "
+            "or the API returned zero candidates."
+        )
+
     parsed = _parse_analysis(response.text)
     meta = getattr(response, "usage_metadata", None)
     if meta is not None:
@@ -313,8 +368,65 @@ async def _analyze_with_gemini(image_path: str, objective: str) -> dict:
     return parsed
 
 
-def _parse_analysis(raw_output: str) -> dict:
-    """Parse LLM output into a structured analysis dict."""
+def _extract_completion_text(response, backend_label: str) -> str:
+    """Extract message content from an OpenAI-compatible chat completion
+    response, raising a clear diagnostic error instead of letting a bare
+    ``None`` content silently propagate to ``_parse_analysis`` (which would
+    crash with an opaque ``AttributeError: 'NoneType' object has no
+    attribute 'strip'``).
+
+    An OpenAI-compatible backend can return HTTP 200 with
+    ``choices[0].message.content`` set to ``None`` — without raising —
+    when: the upstream provider hit an error/rate-limit and passed it
+    through as a "soft" failure (common with OpenRouter's multi-provider
+    routing), the response was blocked by a content filter, or a
+    reasoning-capable model exhausted ``max_tokens`` on internal reasoning
+    before emitting any final-answer content (``finish_reason == "length"``
+    with reasoning tokens consumed and no visible output).
+    """
+    if not response.choices:
+        raise RuntimeError(f"{backend_label} returned zero choices — empty response body")
+
+    choice = response.choices[0]
+    content = choice.message.content
+    finish_reason = getattr(choice, "finish_reason", None)
+
+    if content is None or not content.strip():
+        # Some reasoning-capable models expose the (possibly truncated)
+        # reasoning trace under a non-standard `reasoning`/`reasoning_content`
+        # field even when `content` is empty — surface it for diagnosis.
+        reasoning = getattr(choice.message, "reasoning", None) or getattr(
+            choice.message, "reasoning_content", None
+        )
+        reasoning_hint = " (reasoning trace present but no final content — likely truncated by max_tokens)" if reasoning else ""
+        raise RuntimeError(
+            f"{backend_label} returned empty content (finish_reason={finish_reason})"
+            f"{reasoning_hint}. This usually means the upstream provider hit an "
+            "error, rate limit, or content filter, or the model exhausted "
+            "max_tokens before producing an answer."
+        )
+
+    return content
+
+
+def _parse_analysis(raw_output: str | None) -> dict:
+    """Parse LLM output into a structured analysis dict.
+
+    ``raw_output`` should already be a non-empty string by the time it
+    reaches here (callers are expected to guard/raise before calling this),
+    but this function stays defensive against ``None``/empty input so a
+    future backend that forgets to guard degrades gracefully instead of
+    crashing with an opaque AttributeError.
+    """
+    if raw_output is None or not raw_output.strip():
+        return {
+            "description": "",
+            "findings": "The AI backend returned an empty response.",
+            "recommendation": "Retry the analysis — the backend returned no content.",
+            "flagged": False,
+            "flag_reason": "",
+        }
+
     text = raw_output.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1]

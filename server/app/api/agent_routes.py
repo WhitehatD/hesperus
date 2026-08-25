@@ -1131,14 +1131,18 @@ async def _capture_pipeline(
     await _timing.record(task_id, t_analysis_start=time.time())
 
     _analysis_error: str | None = None
+    _failed_indices: set[int] = set()
     for idx, new_file in enumerate(new_files, 1):
         file_path = str(new_file)
         _m = _re.search(r"task_(\d+)_", new_file.name)
         board_task_id = int(_m.group(1)) if _m else 0
 
+        _img_failed = False
         try:
             analysis_result = await _analyze_image(file_path, "General visual inspection", model_key)
         except Exception as exc:
+            _img_failed = True
+            _failed_indices.add(idx)
             _analysis_error = f"{type(exc).__name__}: {exc}"
             analysis_result = {
                 "findings": f"Analysis error: {_analysis_error}",
@@ -1171,8 +1175,12 @@ async def _capture_pipeline(
         })
         yield _sse_event("tool_result", {
             "id": f"img_{idx}",
-            "success": True,
-            "summary": f"Image {idx}/{expected} analyzed (task #{board_task_id})",
+            "success": not _img_failed,
+            "summary": (
+                f"Image {idx}/{expected} analysis failed (task #{board_task_id})"
+                if _img_failed else
+                f"Image {idx}/{expected} analyzed (task #{board_task_id})"
+            ),
             "image_url": f"/api/images/{new_file.parent.name}/{new_file.name}",
         })
 
@@ -1184,10 +1192,16 @@ async def _capture_pipeline(
         error=_analysis_error,
     )
 
+    _any_failed = len(_failed_indices) > 0
     yield _sse_event("tool_result", {
         "id": "analyze",
-        "success": True,
-        "summary": f"{len(analyses)}/{expected} image{'s' if expected > 1 else ''} analyzed",
+        "success": not _any_failed,
+        "summary": (
+            f"{len(analyses) - len(_failed_indices)}/{expected} image{'s' if expected > 1 else ''} analyzed"
+            f" — {len(_failed_indices)} failed"
+            if _any_failed else
+            f"{len(analyses)}/{expected} image{'s' if expected > 1 else ''} analyzed"
+        ),
     })
 
     # Build report — embed image URL(s) in reply text so they persist after page refresh
@@ -1195,25 +1209,43 @@ async def _capture_pipeline(
         a = analyses[0]
         _img_url = f"/api/images/{new_files[0].parent.name}/{new_files[0].name}" if new_files else ""
         _img_md = f"![Captured]({_img_url})\n\n" if _img_url else ""
-        detail = (
-            f"**Capture & Analysis Complete** (task #{a.task_id})\n\n"
-            f"{_img_md}"
-            f"**Objective:** {a.objective}\n\n"
-            f"**Findings:** {a.analysis}\n\n"
-            f"**Recommendation:** {a.recommendation}\n\n"
-            f"*{a.model_used} | {a.inference_time_ms:.0f}ms*"
-        )
+        if 1 in _failed_indices:
+            detail = (
+                f"**Capture Complete — Analysis Failed** (task #{a.task_id})\n\n"
+                f"{_img_md}"
+                f"The image was captured and saved, but visual analysis did not succeed:\n\n"
+                f"**Error:** {a.analysis}\n\n"
+                f"**Recommendation:** {a.recommendation}"
+            )
+        else:
+            detail = (
+                f"**Capture & Analysis Complete** (task #{a.task_id})\n\n"
+                f"{_img_md}"
+                f"**Objective:** {a.objective}\n\n"
+                f"**Findings:** {a.analysis}\n\n"
+                f"**Recommendation:** {a.recommendation}\n\n"
+                f"*{a.model_used} | {a.inference_time_ms:.0f}ms*"
+            )
     else:
-        parts = [f"**Sequence Complete** — {len(analyses)}/{expected} images analyzed\n"]
+        _header = (
+            f"**Sequence Complete** — {len(analyses) - len(_failed_indices)}/{expected} images analyzed"
+            f" ({len(_failed_indices)} failed)\n"
+            if _failed_indices else
+            f"**Sequence Complete** — {len(analyses)}/{expected} images analyzed\n"
+        )
+        parts = [_header]
         for i, (a, nf) in enumerate(zip(analyses, new_files), 1):
             _img_url = f"/api/images/{nf.parent.name}/{nf.name}"
+            _label = "ANALYSIS FAILED" if i in _failed_indices else a.analysis[:120] + ("..." if len(a.analysis) > 120 else "")
             parts.append(
-                f"**#{i}** (task {a.task_id}): {a.analysis[:120]}{'...' if len(a.analysis) > 120 else ''}\n"
+                f"**#{i}** (task {a.task_id}): {_label}\n"
                 f"![Image {i}]({_img_url})"
             )
-        if analyses[-1].recommendation:
-            parts.append(f"\n**Recommendation:** {analyses[-1].recommendation}")
-        parts.append(f"\n*{analyses[-1].model_used} | avg {sum(a.inference_time_ms for a in analyses) / len(analyses):.0f}ms*")
+        _ok_analyses = [a for i, a in enumerate(analyses, 1) if i not in _failed_indices]
+        if _ok_analyses and _ok_analyses[-1].recommendation:
+            parts.append(f"\n**Recommendation:** {_ok_analyses[-1].recommendation}")
+        if _ok_analyses:
+            parts.append(f"\n*{_ok_analyses[-1].model_used} | avg {sum(a.inference_time_ms for a in _ok_analyses) / len(_ok_analyses):.0f}ms*")
         detail = "\n\n".join(parts)
 
     # ── Benchmark: SSE delivered ──────────────────────────────────────────────

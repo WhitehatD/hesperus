@@ -8,13 +8,25 @@ Legacy backends (for thesis benchmarking):
   - Gemini 3 Flash (via Google GenAI API)
 """
 
+import asyncio
 import json
 from datetime import datetime
 
 import anthropic
+from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
 from app.api.schemas import PlanResponse, ScheduledTask
+
+# See matching note in app/analysis/engine.py — same OpenRouter gateway,
+# same observed transient-failure profile.
+_OPENROUTER_TRANSIENT_ERRORS = (
+    ValueError,  # our own _extract_completion_text/_parse_schedule guards
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    APIStatusError,
+)
 
 
 # ── System Prompt ────────────────────────────────────────
@@ -86,7 +98,7 @@ async def generate_plan(prompt: str, model_key: str = "claude-sonnet") -> PlanRe
     elif model_key == "gemini-3":
         schedule = await _plan_with_gemini(prompt)
     elif model_key == "openrouter":
-        schedule = await _plan_with_openrouter(prompt)
+        schedule = await _plan_with_openrouter_retrying(prompt)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -173,7 +185,7 @@ async def _plan_with_vllm(prompt: str, model_key: str) -> list[ScheduledTask]:
         max_tokens=2048,
     )
 
-    return _parse_schedule(response.choices[0].message.content)
+    return _parse_schedule(_extract_completion_text(response, backend_label=f"vLLM ({model_key})"))
 
 
 async def _plan_with_openrouter(prompt: str) -> list[ScheduledTask]:
@@ -197,7 +209,27 @@ async def _plan_with_openrouter(prompt: str) -> list[ScheduledTask]:
         max_tokens=2048,
     )
 
-    return _parse_schedule(response.choices[0].message.content)
+    return _parse_schedule(_extract_completion_text(response, backend_label="OpenRouter"))
+
+
+async def _plan_with_openrouter_retrying(
+    prompt: str, max_attempts: int = 3
+) -> list[ScheduledTask]:
+    """See matching _analyze_with_openrouter_retrying in analysis/engine.py:
+    retry transient OpenRouter failures. No cross-backend fallback — same
+    reasoning as the analysis engine (misreporting which backend actually
+    planned, benchmark integrity)."""
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await _plan_with_openrouter(prompt)
+        except _OPENROUTER_TRANSIENT_ERRORS as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _plan_with_gemini(prompt: str) -> list[ScheduledTask]:
@@ -211,11 +243,60 @@ async def _plan_with_gemini(prompt: str) -> list[ScheduledTask]:
         contents=f"{PLANNING_SYSTEM_PROMPT}\n\nUser request: {prompt}",
     )
 
+    if response.text is None:
+        finish_reason = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            finish_reason = getattr(candidates[0], "finish_reason", None)
+        raise ValueError(
+            f"Gemini returned no text content (finish_reason={finish_reason}). "
+            "This usually means the response was blocked by a safety filter "
+            "or the API returned zero candidates."
+        )
+
     return _parse_schedule(response.text)
 
 
-def _parse_schedule(raw_output: str) -> list[ScheduledTask]:
+def _extract_completion_text(response, backend_label: str) -> str:
+    """Extract message content from an OpenAI-compatible chat completion
+    response, raising a clear diagnostic error instead of letting a bare
+    ``None`` content silently propagate to ``_parse_schedule`` (which would
+    crash with an opaque ``AttributeError: 'NoneType' object has no
+    attribute 'strip'``).
+
+    Mirrors ``app.analysis.engine._extract_completion_text`` — kept as a
+    separate local copy rather than a shared import so the planning and
+    analysis engines stay independently deployable/testable, matching this
+    file's existing pattern of duplicating the OpenAI-compatible call shape
+    rather than sharing it with the analysis engine.
+    """
+    if not response.choices:
+        raise ValueError(f"{backend_label} returned zero choices — empty response body")
+
+    choice = response.choices[0]
+    content = choice.message.content
+    finish_reason = getattr(choice, "finish_reason", None)
+
+    if content is None or not content.strip():
+        reasoning = getattr(choice.message, "reasoning", None) or getattr(
+            choice.message, "reasoning_content", None
+        )
+        reasoning_hint = " (reasoning trace present but no final content — likely truncated by max_tokens)" if reasoning else ""
+        raise ValueError(
+            f"{backend_label} returned empty content (finish_reason={finish_reason})"
+            f"{reasoning_hint}. This usually means the upstream provider hit an "
+            "error, rate limit, or content filter, or the model exhausted "
+            "max_tokens before producing an answer."
+        )
+
+    return content
+
+
+def _parse_schedule(raw_output: str | None) -> list[ScheduledTask]:
     """Parse LLM output into a list of ScheduledTask objects."""
+    if raw_output is None or not raw_output.strip():
+        raise ValueError("LLM returned empty output — no content to parse as a schedule")
+
     text = raw_output.strip()
     # Strip markdown code fence if present
     if "```" in text:
