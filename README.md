@@ -1,19 +1,41 @@
-# Hesperus
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hesperus-logo-dark.svg">
+    <img alt="Hesperus" src="docs/assets/hesperus-logo-light.svg" width="360">
+  </picture>
+</p>
 
-**Autonomous IoT Visual Monitoring — natural language in, autonomous visual intelligence out.**
+<h3 align="center">A camera that almost never looks.</h3>
 
-A complete edge-to-cloud system where you tell an AI agent *what to monitor* in plain English, and a physical STM32 camera board autonomously captures, uploads, and analyzes images using multimodal LLMs — no camera feeds, no manual triggers, no human in the loop.
+<p align="center">Tell it what matters in one sentence. A language model decides when a photo is worth taking.</p>
 
-> Named for the evening star — the light that appears at dusk, when the watch begins. The
-> system's core behavior isn't continuous watching, it's a device that wakes on schedule,
-> captures once, and returns to dormancy: the *duty cycle*, not the *stare*, is the point
-> (see [Key Findings](#key-findings) below — a 100–252× energy reduction depends on it).
-
-> Bachelor Thesis — Design and Implementation of an Autonomous IoT Visual Monitoring System with Cloud-Based AI Planning and Analysis
+> **Accepted at [BNAIC/BeNeLearn 2026](https://www.maastrichtuniversity.nl/bnaic2026)**, the 38th Benelux Conference on Artificial Intelligence (Maastricht, 21–23 October 2026). Poster Session II, Friday 23 October.
 >
-> Alexandru-Ionut Cioc | Supervisors: Prof. Tang & Prof. Kouzinopoulos | 2026
+> *Hesperus: A Camera That Almost Never Looks, and the Language Model That Decides When.* Alexandru Cioc, Department of Advanced Computing Sciences, Maastricht University.
+> [OpenReview](https://openreview.net/forum?id=DuJJYHD4AL) · [Paper (PDF)](https://openreview.net/pdf/195c2faa8e33609e9fc0442c984f443905bafc3f.pdf) · [Poster (PDF)](docs/assets/bnaic-2026-poster.pdf) · [Benchmark write-up](https://ciocandco.com/writing/self-hosted-vs-cloud-vlm-benchmark)
 
-> **The headline result:** a self-hosted 30B vision model matched the best cloud model's quality within statistical noise at five to ten times the speed (0.77s vs 3.6 to 7.8s per call). Write-up: [ciocandco.com/writing/self-hosted-vs-cloud-vlm-benchmark](https://ciocandco.com/writing/self-hosted-vs-cloud-vlm-benchmark) | full findings: [results/findings_v3.md](results/findings_v3.md)
+## What it is
+
+Security cameras record everything and understand none of it, and motion sensors fire on anything that moves while missing what doesn't, like a blocked exit or a propped fire door. Hesperus starts from the question instead.
+
+1. **You ask.** Describe what you want to know, in plain English.
+2. **A model plans.** An LLM agent turns the goal into capture times and sends them to the camera over MQTT.
+3. **The camera sleeps.** A low-power camera board waits in deep sleep for each alarm. The prototype is a bare-metal STM32U585 with an OV5640 camera.
+4. **You get the answer.** A vision model checks each photo against your goal and reports what it finds. Then the camera sleeps again.
+
+Because all the thinking happens off the device, the camera stays small and asleep, and a better model can be swapped in without touching the firmware or the battery.
+
+## Results
+
+- **Asleep 95% of the time.** Over 129 hours of deployment the board slept 94.95% of the time, using about **100× less energy per day** than an always-on camera (1.14 kJ vs 113.8 kJ; 252× projected with the radio off between captures). Energy is modelled from datasheet currents and checked against the deployment logs; supply current was not metered.
+- **0.77 s per photo on one GPU.** A self-hosted Qwen3-VL-30B answers in 0.77 s (median), against 3.6–7.8 s for the cloud models.
+- **Five of six vision models are tied on quality** (Kruskal–Wallis p = 0.11 over 1,200 analysis calls). The self-hosted 30B model is within 0.55 points of the best cloud model on a 0–9 LLM-judged scale.
+- **But a tie in the score is not a tie in what they see.** On a photo with a wooden toy lying in a hallway, only Gemini 3 Flash mentioned it, in 10 of 10 runs; Claude Sonnet 4.6, Claude Haiku 4.5 and Qwen3-VL-30B never did. Every model was weakest at spotting hazards.
+
+<p align="center">
+  <a href="docs/assets/bnaic-2026-poster.pdf"><img src="docs/assets/bnaic-2026-poster.jpg" alt="BNAIC 2026 poster" width="520"></a>
+  <br><sub>BNAIC/BeNeLearn 2026 poster (A0). Click for the PDF.</sub>
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/STM32U585AI-Cortex--M33-03234B?style=flat-square&logo=stmicroelectronics&logoColor=white" />
@@ -38,7 +60,7 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 74 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 114 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
@@ -162,7 +184,7 @@ The model's response contains a mix of text and tool calls. Each tool call speci
 
 ```
 User: "Monitor for 30 seconds"
-  → Claude decides: capture_sequence(count=4, interval_ms=7500)
+  → the model decides: capture_sequence(count=4, interval_ms=7500)
   → Server executes the tool
   → Server streams progress events back
 ```
@@ -319,7 +341,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (90 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
+- **Full pipeline**: pytest (114 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
 - **CI-driven deploy** — on each push the CI job force-recreates the server and dashboard containers on the VPS over SSH; a `nickfedor/watchtower` service additionally polls GHCR every 5 minutes as a fallback.
 
 ---
@@ -351,7 +373,7 @@ hesperus/
       analysis/           Multimodal LLM analysis pipeline
       planning/           NL prompt to schedule generation
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                74 pytest tests (async, in-memory SQLite)
+    tests/                114 pytest tests (async, in-memory SQLite)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/
@@ -428,4 +450,4 @@ Push to `main` -> GitHub Actions builds everything -> VPS deploys -> board updat
 
 ---
 
-<sub>Bachelor thesis project — Alexandru-Ionut Cioc, 2026</sub>
+<sub>Alexandru Cioc, Department of Advanced Computing Sciences, Maastricht University · BNAIC/BeNeLearn 2026</sub>
