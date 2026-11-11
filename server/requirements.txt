@@ -18,6 +18,11 @@ anthropic>=0.52.0
 openai>=1.60.0
 google-genai>=1.66.0,<2.0  # pinned: Part.from_text(positional) removed in 1.5x; use Part(text=...)
 
+# Agent loop (app/agent/graph.py)
+langgraph>=1.2,<2.0
+langchain-core>=1.8,<2.0
+langchain-openai>=1.7,<2.0
+
 # HTTP & Image
 httpx>=0.28.0
 numpy>=1.26.0

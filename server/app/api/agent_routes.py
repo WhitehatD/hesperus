@@ -30,12 +30,14 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from langchain_core.messages import convert_to_messages
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.agent.graph import AgentContext, ClientDisconnected, RECURSION_LIMIT, agent_graph, initial_state
 from app.agent.models import ChatMessage, ChatSession
 from app.config import settings
-from app.llm_clients import get_anthropic_client, get_openai_client
+from app.llm_clients import get_anthropic_client, get_chat_model, get_openai_client
 # This module-level `async_session` binds a snapshot at first-import time and
 # is now UNUSED by every function body in this file on purpose — each one
 # re-imports it locally instead (see _persist_message's docstring for why: a
@@ -694,6 +696,220 @@ def _sse_event(event: str, data: dict) -> str:
     return f"data: {json.dumps({'event': event, **data})}\n\n"
 
 
+# ── Agent loops ─────────────────────────────────────────────
+# Two interchangeable implementations of the /agent/chat tool-use loop,
+# picked per request by settings.agent_engine. Same signature, same tools,
+# same SSE events in the same order:
+#   - yield raw SSE strings (agent_chat mirrors and forwards them)
+#   - append the model's own reply text to final_reply_parts (that, not the
+#     capture pipelines' replies, is what gets persisted as message text)
+#   - raise ClientDisconnected when the browser goes away (Stop button)
+# Confirm-before-delete and queued-vs-sent live inside the _tool_* functions,
+# so both loops get them for free.
+
+async def _sdk_agent_loop(
+    request: Request,
+    messages: list[dict],
+    final_reply_parts: list[str],
+    *,
+    session_id: int | None,
+    model_key: str,
+    bench_task_id: str,
+    bench_run_id: str,
+):
+    """Hand-written loop straight on the OpenAI SDK (OpenRouter)."""
+    client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key, timeout=30.0)
+    tools_schema = _agent_tools_openai_format()
+
+    messages_list = list(messages)
+    MAX_AGENT_TURNS = 8
+    loop_count = 0
+    _t_plan_start = time.time()
+
+    while loop_count < MAX_AGENT_TURNS:
+        loop_count += 1
+
+        # Stop mid-generation: client disconnect (Stop button on the
+        # dashboard aborts its fetch) breaks the loop before the next
+        # OpenRouter call or tool dispatch.
+        if await request.is_disconnected():
+            raise ClientDisconnected()
+
+        response = await client.chat.completions.create(
+            model=settings.openrouter_planner_model,
+            max_tokens=1024,
+            messages=messages_list,
+            tools=tools_schema,
+            temperature=0.1,
+        )
+
+        if loop_count == 1:
+            _t_plan_end = time.time()
+            # Persist planning timestamps for the first (planning) turn
+            await _timing.record(
+                bench_task_id,
+                run_id=bench_run_id,
+                t_plan_start=_t_plan_start,
+                t_plan_end=_t_plan_end,
+                model_key=model_key,
+            )
+
+        choice = response.choices[0]
+        reply_msg = choice.message
+        tool_calls = reply_msg.tool_calls or []
+
+        if reply_msg.content and reply_msg.content.strip():
+            final_reply_parts.append(reply_msg.content)
+            yield _sse_event("reply", {"text": reply_msg.content})
+
+        if not tool_calls:
+            break  # No more tool calls — final turn
+
+        messages_list.append({
+            "role": "assistant",
+            "content": reply_msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        for tc in tool_calls:
+            if await request.is_disconnected():
+                raise ClientDisconnected()
+
+            tool_name = tc.function.name
+            try:
+                tool_input = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except (json.JSONDecodeError, TypeError):
+                tool_input = {}
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+
+            if tool_name == "capture_now":
+                pipeline_reply = ""
+                async for ev in _capture_pipeline(
+                    tool_input, model_key,
+                    bench_task_id=bench_task_id, bench_run_id=bench_run_id,
+                ):
+                    yield ev
+                    if '"event": "reply"' in ev:
+                        try:
+                            ev_data = json.loads(ev.split("data: ", 1)[1].strip())
+                            pipeline_reply = ev_data.get("text", "")
+                        except Exception as _e:
+                            print(f"[WARN] SSE reply-parse error: {_e}")
+                messages_list.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": pipeline_reply or "Capture pipeline completed.",
+                })
+
+            elif tool_name == "capture_sequence":
+                pipeline_reply = ""
+                async for ev in _capture_sequence_pipeline(
+                    tool_input,
+                    bench_run_id=bench_run_id,
+                    model_key=model_key,
+                ):
+                    yield ev
+                    if '"event": "reply"' in ev:
+                        try:
+                            ev_data = json.loads(ev.split("data: ", 1)[1].strip())
+                            pipeline_reply = ev_data.get("text", "")
+                        except Exception as _e:
+                            print(f"[WARN] SSE reply-parse error: {_e}")
+                messages_list.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": pipeline_reply or "Sequence pipeline completed.",
+                })
+
+            else:
+                yield _sse_event("tool_call", {
+                    "id": tc.id,
+                    "label": _tool_label(tool_name, tool_input),
+                })
+
+                try:
+                    result = await _execute_tool(tool_name, tool_input, session_id, model_key=model_key)
+                except Exception as e:
+                    # Per-call isolation: one bad tool call must not kill the whole
+                    # streamed turn — feed the failure back to the LLM like any other
+                    # tool failure so it can adapt (retry, report, or move on).
+                    print(f"[AGENT] Tool '{tool_name}' raised an unhandled exception: {e}")
+                    result = {
+                        "success": False,
+                        "summary": f"Tool '{tool_name}' failed: {e}",
+                        "detail": "",
+                    }
+
+                yield _sse_event("tool_result", {
+                    "id": tc.id,
+                    "success": result["success"],
+                    "summary": result["summary"],
+                })
+
+                messages_list.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result),
+                })
+
+
+
+async def _langgraph_agent_loop(
+    request: Request,
+    messages: list[dict],
+    final_reply_parts: list[str],
+    *,
+    session_id: int | None,
+    model_key: str,
+    bench_task_id: str,
+    bench_run_id: str,
+):
+    """The same loop as a LangGraph StateGraph — see app/agent/graph.py."""
+    # The chat model is built per request (settings can change at runtime
+    # and in tests); the graph itself is compiled once.
+    model = get_chat_model(
+        settings.openrouter_planner_model,
+        settings.openrouter_base_url,
+        settings.openrouter_api_key,
+        timeout=30.0,
+        max_tokens=1024,
+        temperature=0.1,
+    ).bind_tools(_agent_tools_openai_format())
+    context = AgentContext(
+        model=model,
+        model_key=model_key,
+        session_id=session_id,
+        bench_task_id=bench_task_id,
+        bench_run_id=bench_run_id,
+        is_disconnected=request.is_disconnected,
+    )
+    async for kind, payload in agent_graph.astream(
+        initial_state(convert_to_messages(messages)),
+        config={"recursion_limit": RECURSION_LIMIT},
+        context=context,
+        stream_mode="custom",
+    ):
+        if kind == "model_reply":
+            final_reply_parts.append(payload)
+            yield _sse_event("reply", {"text": payload})
+        else:
+            yield payload
+
+
+AGENT_LOOPS = {"sdk": _sdk_agent_loop, "langgraph": _langgraph_agent_loop}
+
+
 @router.post("/chat")
 async def agent_chat(request: Request):
     body = await request.json()
@@ -793,9 +1009,6 @@ async def agent_chat(request: Request):
                     )
                 return
 
-            client = get_openai_client(settings.openrouter_base_url, settings.openrouter_api_key, timeout=30.0)
-            tools_schema = _agent_tools_openai_format()
-
             # ── World-state snapshot: fresh grounding for EVERY chat call, not
             # just once — this is what lets a brand-new session (or a mid-session
             # ambiguous reference like "that schedule") resolve against current
@@ -806,149 +1019,24 @@ async def agent_chat(request: Request):
                 world_state = f"(world state unavailable: {_e})"
             system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n## WORLD STATE (live, refreshed this turn)\n\n{world_state}"
 
-            # ── Multi-turn agentic loop ───────────────────────────────────────
-            MAX_AGENT_TURNS = 8
-            messages_list = [{"role": "system", "content": system_prompt}] + list(history)
-            loop_count = 0
+            # ── Multi-turn agentic loop (settings.agent_engine picks which) ──
+            agent_loop = AGENT_LOOPS.get(settings.agent_engine, _sdk_agent_loop)
             final_reply_parts: list[str] = []
-            _t_plan_start = time.time()
-
-            while loop_count < MAX_AGENT_TURNS:
-                loop_count += 1
-
-                # Stop mid-generation: client disconnect (Stop button on the
-                # dashboard aborts its fetch) breaks the loop before the next
-                # OpenRouter call or tool dispatch.
-                if await request.is_disconnected():
-                    return
-
-                response = await client.chat.completions.create(
-                    model=settings.openrouter_planner_model,
-                    max_tokens=1024,
-                    messages=messages_list,
-                    tools=tools_schema,
-                    temperature=0.1,
-                )
-
-                if loop_count == 1:
-                    _t_plan_end = time.time()
-                    # Persist planning timestamps for the first (planning) turn
-                    await _timing.record(
-                        _bench_task_id,
-                        run_id=_bench_run_id,
-                        t_plan_start=_t_plan_start,
-                        t_plan_end=_t_plan_end,
-                        model_key=model_key,
-                    )
-
-                choice = response.choices[0]
-                reply_msg = choice.message
-                tool_calls = reply_msg.tool_calls or []
-
-                if reply_msg.content and reply_msg.content.strip():
-                    final_reply_parts.append(reply_msg.content)
-                    yield _mirror(_sse_event("reply", {"text": reply_msg.content}))
-
-                if not tool_calls:
-                    break  # No more tool calls — final turn
-
-                messages_list.append({
-                    "role": "assistant",
-                    "content": reply_msg.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                })
-
-                for tc in tool_calls:
-                    if await request.is_disconnected():
-                        return
-
-                    tool_name = tc.function.name
-                    try:
-                        tool_input = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                    except (json.JSONDecodeError, TypeError):
-                        tool_input = {}
-                    if not isinstance(tool_input, dict):
-                        tool_input = {}
-
-                    if tool_name == "capture_now":
-                        pipeline_reply = ""
-                        async for ev in _capture_pipeline(
-                            tool_input, model_key,
-                            bench_task_id=_bench_task_id, bench_run_id=_bench_run_id,
-                        ):
-                            yield _mirror(ev)
-                            if '"event": "reply"' in ev:
-                                try:
-                                    ev_data = json.loads(ev.split("data: ", 1)[1].strip())
-                                    pipeline_reply = ev_data.get("text", "")
-                                except Exception as _e:
-                                    print(f"[WARN] SSE reply-parse error: {_e}")
-                        messages_list.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": pipeline_reply or "Capture pipeline completed.",
-                        })
-
-                    elif tool_name == "capture_sequence":
-                        pipeline_reply = ""
-                        async for ev in _capture_sequence_pipeline(
-                            tool_input,
-                            bench_run_id=_bench_run_id,
-                            model_key=model_key,
-                        ):
-                            yield _mirror(ev)
-                            if '"event": "reply"' in ev:
-                                try:
-                                    ev_data = json.loads(ev.split("data: ", 1)[1].strip())
-                                    pipeline_reply = ev_data.get("text", "")
-                                except Exception as _e:
-                                    print(f"[WARN] SSE reply-parse error: {_e}")
-                        messages_list.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": pipeline_reply or "Sequence pipeline completed.",
-                        })
-
-                    else:
-                        yield _mirror(_sse_event("tool_call", {
-                            "id": tc.id,
-                            "label": _tool_label(tool_name, tool_input),
-                        }))
-
-                        try:
-                            result = await _execute_tool(tool_name, tool_input, session_id, model_key=model_key)
-                        except Exception as e:
-                            # Per-call isolation: one bad tool call must not kill the whole
-                            # streamed turn — feed the failure back to the LLM like any other
-                            # tool failure so it can adapt (retry, report, or move on).
-                            print(f"[AGENT] Tool '{tool_name}' raised an unhandled exception: {e}")
-                            result = {
-                                "success": False,
-                                "summary": f"Tool '{tool_name}' failed: {e}",
-                                "detail": "",
-                            }
-
-                        yield _mirror(_sse_event("tool_result", {
-                            "id": tc.id,
-                            "success": result["success"],
-                            "summary": result["summary"],
-                        }))
-
-                        messages_list.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": json.dumps(result),
-                        })
+            try:
+                async for ev in agent_loop(
+                    request,
+                    [{"role": "system", "content": system_prompt}] + history,
+                    final_reply_parts,
+                    session_id=session_id,
+                    model_key=model_key,
+                    bench_task_id=_bench_task_id,
+                    bench_run_id=_bench_run_id,
+                ):
+                    yield _mirror(ev)
+            except ClientDisconnected:
+                # Stop mid-generation: the dashboard's Stop button aborts its
+                # fetch; both loops check before every model call and tool.
+                return
 
             # ── Persist final reply (only once, after loop completes) ─────────
             # blocks=assistant_blocks is what makes a refresh show the same

@@ -10,13 +10,14 @@ the same day, a single hung OpenRouter call could leave a user staring at
 "Generating schedule..." for up to 30 minutes with zero feedback — this is
 what actually happened in production.
 
-Every LLM client in this codebase must be constructed through one of the two
-factories below. Do not call AsyncOpenAI(...) or anthropic.AsyncAnthropic(...)
-directly anywhere else — grep for those two symbols before adding a new call
-site, and use these instead.
+Every LLM client in this codebase must be constructed through one of the
+factories below. Do not call AsyncOpenAI(...), anthropic.AsyncAnthropic(...)
+or ChatOpenAI(...) directly anywhere else — grep for those symbols before
+adding a new call site, and use these instead.
 """
 
 import anthropic
+from langchain_openai import ChatOpenAI
 from openai import AsyncOpenAI
 
 # A hung upstream call must fail fast enough that a human waiting on a chat
@@ -36,3 +37,20 @@ def get_openai_client(base_url: str, api_key: str, timeout: float = DEFAULT_LLM_
 def get_anthropic_client(api_key: str, timeout: float = DEFAULT_LLM_TIMEOUT_S) -> anthropic.AsyncAnthropic:
     """Construct an Anthropic client with an enforced request timeout."""
     return anthropic.AsyncAnthropic(api_key=api_key, timeout=timeout)
+
+
+def get_chat_model(
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float = DEFAULT_LLM_TIMEOUT_S,
+    **kwargs,
+) -> ChatOpenAI:
+    """Construct a LangChain chat model for an OpenAI-compatible endpoint
+    (the LangGraph agent in app/agent/graph.py) with an enforced request
+    timeout. Chat Completions only: OpenRouter does not serve the Responses
+    API, so langchain-openai must never pick it on its own."""
+    return ChatOpenAI(
+        model=model, base_url=base_url, api_key=api_key, timeout=timeout,
+        use_responses_api=False, **kwargs,
+    )
