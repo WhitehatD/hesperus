@@ -44,12 +44,21 @@ def get_chat_model(
     base_url: str,
     api_key: str,
     timeout: float = DEFAULT_LLM_TIMEOUT_S,
+    max_tokens: int | None = None,
     **kwargs,
 ) -> ChatOpenAI:
     """Construct a LangChain chat model for an OpenAI-compatible endpoint
-    (the LangGraph agent in app/agent/graph.py) with an enforced request
+    (the LangGraph agent and the LangChain chains) with an enforced request
     timeout. Chat Completions only: OpenRouter does not serve the Responses
-    API, so langchain-openai must never pick it on its own."""
+    API, so langchain-openai must never pick it on its own.
+
+    max_tokens goes in extra_body on purpose: ChatOpenAI(max_tokens=...)
+    sends it as "max_completion_tokens" (OpenAI's newer name), while every
+    SDK call site here sends "max_tokens", the field OpenRouter documents.
+    Sending the same field keeps the two paths identical (asserted in
+    tests/test_llm_chains.py) and the output cap guaranteed to apply."""
+    if max_tokens is not None:
+        kwargs["extra_body"] = {**kwargs.get("extra_body", {}), "max_tokens": max_tokens}
     return ChatOpenAI(
         model=model, base_url=base_url, api_key=api_key, timeout=timeout,
         use_responses_api=False, **kwargs,

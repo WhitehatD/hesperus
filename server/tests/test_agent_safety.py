@@ -298,7 +298,7 @@ def test_tool_exception_does_not_crash_sse_stream(client, monkeypatch):
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     # Mocks the OpenAI SDK client, so it only drives the "sdk" engine; both
     # engines are covered through the HTTP layer in test_agent_engines.py.
-    monkeypatch.setattr(settings, "agent_engine", "sdk")
+    monkeypatch.setattr(settings, "llm_framework", "sdk")
 
     # Turn 1: model calls ping_board. Turn 2: model replies with no more tool calls.
     call_count = {"n": 0}

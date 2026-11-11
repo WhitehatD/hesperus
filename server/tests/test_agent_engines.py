@@ -2,7 +2,7 @@
 Thesis IoT Server — Agent loop parity: SDK loop vs LangGraph
 
 /agent/chat has two interchangeable loop implementations, picked by
-settings.agent_engine ("sdk" = hand-written on the OpenAI SDK, "langgraph" =
+settings.llm_framework ("sdk" = hand-written on the OpenAI SDK, "langchain" =
 StateGraph in app/agent/graph.py). Every test here runs against BOTH and
 asserts the same observable behaviour: SSE events, what goes back to the
 model, what gets persisted, and the safety properties from
@@ -28,13 +28,13 @@ import pytest
 import app.api.agent_routes  # noqa: F401
 from app.agent.graph import MAX_AGENT_TURNS
 
-ENGINES = ["sdk", "langgraph"]
+ENGINES = ["sdk", "langchain"]
 
 
 @pytest.fixture(params=ENGINES)
 def engine(request, monkeypatch):
     from app.config import settings
-    monkeypatch.setattr(settings, "agent_engine", request.param)
+    monkeypatch.setattr(settings, "llm_framework", request.param)
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
     return request.param
 
@@ -119,6 +119,7 @@ def test_plain_reply_without_tools(client, engine):
     assert sent["messages"][-1] == {"role": "user", "content": "hello"}
     assert {t["function"]["name"] for t in sent["tools"]} >= {"ping_board", "delete_schedule"}
     assert sent["temperature"] == 0.1
+    assert sent["max_tokens"] == 1024 and "max_completion_tokens" not in sent
 
 
 def test_tool_call_then_reply_feeds_result_back(client, engine):
@@ -331,13 +332,13 @@ def test_both_engines_emit_identical_event_streams(client, monkeypatch):
     ]
     streams, bodies = {}, {}
     for name in ENGINES:
-        monkeypatch.setattr(settings, "agent_engine", name)
+        monkeypatch.setattr(settings, "llm_framework", name)
         fake = FakeOpenRouter(*script)
         with patch("app.api.agent_routes.send_board_command", return_value={"queued": False}):
             streams[name] = _chat(client, fake, "ping and status")
         bodies[name] = fake.requests
 
-    assert streams["sdk"] == streams["langgraph"]
+    assert streams["sdk"] == streams["langchain"]
 
     # The model gets the same conversation from both — compared on what
     # matters to it (roles, text, tool calls, tool results).
@@ -348,4 +349,4 @@ def test_both_engines_emit_identical_event_streams(client, monkeypatch):
             out.append((m["role"], m.get("content") or "", calls, m.get("tool_call_id")))
         return out
 
-    assert [_shape(r) for r in bodies["sdk"]] == [_shape(r) for r in bodies["langgraph"]]
+    assert [_shape(r) for r in bodies["sdk"]] == [_shape(r) for r in bodies["langchain"]]

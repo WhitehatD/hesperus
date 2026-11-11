@@ -12,11 +12,15 @@ import asyncio
 import json
 from datetime import datetime
 
+from langchain_core.messages import SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
 from app.api.schemas import PlanResponse, ScheduledTask
-from app.llm_clients import get_anthropic_client, get_openai_client
+from app.llm_clients import get_anthropic_client, get_chat_model, get_openai_client
 
 # See matching note in app/analysis/engine.py — same OpenRouter gateway,
 # same observed transient-failure profile.
@@ -98,7 +102,10 @@ async def generate_plan(prompt: str, model_key: str = "claude-sonnet") -> PlanRe
     elif model_key == "gemini-3":
         schedule = await _plan_with_gemini(prompt)
     elif model_key == "openrouter":
-        schedule = await _plan_with_openrouter_retrying(prompt)
+        if settings.llm_framework == "langchain":
+            schedule = await build_planning_chain().ainvoke({"request": prompt})
+        else:
+            schedule = await _plan_with_openrouter_retrying(prompt)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -226,6 +233,34 @@ async def _plan_with_openrouter_retrying(
 
     assert last_exc is not None
     raise last_exc
+
+
+def build_planning_chain():
+    """The OpenRouter planning call as a LangChain chain (used when
+    settings.llm_framework == "langchain"). Same prompt, model, settings,
+    parsing and 3-attempt retry as _plan_with_openrouter_retrying:
+
+        prompt  →  model  →  text  →  list[ScheduledTask]
+
+    SystemMessage(...) instead of a ("system", ...) tuple: the system prompt
+    contains literal JSON braces, which a tuple would read as {variables}.
+    """
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=PLANNING_SYSTEM_PROMPT),
+        ("human", "{request}"),
+    ])
+    model = get_chat_model(
+        settings.openrouter_planner_model,
+        settings.openrouter_base_url,
+        settings.openrouter_api_key,
+        temperature=0.1,
+        max_tokens=2048,
+    )
+    chain = prompt | model | StrOutputParser() | RunnableLambda(_parse_schedule)
+    return chain.with_retry(
+        retry_if_exception_type=_OPENROUTER_TRANSIENT_ERRORS,
+        stop_after_attempt=3,
+    )
 
 
 async def _plan_with_gemini(prompt: str) -> list[ScheduledTask]:

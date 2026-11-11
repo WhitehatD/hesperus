@@ -16,10 +16,13 @@ import json
 import time
 from pathlib import Path
 
+from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from app.config import settings
-from app.llm_clients import get_anthropic_client, get_openai_client
+from app.llm_clients import get_anthropic_client, get_chat_model, get_openai_client
 
 # Transient failure modes observed from the OpenRouter gateway/upstream
 # providers — production evidence (2026-08-18..24) shows these firing on
@@ -111,7 +114,13 @@ async def analyze_image(
     elif model_key == "gemini-3":
         result = await _analyze_with_gemini(image_path, objective)
     elif model_key == "openrouter":
-        result = await _analyze_with_openrouter_retrying(image_path, objective)
+        if settings.llm_framework == "langchain":
+            result = await build_analysis_chain().ainvoke({
+                "image_b64": _load_image_b64(image_path),
+                "objective": objective,
+            })
+        else:
+            result = await _analyze_with_openrouter_retrying(image_path, objective)
     else:
         raise ValueError(f"Unknown model: {model_key}")
 
@@ -309,6 +318,59 @@ async def _analyze_with_openrouter_retrying(
 
     assert last_exc is not None
     raise last_exc
+
+
+def _parse_ai_message(msg: AIMessage) -> dict:
+    """Last step of build_analysis_chain: same checks and parsing as the SDK
+    path (_extract_completion_text + _parse_analysis), plus the token counts.
+    Takes the whole AIMessage rather than the text (so no StrOutputParser
+    before it) because the token counts live on the message."""
+    content = msg.content if isinstance(msg.content, str) else ""
+    if not content.strip():
+        finish_reason = msg.response_metadata.get("finish_reason")
+        raise RuntimeError(
+            f"OpenRouter returned empty content (finish_reason={finish_reason}). "
+            "This usually means the upstream provider hit an error, rate limit, "
+            "or content filter, or the model exhausted max_tokens before "
+            "producing an answer."
+        )
+    parsed = _parse_analysis(content)
+    if msg.usage_metadata:
+        parsed["input_tokens"] = msg.usage_metadata.get("input_tokens")
+        parsed["output_tokens"] = msg.usage_metadata.get("output_tokens")
+    return parsed
+
+
+def build_analysis_chain():
+    """The OpenRouter analysis call as a LangChain chain (used when
+    settings.llm_framework == "langchain"). Same prompt, model, settings,
+    parsing and 3-attempt retry as _analyze_with_openrouter_retrying:
+
+        prompt (image + objective)  →  vision model  →  analysis dict
+
+    SystemMessage(...) instead of a ("system", ...) tuple: the system prompt
+    contains literal JSON braces, which a tuple would read as {variables}.
+    """
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=ANALYSIS_SYSTEM_PROMPT),
+        ("human", [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_b64}"}},
+            {"type": "text", "text": "Monitoring objective: {objective}"},
+        ]),
+    ])
+    model = get_chat_model(
+        settings.openrouter_analysis_model,
+        settings.openrouter_base_url,
+        settings.openrouter_api_key,
+        timeout=60.0,
+        temperature=0.1,
+        max_tokens=2048,
+    )
+    chain = prompt | model | RunnableLambda(_parse_ai_message)
+    return chain.with_retry(
+        retry_if_exception_type=_OPENROUTER_TRANSIENT_ERRORS,
+        stop_after_attempt=3,
+    )
 
 
 async def _analyze_with_gemini(image_path: str, objective: str) -> dict:

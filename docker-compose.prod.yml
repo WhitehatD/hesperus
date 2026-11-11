@@ -72,7 +72,7 @@ services:
       - FIRMWARE_DIR=/app/data/firmware
       - FIRMWARE_UPLOAD_TOKEN=${FIRMWARE_UPLOAD_TOKEN:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - AGENT_ENGINE=${AGENT_ENGINE:-sdk}  # sdk | langgraph — see app/config.py agent_engine
+      - LLM_FRAMEWORK=${LLM_FRAMEWORK:-sdk}  # sdk | langchain — see app/config.py llm_framework
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - CLAUDE_SONNET_MODEL=${CLAUDE_SONNET_MODEL:-claude-sonnet-4-6}

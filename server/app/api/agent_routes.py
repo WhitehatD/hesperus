@@ -698,7 +698,7 @@ def _sse_event(event: str, data: dict) -> str:
 
 # ── Agent loops ─────────────────────────────────────────────
 # Two interchangeable implementations of the /agent/chat tool-use loop,
-# picked per request by settings.agent_engine. Same signature, same tools,
+# picked per request by settings.llm_framework. Same signature, same tools,
 # same SSE events in the same order:
 #   - yield raw SSE strings (agent_chat mirrors and forwards them)
 #   - append the model's own reply text to final_reply_parts (that, not the
@@ -907,7 +907,7 @@ async def _langgraph_agent_loop(
             yield payload
 
 
-AGENT_LOOPS = {"sdk": _sdk_agent_loop, "langgraph": _langgraph_agent_loop}
+AGENT_LOOPS = {"sdk": _sdk_agent_loop, "langchain": _langgraph_agent_loop}
 
 
 @router.post("/chat")
@@ -1019,8 +1019,8 @@ async def agent_chat(request: Request):
                 world_state = f"(world state unavailable: {_e})"
             system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\n## WORLD STATE (live, refreshed this turn)\n\n{world_state}"
 
-            # ── Multi-turn agentic loop (settings.agent_engine picks which) ──
-            agent_loop = AGENT_LOOPS.get(settings.agent_engine, _sdk_agent_loop)
+            # ── Multi-turn agentic loop (settings.llm_framework picks which) ──
+            agent_loop = AGENT_LOOPS.get(settings.llm_framework, _sdk_agent_loop)
             final_reply_parts: list[str] = []
             try:
                 async for ev in agent_loop(

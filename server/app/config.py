@@ -54,12 +54,15 @@ class Settings(BaseSettings):
     # in results/findings_v3.md (self-hosted Qwen3-VL-30B-A3B) — known T1
     # quality tier — via OpenRouter instead of the VPN-gated Ernis tunnel.
     openrouter_analysis_model: str = "qwen/qwen3-vl-30b-a3b-instruct"
-    # Which implementation runs the /agent/chat tool-use loop. Both stay in
-    # the codebase on purpose, same tools and same SSE events:
-    #   "sdk"       — hand-written loop on the OpenAI SDK (_sdk_agent_loop
-    #                 in app/api/agent_routes.py)
-    #   "langgraph" — StateGraph in app/agent/graph.py
-    agent_engine: str = "sdk"
+    # Which implementation makes the OpenRouter calls. Both stay in the
+    # codebase on purpose and behave the same from the outside:
+    #   "sdk"       — written straight on the OpenAI SDK
+    #   "langchain" — the agent loop is a LangGraph StateGraph
+    #                 (app/agent/graph.py); schedule planning and image
+    #                 analysis are LangChain chains (build_planning_chain in
+    #                 app/planning/engine.py, build_analysis_chain in
+    #                 app/analysis/engine.py)
+    llm_framework: str = "sdk"
 
     # Alternate vision backends (thesis multi-backend benchmark)
     # Each open-weight model runs on its own llama-server instance — the
