@@ -69,3 +69,39 @@ async def get_db():
     """FastAPI dependency — yields an async DB session."""
     async with async_session() as session:
         yield session
+
+
+# task_ids at or above this are the board's own fallback ids, which
+# /api/upload replaces (see app/benchmark/ids.py); never seed from them.
+_BOARD_FALLBACK_TASK_ID = 10000
+
+
+async def highest_task_id() -> int:
+    """Highest task_id in use anywhere: analyses, latency rows, schedule
+    tasks and upload filenames (task_<id>_<ts>.jpg). Seeds the task_id
+    counter at startup so new captures never reuse an old id."""
+    import re
+    from pathlib import Path
+
+    import sqlalchemy as sa
+
+    queries = (
+        "SELECT MAX(task_id) FROM analysis_results WHERE task_id < :cap",
+        "SELECT MAX(task_id) FROM capture_latency WHERE task_id < :cap",
+        "SELECT MAX(id) FROM schedule_tasks WHERE id < :cap",
+    )
+    highest = 0
+    async with async_session() as db:
+        for q in queries:
+            try:
+                value = (await db.execute(sa.text(q), {"cap": _BOARD_FALLBACK_TASK_ID})).scalar()
+            except sa.exc.OperationalError:  # table not created yet
+                value = None
+            highest = max(highest, value or 0)
+
+    pattern = re.compile(r"task_(\d+)_")
+    for f in Path(settings.upload_dir).glob("*/task_*"):
+        m = pattern.match(f.name)
+        if m and int(m.group(1)) < _BOARD_FALLBACK_TASK_ID:
+            highest = max(highest, int(m.group(1)))
+    return highest

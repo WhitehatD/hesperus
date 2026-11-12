@@ -123,6 +123,14 @@ export default function BoardHeader({
 				>
 					Refresh
 				</button>
+				{/* The phone page that stands in for the board (app/camera). */}
+				<Link
+					href="/camera"
+					className={`${buttons.btnAction} ${styles.actionBtn}`}
+					title="Open on a phone to use it as the camera"
+				>
+					Phone camera
+				</Link>
 				<ActionFeedback
 					align="right"
 					feedback={feedback.capture ?? feedback.ping ?? feedback.setup}

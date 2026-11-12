@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import ConnectionBadge from "../common/ConnectionBadge";
 import styles from "./FleetHeader.module.css";
 
@@ -54,6 +55,13 @@ export default function FleetHeader({
 				</div>
 			</div>
 			<div className={styles.fleetSummary}>
+				<Link
+					href="/camera"
+					className={`${styles.fleetChip} ${styles.cameraLink}`}
+					title="Open on a phone to use it as the camera"
+				>
+					Phone camera
+				</Link>
 				<span className={styles.fleetChip}>
 					{nodeCount} node{nodeCount !== 1 ? "s" : ""}
 				</span>

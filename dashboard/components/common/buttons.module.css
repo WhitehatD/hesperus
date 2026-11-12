@@ -149,6 +149,10 @@
 		background var(--transition-fast),
 		border-color var(--transition-fast),
 		color var(--transition-fast);
+	/* Also used on <Link>s (e.g. "Phone camera" in BoardHeader). */
+	display: inline-flex;
+	align-items: center;
+	text-decoration: none;
 }
 
 .btnAction:hover:not(:disabled) {

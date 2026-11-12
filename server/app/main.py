@@ -32,6 +32,12 @@ async def lifespan(app: FastAPI):
     await create_tables()
     print("[OK] Database tables ready")
 
+    # Continue task_ids after the highest one already stored (see
+    # app/benchmark/ids.py for why restarting at 1 broke the gallery).
+    from app.benchmark.ids import seed_task_ids
+    from app.db.database import highest_task_id
+    seed_task_ids(await highest_task_id())
+
     # Connect MQTT
     await mqtt_client.connection()
     print(f"[OK] MQTT connected to {settings.mqtt_broker_host}:{settings.mqtt_broker_port}")

@@ -87,3 +87,13 @@
 		row-gap: 6px;
 	}
 }
+
+.cameraLink {
+	color: var(--accent);
+	border-color: var(--border-accent);
+	text-decoration: none;
+}
+
+.cameraLink:hover {
+	background: var(--accent-glow);
+}

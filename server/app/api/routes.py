@@ -730,9 +730,14 @@ async def list_images(board_id: str | None = None, db: AsyncSession = Depends(ge
             .where(AnalysisResult.task_id.in_(task_ids))
             .order_by(AnalysisResult.created_at.desc())
         )
+        # Keyed by the analysed image's FILE NAME, not by task_id: task_ids
+        # were reused across server restarts before 2026-11-12 (see
+        # app/benchmark/ids.py), so a task_id alone could attach another
+        # photo's analysis. Rows are newest first; keep the first per file.
         for row in ar.scalars().all():
-            if row.task_id not in analysis_map:
-                analysis_map[row.task_id] = {
+            key = Path(row.image_path or "").name
+            if key and key not in analysis_map:
+                analysis_map[key] = {
                     "objective": row.objective,
                     "findings": row.analysis,
                     "recommendation": row.recommendation,
@@ -742,7 +747,7 @@ async def list_images(board_id: str | None = None, db: AsyncSession = Depends(ge
                     "flag_reason": row.flag_reason,
                 }
     for img in images:
-        img["analysis"] = analysis_map.get(img["task_id"])
+        img["analysis"] = analysis_map.get(img["filename"])
 
     return {"images": images}
 
@@ -805,7 +810,9 @@ async def get_analysis(task_id: int, db: AsyncSession = Depends(get_db)):
         .where(AnalysisResult.task_id == task_id)
         .order_by(AnalysisResult.created_at.desc())
     )
-    analysis = result.scalar_one_or_none()
+    # first(), not scalar_one_or_none(): old task_ids can have several rows
+    # (see app/benchmark/ids.py) and the latter raised a 500 for them.
+    analysis = result.scalars().first()
     if not analysis:
         raise HTTPException(status_code=404, detail="No analysis found for this task")
     return {
