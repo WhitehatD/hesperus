@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     #                 app/analysis/engine.py)
     llm_framework: str = "sdk"
 
+    # ── Owner login (app/auth.py) ───────────────────────
+    # The one password for the dashboard, the API and the phone camera page.
+    # Empty = login disabled (local dev). Production MUST set OWNER_PASSWORD.
+    owner_password: str = ""
+
     # Alternate vision backends (thesis multi-backend benchmark)
     # Each open-weight model runs on its own llama-server instance — the
     # *_base_url settings let the engine pick the right backend by model_key.

@@ -15,7 +15,9 @@ from app.api.firmware_routes import router as firmware_router
 from app.api.wifi_routes import router as wifi_router
 from app.api.agent_routes import router as agent_router
 from app.api.benchmark_routes import router as benchmark_router
+from app.api.camera_routes import router as camera_router
 from app.mqtt.client import mqtt_client, mqtt_config
+from app.auth import OwnerAuthMiddleware, router as auth_router
 from app.db.database import create_tables
 
 
@@ -77,13 +79,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Owner login: every route below needs it, see app/auth.py ──
+# Added after CORS so it runs inside it (CORS headers still go on a 401).
+app.add_middleware(OwnerAuthMiddleware)
+
 # ── Routes ───────────────────────────────────────────────
+app.include_router(auth_router, prefix="/api")
 app.include_router(api_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
 app.include_router(firmware_router, prefix="/api")
 app.include_router(wifi_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(benchmark_router, prefix="/api")
+app.include_router(camera_router, prefix="/api")
 
 
 @app.get("/health")

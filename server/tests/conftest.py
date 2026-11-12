@@ -18,8 +18,17 @@ import app.api.firmware_routes  # noqa: F401
 import app.api.wifi_routes  # noqa: F401
 import app.api.agent_routes  # noqa: F401
 import app.api.benchmark_routes  # noqa: F401
+import app.api.camera_routes  # noqa: F401
 import app.mqtt.client  # noqa: F401
 import app.db.database  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _owner_login_off(monkeypatch):
+    """Owner login off unless a test turns it on (test_owner_auth.py), so an
+    OWNER_PASSWORD in the environment can't 401 every other test."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "owner_password", "")
 
 
 @pytest.fixture
@@ -48,6 +57,7 @@ def client():
          patch.object(app.api.firmware_routes, "mqtt_client", mock_mqtt), \
          patch.object(app.api.wifi_routes, "mqtt_client", mock_mqtt), \
          patch.object(app.api.agent_routes, "mqtt_client", mock_mqtt), \
+         patch.object(app.api.camera_routes, "mqtt_client", mock_mqtt), \
          patch.object(app.db.database, "engine", test_engine), \
          patch.object(app.db.database, "async_session", test_session):
         # Ensure settings has a valid Fernet key for WiFi config tests

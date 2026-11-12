@@ -15,7 +15,11 @@ export async function POST(request: Request) {
 	try {
 		upstream = await fetch(`${BACKEND_URL}/api/agent/chat`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: {
+				"Content-Type": "application/json",
+				// Owner login cookie: FastAPI rejects the chat without it (app/auth.py).
+				cookie: request.headers.get("cookie") ?? "",
+			},
 			body: JSON.stringify(body),
 			// Propagate client disconnect (dashboard Stop button aborts its
 			// fetch) upstream to FastAPI. Without this the backend never sees

@@ -1,0 +1,139 @@
+.page {
+	min-height: 100dvh;
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-3);
+	padding: var(--space-3);
+	background: var(--bg-primary);
+	max-width: 720px;
+	margin: 0 auto;
+}
+
+.header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.title {
+	font-size: var(--text-lg);
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.live,
+.offline {
+	font-size: var(--text-sm);
+	padding: 2px var(--space-2);
+	border-radius: var(--radius-sm);
+}
+
+.live {
+	color: var(--emerald);
+	background: var(--emerald-glow);
+}
+
+.offline {
+	color: var(--amber);
+	background: var(--amber-glow);
+}
+
+.viewport {
+	position: relative;
+	width: 100%;
+	aspect-ratio: 3 / 4;
+	background: #000;
+	border-radius: var(--radius-lg);
+	overflow: hidden;
+}
+
+.video {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	display: block;
+}
+
+.flash {
+	position: absolute;
+	inset: 0;
+	background: #fff;
+	opacity: 0.85;
+	pointer-events: none;
+}
+
+.cameraError {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: var(--space-5);
+	text-align: center;
+	color: var(--rose);
+	font-size: var(--text-base);
+}
+
+.controls {
+	display: flex;
+	gap: var(--space-2);
+}
+
+.shoot,
+.flip {
+	height: 48px;
+	border-radius: var(--radius-md);
+	font-family: var(--font-sans);
+	font-size: var(--text-lg);
+	font-weight: 500;
+	cursor: pointer;
+}
+
+.shoot {
+	flex: 1;
+	background: var(--accent);
+	border: none;
+	color: #fff;
+}
+
+.shoot:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+
+.flip {
+	padding: 0 var(--space-4);
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+	color: var(--text-primary);
+}
+
+.hint {
+	font-size: var(--text-sm);
+	color: var(--text-secondary);
+}
+
+.log {
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+	font-family: var(--font-mono, monospace);
+	font-size: var(--text-sm);
+}
+
+.at {
+	color: var(--text-tertiary);
+}
+
+.info {
+	color: var(--text-secondary);
+}
+
+.ok {
+	color: var(--emerald);
+}
+
+.error {
+	color: var(--rose);
+}

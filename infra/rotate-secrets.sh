@@ -15,7 +15,12 @@
 #   OPENROUTER_API_KEY=... FIRMWARE_UPLOAD_TOKEN=... \
 #   MQTT_USERNAME=hesperus-board MQTT_PASSWORD=... \
 #   DASHBOARD_MQTT_USERNAME=hesperus-dashboard DASHBOARD_MQTT_PASSWORD=... \
+#   OWNER_PASSWORD=... \
 #   bash infra/rotate-secrets.sh
+#
+# OWNER_PASSWORD is the one human login for the dashboard, the API and the
+# phone camera page (server/app/auth.py). Optional only so a rotation can't
+# fail on it; without it the whole site is open to anyone with the URL.
 #
 # ANTHROPIC_API_KEY/GEMINI_API_KEY are optional passthrough, kept only for
 # manual model_key testing — OPENROUTER_API_KEY is REQUIRED and is what the
@@ -47,6 +52,7 @@ printf '%s\n' \
   "GEMINI_API_KEY=${GEMINI_API_KEY:-}" \
   "MQTT_USERNAME=${MQTT_USERNAME}" \
   "MQTT_PASSWORD=${MQTT_PASSWORD}" \
+  "OWNER_PASSWORD=${OWNER_PASSWORD:-}" \
   > "$ENV_FILE"
 chown hesperus-deploy:hesperus-deploy "$ENV_FILE"
 chmod 600 "$ENV_FILE"

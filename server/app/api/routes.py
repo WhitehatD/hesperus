@@ -48,6 +48,13 @@ def verify_board_token(request: Request) -> None:
     dev-mode escape hatch, not a bug; production deployments MUST set
     FIRMWARE_UPLOAD_TOKEN or every board-facing endpoint is unauthenticated.
     """
+    # 2026-11: the physical board is gone; the phone camera page
+    # (dashboard /camera) uploads as the logged-in owner instead of with a
+    # device token. Only counts when owner login is actually configured,
+    # otherwise is_owner() is always true and would bypass the token.
+    from app.auth import auth_enabled, is_owner
+    if auth_enabled() and is_owner(request):
+        return
     token = request.headers.get("X-Upload-Token", "")
     if settings.firmware_upload_token and not hmac.compare_digest(token, settings.firmware_upload_token):
         raise HTTPException(status_code=403, detail="Invalid or missing X-Upload-Token")

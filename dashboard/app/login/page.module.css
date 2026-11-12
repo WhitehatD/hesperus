@@ -1,0 +1,75 @@
+.page {
+	min-height: 100dvh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: var(--space-4);
+	background: var(--bg-primary);
+}
+
+.card {
+	width: 100%;
+	max-width: 320px;
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-3);
+	padding: var(--space-5);
+	background: var(--bg-elevated);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xl);
+}
+
+.title {
+	font-size: var(--text-lg);
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.subtitle {
+	font-size: var(--text-base);
+	color: var(--text-secondary);
+	margin-top: calc(-1 * var(--space-2));
+}
+
+.input {
+	height: 40px;
+	padding: 0 var(--space-3);
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--text-primary);
+	font-family: var(--font-sans);
+	/* 16px stops iOS Safari zooming in on focus. */
+	font-size: 16px;
+}
+
+.input:focus {
+	outline: none;
+	border-color: var(--border-strong);
+}
+
+.error {
+	font-size: var(--text-sm);
+	color: var(--rose);
+}
+
+.button {
+	height: 40px;
+	background: var(--accent);
+	border: none;
+	border-radius: var(--radius-sm);
+	color: #fff;
+	font-family: var(--font-sans);
+	font-weight: 500;
+	font-size: var(--text-base);
+	cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+	background: var(--accent-hover);
+}
+
+.button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
