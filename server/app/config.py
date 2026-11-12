@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     #                 app/analysis/engine.py)
     llm_framework: str = "sdk"
 
+    # ── RAG over past findings (app/rag/findings.py) ─────
+    # Embedding model for the semantic half of the hybrid search, served by
+    # OpenRouter (probed 2026-11-12: available under the account's ZDR rule).
+    rag_embedding_model: str = "openai/text-embedding-3-small"
+
     # ── Owner login (app/auth.py) ───────────────────────
     # The one password for the dashboard, the API and the phone camera page.
     # Empty = login disabled (local dev). Production MUST set OWNER_PASSWORD.

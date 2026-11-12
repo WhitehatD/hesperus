@@ -17,7 +17,7 @@ adding a new call site, and use these instead.
 """
 
 import anthropic
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from openai import AsyncOpenAI
 
 # A hung upstream call must fail fast enough that a human waiting on a chat
@@ -62,4 +62,19 @@ def get_chat_model(
     return ChatOpenAI(
         model=model, base_url=base_url, api_key=api_key, timeout=timeout,
         use_responses_api=False, **kwargs,
+    )
+
+
+def get_embeddings(timeout: float = DEFAULT_LLM_TIMEOUT_S) -> OpenAIEmbeddings:
+    """LangChain embedding model on OpenRouter, for the RAG search over past
+    findings (app/rag/findings.py). check_embedding_ctx_length=False: the
+    length check tokenizes with tiktoken, which downloads its encoding files
+    on first use and only knows OpenAI's own model names."""
+    from app.config import settings
+    return OpenAIEmbeddings(
+        model=settings.rag_embedding_model,
+        base_url=settings.openrouter_base_url,
+        api_key=settings.openrouter_api_key,
+        timeout=timeout,
+        check_embedding_ctx_length=False,
     )

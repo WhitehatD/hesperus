@@ -42,6 +42,7 @@ Because all the thinking happens off the device, the camera stays small and asle
   <img src="https://img.shields.io/badge/FastAPI-Python_3.11-009688?style=flat-square&logo=fastapi&logoColor=white" />
   <img src="https://img.shields.io/badge/LangGraph-agent_loop-1C3C3C?style=flat-square&logo=langchain&logoColor=white" />
   <img src="https://img.shields.io/badge/LangChain-chains-1C3C3C?style=flat-square&logo=langchain&logoColor=white" />
+  <img src="https://img.shields.io/badge/RAG-hybrid_BM25_%2B_embeddings-4B32C3?style=flat-square" />
   <img src="https://img.shields.io/badge/Next.js_16-React_19-000?style=flat-square&logo=next.js" />
   <img src="https://img.shields.io/badge/MQTT-Mosquitto-660066?style=flat-square&logo=eclipsemosquitto&logoColor=white" />
   <img src="https://img.shields.io/badge/OTA-Dual_Bank_Flash-FF6F00?style=flat-square" />
@@ -57,12 +58,12 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 | Layer | Technology | Lines of Code | What It Does |
 |-------|-----------|---------------|--------------|
 | **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, on-board JPEG encoder, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, resumable chunked upload, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
-| **Backend** | FastAPI, SQLAlchemy async, LangGraph, LangChain, Python | ~6,500 | Tool-using LLM agent (LangGraph state graph, or the same loop hand-written on the SDK), planning and vision chains (LangChain), MQTT broker bridge, resumable chunked-upload endpoints, SSE streaming, owner login |
+| **Backend** | FastAPI, SQLAlchemy async, LangGraph, LangChain, Python | ~6,800 | Tool-using LLM agent (LangGraph state graph, or the same loop hand-written on the SDK), planning and vision chains (LangChain), hybrid RAG over past findings, MQTT broker bridge, resumable chunked-upload endpoints, SSE streaming, owner login |
 | **Frontend** | Next.js 16, React 19, TypeScript | ~3,400 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay, phone camera page that stands in for the board |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 165 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 176 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
@@ -215,7 +216,7 @@ Safety rules live in the tools, so both implementations share them: destructive 
 
 When no API key is configured, a **rule-based fallback dispatcher** maps keywords to tools directly, so the system works without any LLM.
 
-### 3. The Agent's 14 Tools
+### 3. The Agent's 15 Tools
 
 | Tool | Trigger Examples | What It Does |
 |------|-----------------|--------------|
@@ -233,6 +234,28 @@ When no API key is configured, a **rule-based fallback dispatcher** maps keyword
 | `get_board_status` | *"status"*, *"uptime"* | Queries DB for analysis count, latest result, and board telemetry |
 | `synthesize_schedule` | *"summarize findings"*, *"what did you learn"* | Reads all recent analyses, feeds them to Claude for cross-observation pattern synthesis |
 | `delete_image` | *"delete that image"*, *"remove photo"* | Deletes a captured image and its AI analysis from storage and the database |
+| `search_history` | *"what did the camera see in the hallway yesterday"*, *"anyone at the door this week"* | Hybrid RAG search over every past finding (see below); the agent answers from what was actually observed, with times |
+
+### Memory: RAG Over Past Findings
+
+Every photo's analysis is stored, so the camera's history is searchable. The `search_history` tool ([`server/app/rag/findings.py`](server/app/rag/findings.py)) is the retrieval step of retrieval-augmented generation: the agent decides when to retrieve, and the retrieved findings come back into the conversation so the answer is grounded in real observations instead of guessed.
+
+```mermaid
+flowchart LR
+    Q["question<br/>'anyone at the entrance?'"] --> K["BM25 keyword ranking<br/>SQLite FTS5"]
+    Q --> V["embedding ranking<br/>text-embedding-3-small, cosine"]
+    K --> F["reciprocal rank fusion<br/>score = Σ 1/(60 + rank)"]
+    V --> F
+    F --> R["top findings + times + images<br/>→ back to the agent"]
+```
+
+| Half | Finds | Example |
+|------|-------|---------|
+| **BM25** (keywords, FTS5) | exact words, ids, names | "task 42", a word on a sign |
+| **Embeddings** (meaning) | the same idea in different words | "someone at the entrance" finds "a person standing by the front door" |
+| **RRF** (fusion) | what ranks high in both | uses ranks only, so BM25 and cosine scores never need calibrating against each other |
+
+It needs no vector database: the index lives next to the findings in the same SQLite file and updates incrementally before each search (only new findings get embedded; deleted ones drop out). A cosine floor, measured on real queries, keeps unrelated questions from returning noise, and without an API key the search degrades to BM25 alone. `HybridFindingsRetriever` is a standard LangChain `BaseRetriever`.
 
 ### 4. SSE Streaming Protocol
 
@@ -362,7 +385,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### Backend (FastAPI + AI)
 
 - **AI planning engine** — translates natural language monitoring requests into executable HH:MM task schedules with objectives. The planner is model-agnostic (Claude, Gemini, Qwen).
-- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.6-35b-a3b`) with OpenAI-style tool calling, run either as a LangGraph state graph or as the equivalent hand-written SDK loop (`LLM_FRAMEWORK`), with a rule-based fallback if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
+- **Agentic chat with 15 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.6-35b-a3b`) with OpenAI-style tool calling, run either as a LangGraph state graph or as the equivalent hand-written SDK loop (`LLM_FRAMEWORK`), with a rule-based fallback if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
 - **Full capture pipeline with SSE streaming** — when the agent triggers a capture, the server streams real-time progress events (command sent, image received, per-image analysis, inline thumbnail URL) back to the dashboard. Heartbeat events every 5 s keep the SSE connection alive. For sequences, each image completion is a separate step.
 - **Resumable chunked image upload** — `/api/upload/chunk`, `/api/upload/resume`, `/api/upload/complete` let the board send an image as independent byte-ranged chunks over a degraded link, resuming from the server's confirmed offset instead of restarting after a stall, with a CRC32 check on reassembly. The board additionally JPEG-encodes on-device before sending, so a raw-RGB565 fallback (RGB565 → JPEG server-side, same R[15:11] G[10:5] B[4:0] unpacking) only runs if the on-board encoder can't fit a frame in its output buffer.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.
@@ -379,7 +402,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (165 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
+- **Full pipeline**: pytest (176 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
 - **CI-driven deploy** — on each push the CI job force-recreates the server and dashboard containers on the VPS over SSH; a `nickfedor/watchtower` service additionally polls GHCR every 5 minutes as a fallback.
 
 ---
@@ -404,7 +427,7 @@ hesperus/
   server/                 FastAPI backend (Python 3.11)
     app/
       api/
-        agent_routes.py   Agent chat endpoint, 14 tools, SSE streaming, SDK agent loop
+        agent_routes.py   Agent chat endpoint, 15 tools, SSE streaming, SDK agent loop
         camera_routes.py  Virtual-board status relay for the phone camera
         routes.py         Image upload, RGB565 conversion, analysis trigger
         scheduler_routes.py  Schedule CRUD + MQTT dispatch
@@ -413,10 +436,11 @@ hesperus/
         models.py         Chat session persistence (SQLAlchemy)
       analysis/           Vision analysis (SDK call or LangChain chain)
       planning/           NL prompt to schedule (SDK call or LangChain chain)
+      rag/findings.py     Hybrid RAG over past findings (BM25 + embeddings, RRF)
       auth.py             Owner login (signed session cookie, ASGI middleware)
       llm_clients.py      The only place LLM clients are constructed
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                165 pytest tests (async, in-memory SQLite, both LLM frameworks)
+    tests/                176 pytest tests (async, in-memory SQLite, both LLM frameworks)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/
