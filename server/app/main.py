@@ -80,7 +80,8 @@ app.add_middleware(
 )
 
 # ── Owner login: every route below needs it, see app/auth.py ──
-# Added after CORS so it runs inside it (CORS headers still go on a 401).
+# Added after CORS, so Starlette runs it outside CORS: a 401 carries no CORS
+# headers. Fine here, the dashboard is same-origin (nginx serves both).
 app.add_middleware(OwnerAuthMiddleware)
 
 # ── Routes ───────────────────────────────────────────────
