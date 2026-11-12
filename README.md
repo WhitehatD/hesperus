@@ -40,6 +40,8 @@ Because all the thinking happens off the device, the camera stays small and asle
 <p align="center">
   <img src="https://img.shields.io/badge/STM32U585AI-Cortex--M33-03234B?style=flat-square&logo=stmicroelectronics&logoColor=white" />
   <img src="https://img.shields.io/badge/FastAPI-Python_3.11-009688?style=flat-square&logo=fastapi&logoColor=white" />
+  <img src="https://img.shields.io/badge/LangGraph-agent_loop-1C3C3C?style=flat-square&logo=langchain&logoColor=white" />
+  <img src="https://img.shields.io/badge/LangChain-chains-1C3C3C?style=flat-square&logo=langchain&logoColor=white" />
   <img src="https://img.shields.io/badge/Next.js_16-React_19-000?style=flat-square&logo=next.js" />
   <img src="https://img.shields.io/badge/MQTT-Mosquitto-660066?style=flat-square&logo=eclipsemosquitto&logoColor=white" />
   <img src="https://img.shields.io/badge/OTA-Dual_Bank_Flash-FF6F00?style=flat-square" />
@@ -55,12 +57,12 @@ The project spans five layers, from register-level hardware drivers to a cloud A
 | Layer | Technology | Lines of Code | What It Does |
 |-------|-----------|---------------|--------------|
 | **Firmware** | Bare-metal C, ARM Cortex-M33 | ~8,000 | OV5640 camera driver with register-level AEC tuning, on-board JPEG encoder, hand-rolled MQTT 3.1.1 client, dual-bank OTA, DCMI/DMA capture, resumable chunked upload, adaptive STOP2 sleep with wake-on-ping, hardware watchdog |
-| **Backend** | FastAPI, SQLAlchemy async, Python | ~5,700 | AI planning engine, multimodal LLM orchestration (OpenRouter primary, Claude/Gemini for benchmarking), MQTT broker bridge, resumable chunked-upload endpoints, SSE streaming |
-| **Frontend** | Next.js 16, React 19, TypeScript | ~3,000 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay |
+| **Backend** | FastAPI, SQLAlchemy async, LangGraph, LangChain, Python | ~6,500 | Tool-using LLM agent (LangGraph state graph, or the same loop hand-written on the SDK), planning and vision chains (LangChain), MQTT broker bridge, resumable chunked-upload endpoints, SSE streaming, owner login |
+| **Frontend** | Next.js 16, React 19, TypeScript | ~3,400 | Real-time MQTT WebSocket dashboard, agentic chat interface, live board console, image gallery with AI analysis overlay, phone camera page that stands in for the board |
 | **Infrastructure** | Docker Compose, GitHub Actions, Nginx | ~500 | Automated CI/CD, cross-compilation, OTA binary delivery, VPS deployment, container orchestration |
 | **Hardware** | STM32 B-U585I-IOT02A Discovery Kit | — | 160MHz Cortex-M33, 768KB SRAM, OV5640 5MP camera, EMW3080 WiFi (SPI), dual-bank 2MB flash |
 
-A `git push` compiles ARM firmware, runs 114 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
+A `git push` compiles ARM firmware, runs 165 backend tests, builds Docker images, deploys to a VPS, and delivers a firmware update over-the-air to the board.
 
 ---
 
@@ -176,20 +178,42 @@ The dashboard's chat interface is backed by a full agentic loop: a user message 
 
 The user types a natural language message in the chat (e.g., *"Monitor the hallway every 5 minutes for an hour"*). The frontend sends this to `POST /api/agent/chat`, which returns a Server-Sent Events (SSE) stream. The frontend renders each event as it arrives — thinking indicators, tool execution spinners, results, and final replies — giving the user real-time visibility into what the agent is doing.
 
-### 2. LLM Tool Dispatch
+### 2. The Agent Loop (LangGraph)
 
-The server loads the conversation history from the database, appends the new message, and calls the planner model (OpenRouter, `qwen/qwen3.7-flash` by default) with tool-calling enabled — a single production backend, no model picker in the UI. The system prompt defines the agent's personality (action-first, bias toward capturing fresh data) and routing rules that map user intents to specific tools.
+The server loads the conversation history from the database, adds a live **world-state snapshot** (board state, active schedules, recent flagged findings) to the system prompt, and runs the agent loop against the planner model (OpenRouter, `qwen/qwen3.7-flash`) with tool calling enabled.
 
-The model's response contains a mix of text and tool calls. Each tool call specifies which tool to invoke and with what parameters. The server processes these sequentially:
+The loop is a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph` ([`server/app/agent/graph.py`](server/app/agent/graph.py)):
 
+```mermaid
+flowchart LR
+    S((START)) --> A["agent node<br/>one model call<br/>(LangChain ChatOpenAI + bind_tools)"]
+    A -- "tool calls requested" --> T["tools node<br/>run each requested tool,<br/>stream progress over SSE"]
+    A -- "plain answer" --> E((END))
+    T -- "fewer than 8 model calls" --> A
+    T -- "8 model calls reached" --> E
 ```
-User: "Monitor for 30 seconds"
-  → the model decides: capture_sequence(count=4, interval_ms=7500)
-  → Server executes the tool
-  → Server streams progress events back
-```
 
-When no API key is configured, a **rule-based fallback dispatcher** maps keywords to tools directly — ensuring the system works without any LLM.
+| Piece | In the code | Role |
+|-------|-------------|------|
+| State | `AgentState`: `messages` (with the `add_messages` reducer) and `turns` | Everything carried between steps |
+| Node `agent` | `agent_node` | Sends the messages to the model, appends its answer |
+| Node `tools` | `tools_node` | Runs the requested tools, appends their results as `ToolMessage`s |
+| Conditional edges | `route_after_agent`, `route_after_tools` | Tool requested → `tools`, otherwise END; stop after 8 model calls |
+| Context | `AgentContext` (passed as `context=`) | Per-request dependencies: model, session, disconnect check |
+| Streaming | `runtime.stream_writer` + `astream(stream_mode="custom")` | Tool progress reaches the browser while the graph is still running |
+
+The same loop also exists hand-written on the OpenAI SDK (`_sdk_agent_loop`). One setting picks the implementation for every LLM path:
+
+| `LLM_FRAMEWORK` | Agent loop | Schedule planning | Vision analysis |
+|-----------------|-----------|-------------------|-----------------|
+| `sdk` | `while` loop on the OpenAI SDK | one SDK call + manual retry | one SDK call + manual retry |
+| `langchain` | LangGraph `StateGraph` | LangChain chain: `prompt → model → StrOutputParser → parse` | LangChain chain: `prompt (image + objective) → vision model → parse` |
+
+Both chains are wrapped in `.with_retry()` (3 attempts on transient OpenRouter errors and malformed JSON). The parity tests ([`test_agent_engines.py`](server/tests/test_agent_engines.py), [`test_llm_chains.py`](server/tests/test_llm_chains.py)) fake OpenRouter at the HTTP transport and assert that both implementations send the **same requests** and produce the **same SSE event stream**. They caught a real difference: `ChatOpenAI(max_tokens=…)` sends `max_completion_tokens`, so the cap is now sent as `max_tokens` explicitly.
+
+Safety rules live in the tools, so both implementations share them: destructive tools (`delete_schedule`, `delete_image`) refuse without `confirm=true` and return a preview instead; commands to a sleeping board report *queued*, never *done*; a tool that raises becomes a failed tool result instead of ending the stream; findings text from the vision model is treated as an observation, never as instructions.
+
+When no API key is configured, a **rule-based fallback dispatcher** maps keywords to tools directly, so the system works without any LLM.
 
 ### 3. The Agent's 14 Tools
 
@@ -268,7 +292,21 @@ User: "stop monitoring" → LLM picks deactivate_schedule
 
 ### 7. Conversation Persistence
 
-Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). Each board can have multiple named sessions. The agent loads the last 20 messages as context for Claude, so it can reference previous captures and maintain continuity across interactions. Sessions survive page reloads and server restarts.
+Chat sessions are stored in SQLite (`chat_sessions` + `chat_messages` tables). Each board can have multiple named sessions. The agent loads the last 20 messages as context for the model, so it can reference previous captures and maintain continuity across interactions. Sessions survive page reloads and server restarts.
+
+### 8. Phone Camera Mode (no board required)
+
+The physical board can be replaced by a phone. Open [`/camera`](dashboard/app/camera/page.tsx) on a phone, logged in, and leave it on screen. The page:
+
+- subscribes to `device/stm32/commands` and handles `capture_now`, `capture_sequence` (same `task_id + i` and `delays_ms` contract as the firmware) and `ping`
+- takes a frame from the phone camera and uploads it as a JPEG to `POST /api/upload`, the same endpoint the board uses
+- reports `online` / `capturing` / `uploading` / `uploaded` through `POST /api/camera/status`, which the server republishes on the board status topic (the browser's MQTT login is read-only by design)
+
+To the server, the agent and the dashboard it is indistinguishable from the board, so the whole pipeline (agent → MQTT → capture → vision analysis → chat) runs end to end. Schedules are not supported in this mode; the board ran them on-device.
+
+### 9. Owner Login
+
+The dashboard, the API and the phone camera share one owner login ([`server/app/auth.py`](server/app/auth.py)): `OWNER_PASSWORD` is checked once and a signed HttpOnly session cookie (30 days) is issued. A pure ASGI middleware enforces it in FastAPI itself, because `/api/*` and port 8000 reach the server without going through the dashboard. Failed logins are rate-limited per IP. Firmware updates keep their own token, and board uploads accept either the board token or the owner session.
 
 ---
 
@@ -324,7 +362,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### Backend (FastAPI + AI)
 
 - **AI planning engine** — translates natural language monitoring requests into executable HH:MM task schedules with objectives. The planner is model-agnostic (Claude, Gemini, Qwen).
-- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.7-flash`) with OpenAI-style tool calling, with an automatic Claude/vLLM fallback path if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
+- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.7-flash`) with OpenAI-style tool calling, run either as a LangGraph state graph or as the equivalent hand-written SDK loop (`LLM_FRAMEWORK`), with a rule-based fallback if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
 - **Full capture pipeline with SSE streaming** — when the agent triggers a capture, the server streams real-time progress events (command sent, image received, per-image analysis, inline thumbnail URL) back to the dashboard. Heartbeat events every 5 s keep the SSE connection alive. For sequences, each image completion is a separate step.
 - **Resumable chunked image upload** — `/api/upload/chunk`, `/api/upload/resume`, `/api/upload/complete` let the board send an image as independent byte-ranged chunks over a degraded link, resuming from the server's confirmed offset instead of restarting after a stall, with a CRC32 check on reassembly. The board additionally JPEG-encodes on-device before sending, so a raw-RGB565 fallback (RGB565 → JPEG server-side, same R[15:11] G[10:5] B[4:0] unpacking) only runs if the on-board encoder can't fit a frame in its output buffer.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.
@@ -341,7 +379,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### CI/CD
 
 - **Path-based filtering** — `dorny/paths-filter` detects which components changed. A firmware-only change skips dashboard builds.
-- **Full pipeline**: pytest (114 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
+- **Full pipeline**: pytest (165 tests) → Biome lint → TypeScript check → Next.js build → ARM GCC cross-compile → Docker build → VPS deploy → OTA firmware upload. The firmware build/upload job is individually time-bounded (15 min job, 5 min toolchain install) so a runner-side apt stall fails fast instead of blocking a deploy for hours.
 - **CI-driven deploy** — on each push the CI job force-recreates the server and dashboard containers on the VPS over SSH; a `nickfedor/watchtower` service additionally polls GHCR every 5 minutes as a fallback.
 
 ---
@@ -366,19 +404,27 @@ hesperus/
   server/                 FastAPI backend (Python 3.11)
     app/
       api/
-        agent_routes.py   Agentic chat (Claude tool_use + SSE streaming)
+        agent_routes.py   Agent chat endpoint, 14 tools, SSE streaming, SDK agent loop
+        camera_routes.py  Virtual-board status relay for the phone camera
         routes.py         Image upload, RGB565 conversion, analysis trigger
         scheduler_routes.py  Schedule CRUD + MQTT dispatch
-      agent/              Chat session persistence (SQLAlchemy)
-      analysis/           Multimodal LLM analysis pipeline
-      planning/           NL prompt to schedule generation
+      agent/
+        graph.py          The agent loop as a LangGraph StateGraph
+        models.py         Chat session persistence (SQLAlchemy)
+      analysis/           Vision analysis (SDK call or LangChain chain)
+      planning/           NL prompt to schedule (SDK call or LangChain chain)
+      auth.py             Owner login (signed session cookie, ASGI middleware)
+      llm_clients.py      The only place LLM clients are constructed
       mqtt/               Async MQTT client + auto-deactivation
-    tests/                114 pytest tests (async, in-memory SQLite)
+    tests/                165 pytest tests (async, in-memory SQLite, both LLM frameworks)
 
   dashboard/              Next.js 16 frontend (TypeScript, React 19)
     app/
       page.tsx            Fleet overview with live MQTT telemetry
       board/[id]/page.tsx Board detail: chat + gallery + console
+      camera/page.tsx     Phone camera: a browser page that acts as the board
+      login/page.tsx      Owner login
+    proxy.ts              Redirects to /login without a session
       components/
         AgentChat.tsx     Multi-session chat with SSE tool streaming
       hooks/
