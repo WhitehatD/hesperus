@@ -121,7 +121,7 @@ flowchart LR
     Result --> Dashboard
 ```
 
-Production runs on **OpenRouter** — `qwen/qwen3.7-flash` for planning/tool-calling and `qwen/qwen3-vl-30b-a3b-instruct` for image analysis, chosen for the cost/latency profile of a live agent chat. Additional backends are wired in for thesis benchmarking (the Claude entries include a no-thinking control arm):
+Production runs on **OpenRouter** — `qwen/qwen3.6-35b-a3b` for planning/tool-calling and `qwen/qwen3-vl-30b-a3b-instruct` for image analysis, chosen for the cost/latency profile of a live agent chat. Additional backends are wired in for thesis benchmarking (the Claude entries include a no-thinking control arm):
 - **Claude Sonnet 4.6 / Sonnet 4.6 (no-think) / Haiku 4.5** via Anthropic API — benchmark comparison
 - **Qwen3-VL-30B-A3B** via llama.cpp — open-weight, self-hosted on an RTX 6000 Ada
 - **Qwen2.5-VL-3B** via llama.cpp — lightweight edge candidate
@@ -180,7 +180,7 @@ The user types a natural language message in the chat (e.g., *"Monitor the hallw
 
 ### 2. The Agent Loop (LangGraph)
 
-The server loads the conversation history from the database, adds a live **world-state snapshot** (board state, active schedules, recent flagged findings) to the system prompt, and runs the agent loop against the planner model (OpenRouter, `qwen/qwen3.7-flash`) with tool calling enabled.
+The server loads the conversation history from the database, adds a live **world-state snapshot** (board state, active schedules, recent flagged findings) to the system prompt, and runs the agent loop against the planner model (OpenRouter, `qwen/qwen3.6-35b-a3b`) with tool calling enabled.
 
 The loop is a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph` ([`server/app/agent/graph.py`](server/app/agent/graph.py)):
 
@@ -362,7 +362,7 @@ A brief GREEN flash overlays whichever state is showing above whenever a photo i
 ### Backend (FastAPI + AI)
 
 - **AI planning engine** — translates natural language monitoring requests into executable HH:MM task schedules with objectives. The planner is model-agnostic (Claude, Gemini, Qwen).
-- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.7-flash`) with OpenAI-style tool calling, run either as a LangGraph state graph or as the equivalent hand-written SDK loop (`LLM_FRAMEWORK`), with a rule-based fallback if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
+- **Agentic chat with 14 tools** — the dashboard chat is backed by an OpenRouter-hosted model (`qwen/qwen3.6-35b-a3b`) with OpenAI-style tool calling, run either as a LangGraph state graph or as the equivalent hand-written SDK loop (`LLM_FRAMEWORK`), with a rule-based fallback if no OpenRouter key is configured. The agent can capture images, create/activate/deactivate/modify/delete schedules, ping the board, toggle sleep mode, enter setup mode, analyze results, synthesize findings, and delete images — all through natural language, and mid-generation requests can be cancelled from the UI.
 - **Full capture pipeline with SSE streaming** — when the agent triggers a capture, the server streams real-time progress events (command sent, image received, per-image analysis, inline thumbnail URL) back to the dashboard. Heartbeat events every 5 s keep the SSE connection alive. For sequences, each image completion is a separate step.
 - **Resumable chunked image upload** — `/api/upload/chunk`, `/api/upload/resume`, `/api/upload/complete` let the board send an image as independent byte-ranged chunks over a degraded link, resuming from the server's confirmed offset instead of restarting after a stall, with a CRC32 check on reassembly. The board additionally JPEG-encodes on-device before sending, so a raw-RGB565 fallback (RGB565 → JPEG server-side, same R[15:11] G[10:5] B[4:0] unpacking) only runs if the on-board encoder can't fit a frame in its output buffer.
 - **Auto-deactivation** — when the board reports `cycle_complete`, the server automatically deactivates the active schedule.

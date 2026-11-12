@@ -49,7 +49,15 @@ class Settings(BaseSettings):
     # criterion is cost + tool-calling reliability, not vision capability.
     # Cheapest tools-capable model on OpenRouter as of 2026-08-19 per live
     # pricing check (it happens to also support vision, unused here).
-    openrouter_planner_model: str = "qwen/qwen3.7-flash"
+    #
+    # 2026-11-12: switched from qwen/qwen3.7-flash, which OpenRouter now
+    # refuses for this account with "404 - 0 endpoints ... ZDR violation":
+    # the account requires zero-data-retention providers and that model has
+    # none. qwen3.6-35b-a3b has several ZDR providers and picked the right
+    # tool (with confirm=false on delete) in a live probe; openai/gpt-oss-120b
+    # also passed and is the fallback. List ZDR endpoints with
+    # GET https://openrouter.ai/api/v1/endpoints/zdr.
+    openrouter_planner_model: str = "qwen/qwen3.6-35b-a3b"
     # Vision model for image analysis. Same model family already benchmarked
     # in results/findings_v3.md (self-hosted Qwen3-VL-30B-A3B) — known T1
     # quality tier — via OpenRouter instead of the VPN-gated Ernis tunnel.
